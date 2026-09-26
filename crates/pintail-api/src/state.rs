@@ -374,10 +374,14 @@ impl ApiState {
                 (None, Some(bytes)) => format!(" bytes={bytes}"),
                 (None, None) => String::new(),
             };
-            pintail_log::emit(&format!(
-                "{} db={scope}{table}{counts} {}",
-                event.kind, event.message
-            ));
+            // At the level worked out above: `emit` logs at info, and the
+            // exporter forwards errors only, so no replication error ever
+            // reached it - a source that forced a full recopy left no trace
+            // outside the container log.
+            pintail_log::emit_at(
+                level,
+                &format!("{} db={scope}{table}{counts} {}", event.kind, event.message),
+            );
         }
         self.retain_progress(&event);
         if let Some(inner) = &self.inner {
