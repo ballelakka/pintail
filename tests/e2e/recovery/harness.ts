@@ -260,6 +260,11 @@ export class Context {
     await until(`diagnostic ${pattern}`, async () => pattern.test(this.stderr))
     this.check(`diagnostic:${pattern.source}`, true, this.stderr.split('\n').find(line => pattern.test(line)))
   }
+  /** Since the last start: a recovery that must not have happened left no line. */
+  noDiagnostic(pattern: RegExp) {
+    const line = this.stderr.split('\n').find(line => pattern.test(line))
+    this.check(`no-diagnostic:${pattern.source}`, !line, line)
+  }
   async status(): Promise<{ state: string; tables: Array<{ name: string; state: string; last_error?: string; last_reconcile_at?: string }> }> {
     return this.api(`${this.path}/snapshot/status`)
   }

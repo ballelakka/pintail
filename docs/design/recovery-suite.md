@@ -285,6 +285,15 @@ and purge on the source, restart. The restart's runner hits
 | `purge-resnapshot-abort-twice` | `snapshot.chunk.after_ingest@2`, then on the next restart `snapshot.table.before_complete` | third restart completes; the "once per invocation" rule means each restart is a fresh attempt: assert the ledger shows exactly three `resync.auto` events; exact |
 | `purge-resnapshot-position-abort` | `cdc.resnapshot.after_targets` | the copy finished but the position was never adopted: restart must resnapshot AGAIN rather than stream from a stale checkpoint; exact |
 
+Two rebuilt-source shapes sit beside purge, because each looked like one to
+the stream. Neither restarts the source: the suite's other scenarios share
+it.
+
+| Slug | Source change | Assert |
+|---|---|---|
+| `renumbered-binlogs-resume` | pintail down; `RESET BINARY LOGS AND GTIDS`, then `gtid_purged` set back to the old history - the files renumber and every transaction survives, as after a major-version upgrade or a restore | the checkpoint's file is gone and the history is intact; the restart resumes by the GTID set with no `cdc.resnapshot` line; exact |
+| `new-source-identity-recopies` | one transaction committed under a fresh server identity at sequence 1, as a source rebuilt with a new UUID writes first | the stream refuses to version it below the stored rows and recopies (`cdc.resnapshot ... at or below`); exact, so the change is not lost |
+
 "Partial copies never appear healthy": after every kill, read meta.db and
 assert no table with an incomplete chunk journal has `state='streaming'`,
 and `/api/databases/<id>` does not report `streaming` while any table is
