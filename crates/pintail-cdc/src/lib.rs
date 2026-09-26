@@ -463,6 +463,9 @@ async fn run_cdc_inner(
         snapshot_options: &options.resnapshot_options,
     };
     loop {
+        // Every path back here - start, reconnect, recopy - rebuilt the
+        // position from its checkpoint, which does not carry the floor.
+        position.floor = position.floor.max(stored_version_floor(&targets));
         let mut stream = match open_stream(
             pool,
             &metadata,
@@ -520,6 +523,7 @@ async fn run_cdc_inner(
             Err(error) => return Err(error),
         };
         let mut stream_error = None;
+        let mut out_of_order = None;
         // MariaDB writes end_log_pos 0 on every event inside a transaction -
         // table maps and row events included - so those events take the last
         // real position read, which is the transaction's own GTID event. The
@@ -558,6 +562,11 @@ async fn run_cdc_inner(
                         sequence: gtid.gno(),
                     });
                     pending.ordinal = 0;
+                    if let Some(reason) = position.out_of_order(event_position)? {
+                        metadata.mark_database_needs_resync(database_id, &reason)?;
+                        out_of_order = Some(CdcError::NeedsResync { reason });
+                        break;
+                    }
                 }
                 EventData::RotateEvent(rotate) => {
                     // The artificial rotate that opens a stream is not a
@@ -573,6 +582,13 @@ async fn run_cdc_inner(
                     if !rotate.is_fake() && !artificial {
                         position.file = sanitize_binlog_filename(&rotate.name())?;
                         position.pos = rotate.position();
+                    } else if matches!(position.kind, PositionKind::MysqlGtid)
+                        && !rotate.name().is_empty()
+                    {
+                        // A GTID resume names no file; the source picks one,
+                        // and this preamble is the only place it says which.
+                        // MySQL's carries a clean name.
+                        position.file = sanitize_binlog_filename(&rotate.name())?;
                     }
                 }
                 EventData::RowsEvent(rows_event) => {
@@ -962,6 +978,21 @@ async fn run_cdc_inner(
                 return finish_result(commits, mutations, &position, targets);
             }
         }
+        if let Some(error) = out_of_order {
+            drop(stream);
+            position = resnapshot_context
+                .recover(
+                    error,
+                    &mut targets,
+                    &mut blocked_targets,
+                    &paused_targets,
+                    &mut resnapshot_attempted,
+                )
+                .await?;
+            pending = PendingTransaction::default();
+            reconnect_attempts = 0;
+            continue;
+        }
         if let Some(error) = stream_error {
             let reconnect = reconnect_from_checkpoint(
                 &metadata,
@@ -1051,7 +1082,10 @@ impl AutoResnapshotContext<'_> {
         if !self.enabled || *attempted {
             return Err(error);
         }
-        pintail_log::log_info!(
+        // An error, not a lifecycle note: the stream lost its place and every
+        // table is about to be copied again. That is what an operator
+        // needs paged about, whatever the source did to cause it.
+        pintail_log::log_error!(
             "cdc.resnapshot db={} rebuilding after unavailable source position: {error}",
             self.database_id
         );
@@ -2169,6 +2203,14 @@ fn new_table_matches(table: &str, options: &CdcOptions) -> bool {
     included && !excluded
 }
 
+fn stored_version_floor(targets: &[CdcTarget]) -> u64 {
+    targets
+        .iter()
+        .filter_map(|target| target.store.snapshot().max_row_version())
+        .max()
+        .unwrap_or(0)
+}
+
 async fn open_stream(
     pool: &Pool,
     metadata: &MetaStore,
@@ -2823,6 +2865,9 @@ fn commit_pending(
             .push(mutation.row);
     }
     let mutation_count = grouped.values().map(Vec::len).sum();
+    if let Some(highest) = grouped.values().flatten().map(StoredRow::version).max() {
+        position.floor = position.floor.max(highest);
+    }
     let mut touched = Vec::with_capacity(grouped.len());
     for (target_index, rows) in grouped {
         let target = &mut targets[target_index];
@@ -2995,6 +3040,10 @@ struct StreamPosition {
     pending_gtid: Option<GtidIdentity>,
     file: String,
     pos: u64,
+    /// The highest row version the targets hold. The newest version wins,
+    /// so a transaction versioned at or below it would be applied and then
+    /// lose to the very row it replaced.
+    floor: u64,
 }
 
 enum PositionKind {
@@ -3033,6 +3082,7 @@ impl StreamPosition {
                 pending_gtid: None,
                 file: checkpoint.binlog_file.unwrap_or_default(),
                 pos: checkpoint.binlog_pos.unwrap_or(4),
+                floor: 0,
             }),
             "gtid" | "filepos" => Ok(Self {
                 kind: PositionKind::FilePosition,
@@ -3048,6 +3098,7 @@ impl StreamPosition {
                         "file/position checkpoint is missing its position".to_owned(),
                     )
                 })?,
+                floor: 0,
             }),
             "polling" => Err(CdcError::InvalidCheckpoint(
                 "polling checkpoint cannot start CDC".to_owned(),
@@ -3059,18 +3110,31 @@ impl StreamPosition {
     }
 
     fn request(&self, server_id: u32, blocking: bool) -> Result<BinlogStreamRequest<'_>, CdcError> {
-        let mut request = BinlogStreamRequest::new(server_id)
-            .with_filename(self.file.as_bytes())
-            .with_pos(self.pos);
+        let mut request = match self.requested_file() {
+            Some((file, pos)) => BinlogStreamRequest::new(server_id)
+                .with_filename(file.as_bytes())
+                .with_pos(pos),
+            None => BinlogStreamRequest::new(server_id)
+                .with_pos(4)
+                .with_gtid()
+                .with_gtid_set(self.gtid_set.as_ref().expect("GTID set").to_sids()?),
+        };
         if !blocking {
             request = request.with_non_blocking();
         }
-        if matches!(self.kind, PositionKind::MysqlGtid) {
-            request = request
-                .with_gtid()
-                .with_gtid_set(self.gtid_set.as_ref().expect("GTID set").to_sids()?);
-        }
         Ok(request)
+    }
+
+    /// The file and offset a resume names, or `None` when the GTID set alone
+    /// says where. A file name beside the set makes the source look that
+    /// file up before it reads the set, so a source whose binlogs were
+    /// renumbered - an upgrade, a restore - refused with 1236 and forced a
+    /// full copy it did not need.
+    fn requested_file(&self) -> Option<(&str, u64)> {
+        match self.kind {
+            PositionKind::MysqlGtid => None,
+            PositionKind::FilePosition => Some((self.file.as_str(), self.pos)),
+        }
     }
 
     /// How many row mutations one source transaction may carry: 24 ordinal
@@ -3133,6 +3197,26 @@ impl StreamPosition {
             CdcError::Decode("binlog event position exceeds the version range".to_owned())
         })?;
         Ok((u64::from(file_index) << 48) | (u64::from(event_position) << 16) | u64::from(ordinal))
+    }
+
+    /// Why the transaction just opened cannot be applied in order, if it
+    /// cannot. A source rebuilt under a new server identity numbers its
+    /// transactions from one again; resumed by GTID, each change it sent
+    /// would version below the stored row it replaces and lose to it,
+    /// silently. Only a fresh copy puts the two back in one order.
+    fn out_of_order(&self, event_position: u64) -> Result<Option<String>, CdcError> {
+        let first = self.version(event_position, 0)?;
+        Ok((first <= self.floor).then(|| {
+            let transaction = self.pending_gtid.as_ref().map_or_else(
+                || format!("{}:{event_position}", self.file),
+                |gtid| format!("GTID sequence {}", gtid.sequence),
+            );
+            format!(
+                "source transaction {transaction} versions at {first}, at or below the \
+                 {floor} already stored; the source's transaction numbering restarted",
+                floor = self.floor
+            )
+        }))
     }
 
     fn commit_gtid(&mut self) -> Result<(), CdcError> {
@@ -3411,6 +3495,60 @@ mod tests {
             position.version(200, 3).expect("deterministic")
         );
         assert_ne!(generated_server_id("a"), 0);
+    }
+
+    #[test]
+    fn a_gtid_resume_names_no_file_so_renumbered_binlogs_still_resume() {
+        let checkpoint = |kind: &str| SnapshotCheckpointRecord {
+            kind: kind.to_owned(),
+            gtid_set: Some("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-4".to_owned()),
+            binlog_file: Some("binlog.000462".to_owned()),
+            binlog_pos: Some(30_508),
+        };
+        let gtid = StreamPosition::from_checkpoint(checkpoint("gtid"), SourceFlavor::Mysql)
+            .expect("gtid position");
+        assert_eq!(gtid.requested_file(), None);
+        gtid.request(7, true).expect("a GTID request encodes");
+        let filepos = StreamPosition::from_checkpoint(checkpoint("filepos"), SourceFlavor::Mysql)
+            .expect("file position");
+        assert_eq!(filepos.requested_file(), Some(("binlog.000462", 30_508)));
+    }
+
+    #[test]
+    fn a_transaction_numbered_below_the_stored_rows_is_refused() {
+        let mut position = StreamPosition::from_checkpoint(
+            SnapshotCheckpointRecord {
+                kind: "gtid".to_owned(),
+                gtid_set: Some("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-900".to_owned()),
+                binlog_file: Some("binlog.000462".to_owned()),
+                binlog_pos: Some(4),
+            },
+            SourceFlavor::Mysql,
+        )
+        .expect("position");
+        let open = |position: &mut StreamPosition, sequence| {
+            position.pending_gtid = Some(super::GtidIdentity {
+                sid: [7; 16],
+                tag: None,
+                sequence,
+            });
+        };
+        // Freshly copied rows sit at version zero: any transaction follows.
+        open(&mut position, 1);
+        assert_eq!(position.out_of_order(120).expect("check"), None);
+
+        // Rows streamed up to sequence 900; the source was rebuilt under a
+        // new identity and numbers from one again.
+        open(&mut position, 900);
+        position.floor = position.version(120, 3).expect("stored");
+        open(&mut position, 901);
+        assert_eq!(position.out_of_order(120).expect("check"), None);
+        open(&mut position, 2);
+        let reason = position
+            .out_of_order(120)
+            .expect("check")
+            .expect("a restarted numbering is refused");
+        assert!(reason.contains("GTID sequence 2"), "{reason}");
     }
 
     #[test]
