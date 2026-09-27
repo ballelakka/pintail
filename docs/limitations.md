@@ -14,8 +14,11 @@ stays readable as a list of things to fix.
 
 - Correlated subqueries decorrelate when the inner side is a single filtered
   table and every correlated conjunct is a comparison spanning the two scopes
-  (equalities key the hash join; ranges ride the residual or nested loop).
-  Other shapes fall back to bounded dependent execution where the engine
+  (equalities key the hash join; ranges ride the residual or nested loop);
+  `EXISTS`, `NOT EXISTS`, `IN` and `NOT IN` whose inner side joins tables,
+  or groups under `EXISTS`, decorrelate through a derived table. Other
+  shapes - an ungrouped aggregate, `HAVING`, `LIMIT`, or a correlation
+  inside the inner join's `ON` - fall back to bounded dependent execution where the engine
   classifies them, and reject otherwise. On that path the inner query is
   planned and executed once per DISTINCT outer tuple - a statement-local
   memo shares the answer across outer rows that substitute the same values
@@ -23,9 +26,10 @@ stays readable as a list of things to fix.
   correlated `IN` whose inner side holds a join pays roughly 20× the
   per-execution cost of a scalar or `EXISTS` shape
   (`benchmark/evidence/dependent-subquery-memo.md`). An inner query using
-  `RAND()` or `UUID()` is never memoized. Correlated `NOT IN` additionally
-  requires both membership sides to be provably non-nullable: with a possible
-  NULL, MySQL's three-valued `NOT IN` diverges from an anti join, so those
+  `RAND()` or `UUID()` is never memoized. A correlated `NOT IN` over
+  nullable columns decorrelates as a `WHERE` conjunct only; elsewhere both
+  membership sides must be provably non-nullable, because with a possible
+  NULL MySQL's three-valued `NOT IN` diverges from an anti join, and those
   shapes reject.
 - A subquery in a LEFT (or RIGHT) join's ON condition that reaches the
   join's preserved side, and is not a non-negated `IN` or `EXISTS` over one
@@ -56,9 +60,11 @@ stays readable as a list of things to fix.
   subquery reads string constants through a derived table (`3 < ANY (SELECT v
   FROM (SELECT '2' AS v UNION ALL SELECT '10') t)` is 0 there), and Pintail
   does not reproduce that form.
-- A join with no hashable equality key (a pure range/theta join) runs on
-  the nested loop and tests every row pair, so over large inputs it runs
-  until the memory ceiling or `max_execution_time` stops it.
+- A join with no hashable equality key searches a sorted right input only
+  for an inequality between plain integer, double, date or same-precision
+  date-time columns. Any other theta condition, or a right input that
+  spills, tests every row pair, so over large inputs it runs until the
+  memory ceiling or `max_execution_time` stops it.
 - Compound temporal `RANGE` interval qualifiers reject because sqlparser does
   not accept their MySQL spelling (#13, #25).
 - A window frame with a bounded start recomputes its aggregate over the frame
@@ -251,11 +257,9 @@ stays readable as a list of things to fix.
   `global_spill_limit_bytes`; exhausting either limit fails the query before
   the write crosses the ceiling.
 - Dependent correlated execution can rerun its inner plan for each outer
-  row when memoization is unavailable. Nullable correlated
-  `NOT IN` shapes that cannot be proven safe still reject rather than risk a
-  different answer.
-- Cross joins require catalog cardinalities and reject estimates above one
-  million rows.
+  row when memoization is unavailable.
+- A cross join holds every input after the first in memory; only the first
+  streams.
 - General aggregate pre-aggregation across equi-joins is not implemented.
   Aggregate pushdown removes only unreferenced predicate-free cross-join inputs
   with an exact catalog cardinality of one. The optimizer has no general rule
