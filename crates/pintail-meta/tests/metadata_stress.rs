@@ -122,13 +122,22 @@ fn run_case(foreign_fd: bool, second_process: bool) -> Result<()> {
         }));
     }
 
+    let mut worker_error = None;
     for worker in workers {
-        worker.join().expect("stress worker panicked")?;
+        if let Err(error) = worker.join().expect("stress worker panicked") {
+            worker_error.get_or_insert(error);
+        }
     }
     if let Some(mut child) = child {
-        ensure!(child.wait()?.success(), "second process failed");
+        if !child.wait()?.success() {
+            worker_error.get_or_insert_with(|| anyhow::anyhow!("second process failed"));
+        }
     }
-    integrity_check(&path)
+    integrity_check(&path)?;
+    if let Some(error) = worker_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[test]
