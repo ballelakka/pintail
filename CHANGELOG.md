@@ -4,6 +4,40 @@ All notable changes to Pintail are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.6-rc1] - 2026-09-27
+
+Replication that survives a source upgrade, plus two query faults: a tight
+memory ceiling that failed a query before it could spill, and an ORDER BY
+that sorted by the wrong table's column.
+
+### Fixed
+
+- A source whose binary logs were renumbered, as a major-version upgrade or
+  a restore onto a new instance does, no longer forces every table to be
+  copied again. A GTID stream resumes from its transaction set alone,
+  without naming the checkpoint's log file, which the source can no longer
+  find.
+- A source rebuilt under a new server identity numbers its transactions
+  from one again, and each change would have been applied and then lost to
+  the row it replaced. The stream now refuses a transaction numbered at or
+  below the rows already stored and recopies the database.
+- A full recopy of a database is logged at error level, so it reaches
+  error reporting instead of passing as routine output. Dashboard events
+  now log at the level they were published with.
+- Under a tight query memory limit, a small table whose recent changes were
+  not yet flushed could take the whole budget when its scan opened, and a
+  join or sort in the same query failed instead of spilling. Such a scan now
+  takes at most half the budget and streams past it.
+- `ORDER BY b.id` over `SELECT a.id ... CROSS JOIN b` sorted by `a.id`, the
+  selected column sharing the name. A qualified name now always means its
+  own table's column.
+
+### Added
+
+- With `PINTAIL_PROFILE=1`, a query that fails logs its operator tree beside
+  the error, so the operators holding the memory are visible, not only the
+  one that asked last.
+
 ## [0.1.5] - 2026-09-26
 
 Everything in 0.1.5-rc1 through rc9, gated with the full stable chain: fmt,
