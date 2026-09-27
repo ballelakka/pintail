@@ -5,18 +5,18 @@
   "ref": "170b1d70737be6f134448f51713cdc1ae215b420",
   "mysqlVersion": "8.4.11",
   "provenance": {
-    "sourceCommit": "a6d5810257493274c5eb2549a9b16da42188a8ab",
+    "sourceCommit": "4df891994f4bf06eaf7345b63671a823d0fc87c1",
     "sourceDirty": false,
-    "binarySha256": "2e323a6118a33432ab1522f0aa46d5cfd58b7bdfe4a3195d4f11de8dd7a2cb85"
+    "binarySha256": "d41dc68fa19a5944fcd9665449cd394773228f6ea45acc86927e8eac7223dd1f"
   },
-  "artifacts": "validate-out/mtr/runs/muh8wc7a-1751371",
-  "measuredAt": "2026-09-25T17:49:22.046Z",
+  "artifacts": "validate-out/mtr/runs/mujo4oj8-34773",
+  "measuredAt": "2026-09-27T10:30:31.029Z",
   "totals": {
-    "exact": 8146,
-    "compared": 8578,
+    "exact": 8148,
+    "compared": 8580,
     "queries": 24004,
     "replayed": 30174,
-    "notCompared": 21596
+    "notCompared": 21594
   },
   "results": [
     {
@@ -8314,10 +8314,10 @@
       "file": "join",
       "statements": 681,
       "counts": {
-        "exact": 89,
+        "exact": 91,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 18,
+        "pintail-error": 16,
         "mysql-error": 1,
         "tainted": 38,
         "setup": 325,
@@ -8332,7 +8332,6 @@
       "errorClasses": {
         "DDL: Error: Invalid default value for _": 1,
         "INSERT: Error: Incorrect value _ for column _: expected a date": 1,
-        "Error: ambiguous ORDER BY output i": 2,
         "Error: unsupported table expression: (t1__14 NATURAL JOIN t2__13)": 2,
         "Error: unsupported join operator: Right(Natural)": 1,
         "Error: unsupported table expression: (t4__1 NATURAL RIGHT JOIN ((t2__13 NATURAL RIGHT JOIN": 1,
