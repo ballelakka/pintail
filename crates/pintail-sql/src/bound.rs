@@ -1324,11 +1324,14 @@ pub enum ScalarFunction {
         /// Whether the match is negated (`NOT REGEXP`).
         negated: bool,
     },
-    /// `REGEXP_SUBSTR(expr, pattern)`: first match or NULL.
+    /// `REGEXP_SUBSTR(expr, pattern[, pos[, occurrence[, match_type]]])`:
+    /// the match or NULL.
     RegexpSubstr,
-    /// `REGEXP_INSTR(expr, pattern)`: 1-based match position or 0.
+    /// `REGEXP_INSTR(expr, pattern[, pos[, occurrence[, return_option[,
+    /// match_type]]]])`: 1-based position of the match (or just past it) or 0.
     RegexpInstr,
-    /// `REGEXP_REPLACE(expr, pattern, replacement)`.
+    /// `REGEXP_REPLACE(expr, pattern, replacement[, pos[, occurrence[,
+    /// match_type]]])`.
     RegexpReplace,
     /// `JSON_EXTRACT(json, path)` / the `->` operator; `unquote` marks the
     /// `->>` / `JSON_UNQUOTE(JSON_EXTRACT(...))` form.

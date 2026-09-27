@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1939;
+const EXPECTED_CASES: usize = 1941;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2204,6 +2204,18 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "correlated NOT IN over nullable columns",
             "SELECT u.id FROM users AS u WHERE u.name NOT IN (SELECT e.note FROM events AS e \
              WHERE e.score > u.id) ORDER BY u.id",
+        ),
+        ordered(
+            "regex position and occurrence",
+            "SELECT id, REGEXP_INSTR(name, '[aeiou]', 1, 2), REGEXP_INSTR(name, '[aeiou]+', 2, 1, 1), \
+             REGEXP_SUBSTR(name, '[a-z]+', 2, 1), REGEXP_SUBSTR(note, 'A', 1, 1, 'c'), \
+             REGEXP_REPLACE(name, '[aeiou]', '*', 2, 2), REGEXP_REPLACE(name, 'x*', '-', 1, 3) \
+             FROM events ORDER BY id",
+        ),
+        ordered(
+            "regex position and occurrence",
+            "SELECT REGEXP_REPLACE('aaa', 'a*', 'X'), REGEXP_INSTR('abcabc', 'bc', 1, 2, 1), \
+                    REGEXP_SUBSTR('abc', '^b', 2), REGEXP_SUBSTR('a\\nb', '^b', 2, 1, 'm')",
         ),
         ordered(
             "week and quarter intervals",

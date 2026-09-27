@@ -110,11 +110,9 @@ stays readable as a list of things to fix.
   MySQL's array autowrap rules. Single-target functions (`JSON_VALUE`,
   `JSON_LENGTH`, `JSON_KEYS`, `JSON_CONTAINS`) accept `last` but refuse
   multi-target tokens, as MySQL does (#8).
-- `REGEXP_LIKE` accepts MySQL's optional `match_type`; the longer positional
-  overloads of `REGEXP_INSTR`, `REGEXP_REPLACE`, and `REGEXP_SUBSTR`, plus
-  `REGEXP_COUNT`, remain unimplemented (#8). Regex uses Rust's linear-time
-  Unicode engine rather than ICU. The compatibility surface is literals,
-  alternation, capturing/non-capturing groups without backreferences,
+- Regex uses Rust's linear-time Unicode engine rather than ICU. The
+  compatibility surface is literals, alternation, capturing/non-capturing
+  groups without backreferences,
   quantifiers, anchors, dot, Unicode properties and character/POSIX classes;
   lookaround and backreferences reject instead of being reinterpreted. Other
   ICU syntax and same-spelling semantic edges are not claimed. Binary-string

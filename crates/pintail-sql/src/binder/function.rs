@@ -604,9 +604,9 @@ pub(super) fn bind_scalar_function(
         "REGEXP_LIKE" if matches!(args.len(), 2 | 3) => {
             ScalarFunction::RegexpLike { negated: false }
         }
-        "REGEXP_SUBSTR" if args.len() == 2 => ScalarFunction::RegexpSubstr,
-        "REGEXP_INSTR" if args.len() == 2 => ScalarFunction::RegexpInstr,
-        "REGEXP_REPLACE" if args.len() == 3 => ScalarFunction::RegexpReplace,
+        "REGEXP_SUBSTR" if (2..=5).contains(&args.len()) => ScalarFunction::RegexpSubstr,
+        "REGEXP_INSTR" if (2..=6).contains(&args.len()) => ScalarFunction::RegexpInstr,
+        "REGEXP_REPLACE" if (3..=6).contains(&args.len()) => ScalarFunction::RegexpReplace,
         "JSON_EXTRACT" if args.len() >= 2 => ScalarFunction::JsonExtract { unquote: false },
         "JSON_UNQUOTE" if args.len() == 1 => ScalarFunction::JsonUnquote,
         "SUBSTRING_INDEX" if args.len() == 3 => ScalarFunction::SubstringIndex,

@@ -2211,3 +2211,59 @@ fn week_and_quarter_intervals_count_days_and_months() {
         ("TIMESTAMPDIFF(QUARTER, '2024-01-15', '2024-07-14')", "1"),
     ]);
 }
+
+#[test]
+fn regex_functions_take_position_occurrence_and_match_type() {
+    assert_answers(&[
+        ("REGEXP_INSTR('abcabc','b',3)", "5"),
+        ("REGEXP_INSTR('abcabc','b',1,2)", "5"),
+        ("REGEXP_INSTR('abcabc','b',1,0)", "2"),
+        ("REGEXP_INSTR('abcabc','b',1,-1)", "2"),
+        ("REGEXP_INSTR('abcabc','bc',1,2,1)", "7"),
+        ("REGEXP_INSTR('aaa','a*',1,2)", "4"),
+        ("REGEXP_INSTR('abc','x*',1,4)", "4"),
+        ("REGEXP_INSTR('abc','x*',1,5)", "0"),
+        ("REGEXP_INSTR('héllo','l',4)", "4"),
+        ("REGEXP_INSTR('héllo','l',4,1,1)", "5"),
+        ("REGEXP_INSTR('abc','b','2')", "2"),
+        ("REGEXP_INSTR('abc','b',1.6)", "2"),
+        ("REGEXP_INSTR('','b',2)", "0"),
+        ("REGEXP_INSTR('a','a',NULL)", "NULL"),
+        ("REGEXP_SUBSTR('abc','^b',2)", "NULL"),
+        (r"REGEXP_SUBSTR('abc','\\bc',2)", "NULL"),
+        ("REGEXP_SUBSTR('a\\nb','^b',2,1,'m')", "b"),
+        ("REGEXP_SUBSTR('abcabc','B',1,2,'c')", "NULL"),
+        ("REGEXP_SUBSTR('abcabc','B',1,2,'i')", "b"),
+        ("REGEXP_SUBSTR('héllo','l+',3)", "ll"),
+        ("REGEXP_REPLACE('abcabc','b','X',1,2)", "abcaXc"),
+        ("REGEXP_REPLACE('abcabc','b','X',3)", "abcaXc"),
+        ("REGEXP_REPLACE('abcabc','b','X',1,0)", "aXcaXc"),
+        ("REGEXP_REPLACE('abcabc','b','X',1,-1)", "aXcabc"),
+        ("REGEXP_REPLACE('abcabc','b','X',1,5)", "abcabc"),
+        ("REGEXP_REPLACE('abcabc','(b)(c)','$2$1',2,1)", "acbabc"),
+        ("REGEXP_REPLACE('aaa','a*','X')", "XX"),
+        ("REGEXP_REPLACE('aaa','a*','X',1,2)", "aaaX"),
+        ("REGEXP_REPLACE('abc','x*','-')", "-a-b-c-"),
+        ("REGEXP_REPLACE('abc','x*','-',2)", "a-b-c-"),
+        ("REGEXP_REPLACE('abc','x*','-',1,2)", "a-bc"),
+        ("REGEXP_REPLACE('abc','b','X',4)", "abc"),
+        ("REGEXP_REPLACE('abc','^','X',2)", "abc"),
+        ("REGEXP_REPLACE('','b','X',1)", ""),
+        ("REGEXP_SUBSTR('abc','c',4)", "NULL"),
+        ("REGEXP_SUBSTR('abc','x*',4)", ""),
+        ("REGEXP_INSTR('abc','x*',3,2)", "4"),
+        ("REGEXP_REPLACE('abc','x*','-',4)", "abc-"),
+    ]);
+    // Out-of-range positions, an unknown return option and an unknown
+    // match type are errors in MySQL too.
+    for refused in [
+        "REGEXP_INSTR('abc','c',0)",
+        "REGEXP_INSTR('abc','c',4)",
+        "REGEXP_SUBSTR('abc','c',5)",
+        "REGEXP_REPLACE('abc','b','X',5)",
+        "REGEXP_INSTR('abcabc','b',1,1,2)",
+        "REGEXP_REPLACE('abc','b','X',1,1,'x')",
+    ] {
+        assert!(scalar(refused).starts_with("error"), "{refused}");
+    }
+}

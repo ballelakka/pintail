@@ -1,5 +1,4 @@
 //! Bounded regular-expression execution with SQL line-boundary assertions.
-use std::borrow::Cow;
 
 use regex_automata::PatternID;
 use regex_automata::nfa::thompson::{NFA, State};
@@ -46,6 +45,9 @@ impl<'a> Match<'a> {
     }
     pub(super) fn start(&self) -> usize {
         self.start
+    }
+    pub(super) fn end(&self) -> usize {
+        self.end
     }
 }
 
@@ -129,31 +131,116 @@ impl Program {
         }
     }
 
-    pub(super) fn find<'a>(&self, text: &'a str) -> Option<Match<'a>> {
-        let (start, end) = match self {
-            Self::Fast(program) => {
-                let found = program.find(text)?;
-                (found.start(), found.end())
-            }
-            Self::Boundary(program) if single_line(text) => {
-                let found = program.fast.find(text)?;
-                (found.start(), found.end())
-            }
-            Self::Boundary(program) => {
-                let slots = program.captures_at(text, 0)?;
-                (slots[0], slots[1])
-            }
+    /// Capture slots of the first match starting at or after byte `from`,
+    /// with the text before `from` still visible to anchors and boundaries.
+    fn captures_from(&self, text: &str, from: usize) -> Option<Box<[usize]>> {
+        let fast = match self {
+            Self::Fast(program) => program,
+            Self::Boundary(program) if single_line(text) => &program.fast,
+            Self::Boundary(program) => return program.captures_at(text, from),
         };
-        Some(Match { text, start, end })
+        let captures = fast.captures_at(text, from)?;
+        Some(
+            (0..captures.len())
+                .flat_map(|group| {
+                    captures
+                        .get(group)
+                        .map_or([usize::MAX, usize::MAX], |found| {
+                            [found.start(), found.end()]
+                        })
+                })
+                .collect(),
+        )
     }
 
-    pub(super) fn replace_all<'a>(&self, text: &'a str, replacement: &str) -> Cow<'a, str> {
-        match self {
-            Self::Fast(program) => program.replace_all(text, replacement),
-            Self::Boundary(program) if single_line(text) => {
-                program.fast.replace_all(text, replacement)
+    /// Matches from byte `from` on, in the order a search reports them: after
+    /// a non-empty match the next search starts at its end, where an empty
+    /// match may follow; after an empty match it starts one character on.
+    pub(super) fn matches_from<'a>(
+        &'a self,
+        text: &'a str,
+        from: usize,
+    ) -> impl Iterator<Item = Box<[usize]>> + 'a {
+        let mut next = Some(from);
+        std::iter::from_fn(move || {
+            let slots = self.captures_from(text, next?)?;
+            let end = slots[1];
+            next = if slots[0] == end {
+                text[end..]
+                    .chars()
+                    .next()
+                    .map(|character| end + character.len_utf8())
+            } else {
+                Some(end)
+            };
+            Some(slots)
+        })
+    }
+
+    /// The `occurrence`-th match (1-based) from byte `from`.
+    pub(super) fn nth_match<'a>(
+        &self,
+        text: &'a str,
+        from: usize,
+        occurrence: usize,
+    ) -> Option<Match<'a>> {
+        let slots = self
+            .matches_from(text, from)
+            .nth(occurrence.checked_sub(1)?)?;
+        Some(Match {
+            text,
+            start: slots[0],
+            end: slots[1],
+        })
+    }
+
+    /// Replaces the `occurrence`-th match from byte `from`, or every match
+    /// from there when `occurrence` is zero; text before `from` is kept.
+    pub(super) fn replace_from(
+        &self,
+        text: &str,
+        from: usize,
+        occurrence: usize,
+        replacement: &str,
+    ) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut copied = 0;
+        for (index, slots) in self.matches_from(text, from).enumerate() {
+            if occurrence != 0 && index + 1 != occurrence {
+                continue;
             }
-            Self::Boundary(program) => Cow::Owned(program.replace_all(text, replacement)),
+            result.push_str(&text[copied..slots[0]]);
+            regex_automata::util::interpolate::string(
+                replacement,
+                |group, out| {
+                    let Some(slot) = group.checked_mul(2) else {
+                        return;
+                    };
+                    if let (Some(&start), Some(&end)) = (slots.get(slot), slots.get(slot + 1))
+                        && start != usize::MAX
+                        && end != usize::MAX
+                    {
+                        out.push_str(&text[start..end]);
+                    }
+                },
+                |name| self.group_index(name),
+                &mut result,
+            );
+            copied = slots[1];
+            if occurrence != 0 {
+                break;
+            }
+        }
+        result.push_str(&text[copied..]);
+        result
+    }
+
+    fn group_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Self::Fast(program) => program
+                .capture_names()
+                .position(|group| group == Some(name)),
+            Self::Boundary(program) => program.nfa.group_info().to_index(PatternID::ZERO, name),
         }
     }
 }
@@ -362,6 +449,9 @@ impl BoundaryProgram {
             .then_some(first.len_utf8())
     }
 
+    /// Every match replaced, skipping an empty match that ends where the
+    /// previous match did - the reference the tests compare spans against.
+    #[cfg(test)]
     fn replace_all(&self, text: &str, replacement: &str) -> String {
         let mut result = String::new();
         let mut from = 0;

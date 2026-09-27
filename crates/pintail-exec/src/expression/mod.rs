@@ -3999,28 +3999,57 @@ fn evaluate_eager_scalar_inner(
             let matched = program.is_match(&text);
             Ok(Value::Boolean(matched != negated))
         }
-        ScalarFunction::RegexpSubstr => {
+        ScalarFunction::RegexpSubstr | ScalarFunction::RegexpInstr => {
             let text = scalar_string(&values[0])?;
-            let found = regex_program(literal_regex, &scalar_string(&values[1])?, "", collation)?
-                .find(&text)
-                .map(|found| found.as_str().to_owned());
-            Ok(found.map_or(Value::Null, Value::Utf8))
-        }
-        ScalarFunction::RegexpInstr => {
-            let text = scalar_string(&values[0])?;
-            let position =
-                regex_program(literal_regex, &scalar_string(&values[1])?, "", collation)?
-                    .find(&text)
-                    .map_or(0, |found| text[..found.start()].chars().count() as u64 + 1);
-            Ok(Value::UInt64(position))
+            // REGEXP_INSTR alone refuses a start just past the subject.
+            let from = regex_start(
+                &text,
+                values.get(2),
+                matches!(function, ScalarFunction::RegexpSubstr),
+            )?;
+            let occurrence = regex_occurrence(values.get(3))?.max(1);
+            let match_type = values
+                .get(regex_match_type_index(function))
+                .map(scalar_string)
+                .transpose()?;
+            let program = regex_program(
+                literal_regex,
+                &scalar_string(&values[1])?,
+                match_type.as_deref().unwrap_or(""),
+                collation,
+            )?;
+            let found = program.nth_match(&text, from, occurrence);
+            if matches!(function, ScalarFunction::RegexpSubstr) {
+                return Ok(found.map_or(Value::Null, |found| Value::Utf8(found.as_str().to_owned())));
+            }
+            let after = match values.get(4).map(mysql_i64).transpose()? {
+                None | Some(0) => false,
+                Some(1) => true,
+                Some(_) => return Err(ExecError::InvalidExpressionType),
+            };
+            Ok(Value::UInt64(found.map_or(0, |found| {
+                let at = if after { found.end() } else { found.start() };
+                text[..at].chars().count() as u64 + 1
+            })))
         }
         ScalarFunction::RegexpReplace => {
             let text = scalar_string(&values[0])?;
             let replacement = scalar_string(&values[2])?;
-            let replaced =
-                regex_program(literal_regex, &scalar_string(&values[1])?, "", collation)?
-                    .replace_all(&text, replacement.as_str())
-                    .into_owned();
+            let from = regex_start(&text, values.get(3), true)?;
+            // Absent or zero replaces every match; a negative occurrence the
+            // first.
+            let occurrence = match values.get(4) {
+                None => 0,
+                occurrence => regex_occurrence(occurrence)?,
+            };
+            let match_type = values.get(5).map(scalar_string).transpose()?;
+            let replaced = regex_program(
+                literal_regex,
+                &scalar_string(&values[1])?,
+                match_type.as_deref().unwrap_or(""),
+                collation,
+            )?
+            .replace_from(&text, from, occurrence, &replacement);
             Ok(Value::Utf8(replaced))
         }
         ScalarFunction::JsonExtract { unquote } => {
@@ -6349,19 +6378,56 @@ fn literal_regex_arguments(function: ScalarFunction, args: &[BoundExpr]) -> Opti
     else {
         return None;
     };
-    let match_type = if matches!(function, ScalarFunction::RegexpLike { .. }) {
-        match args.get(2) {
-            None => "",
-            Some(BoundExpr {
-                kind: BoundExprKind::Literal(Value::Utf8(match_type)),
-                ..
-            }) => match_type,
-            Some(_) => return None,
-        }
-    } else {
-        ""
+    let match_type = match args.get(regex_match_type_index(function)) {
+        None => "",
+        Some(BoundExpr {
+            kind: BoundExprKind::Literal(Value::Utf8(match_type)),
+            ..
+        }) => match_type,
+        Some(_) => return None,
     };
     Some((pattern, match_type))
+}
+
+/// Where a regular-expression function takes its `match_type` argument.
+const fn regex_match_type_index(function: ScalarFunction) -> usize {
+    match function {
+        ScalarFunction::RegexpSubstr => 4,
+        ScalarFunction::RegexpInstr | ScalarFunction::RegexpReplace => 5,
+        _ => 2,
+    }
+}
+
+/// The byte offset a 1-based character `position` argument starts a search
+/// at. `MySQL` refuses a position before the first character or after the
+/// last - one past it only for `REGEXP_SUBSTR` and `REGEXP_REPLACE` -
+/// except in an empty subject, which has nothing to search either way.
+fn regex_start(text: &str, position: Option<&Value>, past_end: bool) -> Result<usize, ExecError> {
+    let Some(position) = position else {
+        return Ok(0);
+    };
+    let position = mysql_i64(position)?;
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let limit = text.chars().count() + usize::from(past_end);
+    let index = usize::try_from(position)
+        .ok()
+        .filter(|index| (1..=limit).contains(index))
+        .ok_or(ExecError::InvalidExpressionType)?;
+    Ok(text
+        .char_indices()
+        .nth(index - 1)
+        .map_or(text.len(), |(byte, _)| byte))
+}
+
+/// An `occurrence` argument: absent is 1, a negative count reads as 1.
+fn regex_occurrence(occurrence: Option<&Value>) -> Result<usize, ExecError> {
+    let Some(occurrence) = occurrence else {
+        return Ok(1);
+    };
+    let occurrence = mysql_i64(occurrence)?;
+    Ok(usize::try_from(occurrence).unwrap_or(1))
 }
 
 pub(crate) fn bound_regex_memory_upper_bound(expr: &BoundExpr) -> usize {
