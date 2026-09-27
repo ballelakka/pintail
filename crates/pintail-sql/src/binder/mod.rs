@@ -4074,9 +4074,21 @@ fn bind_unary(
             kind: BoundExprKind::Literal(value),
         });
     }
+    // Negation is arithmetic, so its operand is read as a number: a truth
+    // value and an unsigned integer negate as BIGINT, an unintroduced hex
+    // literal as the integer its bytes spell, and other text as a double.
+    let (expr, negated_type) = match expr.data_type {
+        _ if operator != UnaryOperator::Minus => (expr, None),
+        Some(DataType::Binary) if unintroduced_bit_literal(written) => {
+            (numeric_bit_input(expr, written)?, Some(DataType::Int64))
+        }
+        Some(DataType::Utf8 | DataType::Binary) => (expr, Some(DataType::Float64)),
+        Some(DataType::Boolean | DataType::UInt64) => (expr, Some(DataType::Int64)),
+        data_type => (expr, data_type),
+    };
     let (op, data_type) = match operator {
         UnaryOperator::Plus if is_numeric(expr.data_type) => (UnaryOp::Plus, expr.data_type),
-        UnaryOperator::Minus if is_numeric(expr.data_type) => (UnaryOp::Minus, expr.data_type),
+        UnaryOperator::Minus if is_numeric(expr.data_type) => (UnaryOp::Minus, negated_type),
         UnaryOperator::Not if is_truth_value(expr.data_type) => {
             (UnaryOp::Not, Some(DataType::Boolean))
         }

@@ -2179,3 +2179,16 @@ fn the_clock_functions_answer_under_every_spelling() {
         ),
     ]);
 }
+
+#[test]
+fn negation_reads_its_operand_as_a_number() {
+    assert_answers(&[
+        ("-'3'", "float -3"),
+        ("-CONCAT('3', id)", "float -31"),
+        ("-TRUE", "-1"),
+        ("- -TRUE", "1"),
+        ("-0xf", "-15"),
+        ("-CAST(id AS UNSIGNED)", "-1"),
+    ]);
+}
+
