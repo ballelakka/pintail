@@ -811,6 +811,7 @@ fn capture_timestamp_offsets(function: ScalarFunction, args: &mut [BoundExpr]) {
         | ScalarFunction::Time
         | ScalarFunction::DatePart(_)
         | ScalarFunction::ExtractTime { .. }
+        | ScalarFunction::ExtractMicros { .. }
         | ScalarFunction::PackedDateParts { .. }
         | ScalarFunction::DateFormat
         | ScalarFunction::DateInterval { .. }

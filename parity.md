@@ -18,7 +18,7 @@ banked in `tests/sqllogic/fuzz-results.md` with the reproduction recipe in
 
 | Area | Status |
 |---|---|
-| Callable functions | 170 — `bun run scripts/function-surface.ts` reads them from the binder, and a unit test holds this number to what it prints |
+| Callable functions | 181 — `bun run scripts/function-surface.ts` reads them from the binder, and a unit test holds this number to what it prints |
 | Aggregates | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, `ANY_VALUE`, `STDDEV`/`STD`/`STDDEV_POP`/`STDDEV_SAMP`, `VARIANCE`/`VAR_POP`/`VAR_SAMP`, `BIT_AND`/`BIT_OR`/`BIT_XOR` |
 | Window functions | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `LAG`, `LEAD`, `NTILE`, `FIRST_VALUE`, `LAST_VALUE` |
 | Window frames | explicit `ROWS BETWEEN` with all bound forms and the `ROWS n PRECEDING` shorthand; value-based `RANGE` bounds over numeric keys (including exact fractional DECIMAL offsets) and simple temporal `INTERVAL` offsets; `GROUPS` and DISTINCT window aggregates reject as MySQL 8.4 requires |
@@ -165,7 +165,7 @@ design — DDL, DML writes, replication and administration. Those are out of
 scope rather than missing, and counting them as gaps would make this table
 read as far worse than the engine is.
 
-**Functions:** 393 MySQL functions — Pintail 152, ClickHouse 161.
+**Functions:** 393 MySQL functions — Pintail 163, ClickHouse 161.
 
 **Keywords:** 734 MySQL keywords — Pintail 95 supported and 123 out of scope, ClickHouse 225.
 
@@ -174,7 +174,7 @@ read as far worse than the engine is.
 | Function | Pintail | ClickHouse |
 |---|---|---|
 | `ABS` | ✅ | ✅ |
-| `ACOS` | ❌ | ✅ |
+| `ACOS` | ✅ | ✅ |
 | `ADDDATE` | ❌ | ✅ |
 | `ADDTIME` | ✅ | ❌ |
 | `AES_DECRYPT` | ❌ | ❌ |
@@ -182,13 +182,13 @@ read as far worse than the engine is.
 | `AND` | ❌ | ✅ |
 | `ANY_VALUE` | ✅ | ✅ |
 | `ASCII` | ✅ | ✅ |
-| `ASIN` | ❌ | ✅ |
+| `ASIN` | ✅ | ✅ |
 | `ASYMMETRIC_DECRYPT` | ❌ | ❌ |
 | `ASYMMETRIC_ENCRYPT` | ❌ | ❌ |
 | `ASYMMETRIC_SIGN` | ❌ | ❌ |
 | `ASYMMETRIC_VERIFY` | ❌ | ❌ |
-| `ATAN` | ❌ | ✅ |
-| `ATAN2` | ❌ | ✅ |
+| `ATAN` | ✅ | ✅ |
+| `ATAN2` | ✅ | ✅ |
 | `AVG` | ✅ | ✅ |
 | `BENCHMARK` | ❌ | ❌ |
 | `BIN` | ✅ | ✅ |
@@ -219,8 +219,8 @@ read as far worse than the engine is.
 | `CONV` | ✅ | ✅ |
 | `CONVERT` | ❌ | ❌ |
 | `CONVERT_TZ` | ✅ | ❌ |
-| `COS` | ❌ | ✅ |
-| `COT` | ❌ | ❌ |
+| `COS` | ✅ | ✅ |
+| `COT` | ✅ | ❌ |
 | `COUNT` | ✅ | ✅ |
 | `CRC32` | ✅ | ✅ |
 | `CREATE_ASYMMETRIC_PRIV_KEY` | ❌ | ❌ |
@@ -245,7 +245,7 @@ read as far worse than the engine is.
 | `DAYOFWEEK` | ✅ | ✅ |
 | `DAYOFYEAR` | ✅ | ✅ |
 | `DEFAULT` | ❌ | ❌ |
-| `DEGREES` | ❌ | ✅ |
+| `DEGREES` | ✅ | ✅ |
 | `DENSE_RANK` | ✅ | ✅ |
 | `DIV` | ❌ | ❌ |
 | `ELT` | ✅ | ❌ |
@@ -406,7 +406,7 @@ read as far worse than the engine is.
 | `PS_THREAD_ID` | ❌ | ❌ |
 | `QUARTER` | ✅ | ✅ |
 | `QUOTE` | ❌ | ❌ |
-| `RADIANS` | ❌ | ✅ |
+| `RADIANS` | ✅ | ✅ |
 | `RAND` | ✅ | ✅ |
 | `RANDOM_BYTES` | ❌ | ❌ |
 | `RANK` | ✅ | ✅ |
@@ -432,9 +432,9 @@ read as far worse than the engine is.
 | `SHA1` | ✅ | ✅ |
 | `SHA2` | ✅ | ❌ |
 | `SIGN` | ✅ | ✅ |
-| `SIN` | ❌ | ✅ |
+| `SIN` | ✅ | ✅ |
 | `SLEEP` | ❌ | ✅ |
-| `SOUNDEX` | ❌ | ✅ |
+| `SOUNDEX` | ✅ | ✅ |
 | `SPACE` | ✅ | ✅ |
 | `SQRT` | ✅ | ✅ |
 | `STATEMENT_DIGEST` | ❌ | ❌ |
@@ -529,7 +529,7 @@ read as far worse than the engine is.
 | `SUM` | ✅ | ✅ |
 | `SYSDATE` | ❌ | ❌ |
 | `SYSTEM_USER` | ❌ | ❌ |
-| `TAN` | ❌ | ✅ |
+| `TAN` | ✅ | ✅ |
 | `TIMEDIFF` | ✅ | ✅ |
 | `TIMESTAMPADD` | ✅ | ❌ |
 | `TIMESTAMPDIFF` | ✅ | ✅ |

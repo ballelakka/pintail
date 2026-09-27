@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1908;
+const EXPECTED_CASES: usize = 1910;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2103,6 +2103,13 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "hash and net scalars",
             "SELECT SHA1(note), CRC32(note) FROM events WHERE id = 1",
         ),
+        ordered(
+            "soundex and trigonometric scalars",
+            "SELECT SOUNDEX('Hello'), SOUNDEX('Quadratically'), SOUNDEX('a!b-2c'), \
+                    SOUNDEX(NULL), SIN(0), COS(0), TAN(0), ASIN(2), ACOS(2), \
+                    ATAN(1), ATAN(1, 2), ATAN2(1, 2), DEGREES(PI()), \
+                    RADIANS(180), PI()",
+        ),
         // Composite EXTRACT units: concatenated decimal per MySQL.
         ordered(
             "extract composite units",
@@ -2115,6 +2122,14 @@ fn hand_written_cases() -> Vec<OracleCase> {
                     EXTRACT(MINUTE_SECOND FROM '2025-07-21 10:40:50'), \
                     EXTRACT(YEAR_MONTH FROM '2025-01-05'), \
                     EXTRACT(MINUTE_SECOND FROM '2025-01-05 00:00:07')",
+        ),
+        ordered(
+            "extract fractional composite units",
+            "SELECT EXTRACT(MICROSECOND FROM '2025-07-21 10:40:50.123456'), \
+                    EXTRACT(SECOND_MICROSECOND FROM '2025-07-21 10:40:50.123456'), \
+                    EXTRACT(MINUTE_MICROSECOND FROM '2025-07-21 10:40:50.123456'), \
+                    EXTRACT(HOUR_MICROSECOND FROM '2025-07-21 10:40:50.123456'), \
+                    EXTRACT(DAY_MICROSECOND FROM '2025-07-21 10:40:50.123456')",
         ),
         // Theta joins: range and inequality ON conditions on the nested
         // loop, plus equality+range mixes on the hash join's residual.
@@ -4779,11 +4794,6 @@ fn reject_cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "unsupported|json_table|parse|bind|table",
         ),
         (
-            "reject soundex",
-            "SELECT SOUNDEX(name) FROM users",
-            "unsupported",
-        ),
-        (
             "reject recursive with aggregate",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT SUM(n) FROM t) SELECT * FROM t",
             "recursive|unsupported|unknown|aggregate",
@@ -4809,11 +4819,6 @@ fn reject_cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "reject unknown collate",
             "SELECT name FROM users ORDER BY name COLLATE big5_chinese_ci",
             "collat",
-        ),
-        (
-            "reject trig function",
-            "SELECT SIN(score) FROM events WHERE id = 1",
-            "unsupported",
         ),
         (
             "reject full text match",

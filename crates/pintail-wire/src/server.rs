@@ -3241,6 +3241,16 @@ fn is_year_field(field: &QueryField) -> bool {
     })
 }
 
+fn bit_field_bytes(field: &QueryField, value: u64) -> Option<Vec<u8>> {
+    let column = field.wire_column.as_ref()?;
+    (column.coltype == ColumnType::MysqlTypeBit).then(|| {
+        let width = usize::try_from(column.column_length.div_ceil(8))
+            .unwrap_or(8)
+            .min(8);
+        value.to_be_bytes()[8 - width..].to_vec()
+    })
+}
+
 /// Writes one value as a text-protocol cell, straight into the row: the
 /// same bytes [`text_column_value`] renders, without a buffer per cell.
 fn put_text_value(row: &mut TextRow<'_>, value: &Value, field: &QueryField) {
@@ -3248,9 +3258,21 @@ fn put_text_value(row: &mut TextRow<'_>, value: &Value, field: &QueryField) {
         Value::Null => row.null(),
         Value::Boolean(value) => row.signed(i64::from(*value)),
         Value::Int64(value) if is_year_field(field) => row.bytes(format!("{value:04}").as_bytes()),
-        Value::Int64(value) => row.signed(*value),
+        Value::Int64(value) => {
+            if let Some(bytes) = bit_field_bytes(field, u64::from_ne_bytes(value.to_ne_bytes())) {
+                row.bytes(&bytes);
+            } else {
+                row.signed(*value);
+            }
+        }
         Value::UInt64(value) if is_year_field(field) => row.bytes(format!("{value:04}").as_bytes()),
-        Value::UInt64(value) => row.unsigned(*value),
+        Value::UInt64(value) => {
+            if let Some(bytes) = bit_field_bytes(field, *value) {
+                row.bytes(&bytes);
+            } else {
+                row.unsigned(*value);
+            }
+        }
         Value::Float64(value) => row.bytes(floating_text(*value, field).as_bytes()),
         Value::Utf8(value) | Value::Enum { label: value, .. } => row.bytes(value.as_bytes()),
         Value::DecimalAverage(average) => row.bytes(average.label.as_bytes()),
@@ -3264,11 +3286,23 @@ fn put_text_cell(row: &mut TextRow<'_>, cell: Cell<'_>, field: &QueryField) {
     match cell {
         Cell::Null => row.null(),
         Cell::Signed(value) if is_year_field(field) => row.bytes(format!("{value:04}").as_bytes()),
-        Cell::Signed(value) => row.signed(value),
+        Cell::Signed(value) => {
+            if let Some(bytes) = bit_field_bytes(field, u64::from_ne_bytes(value.to_ne_bytes())) {
+                row.bytes(&bytes);
+            } else {
+                row.signed(value);
+            }
+        }
         Cell::Unsigned(value) if is_year_field(field) => {
             row.bytes(format!("{value:04}").as_bytes());
         }
-        Cell::Unsigned(value) => row.unsigned(value),
+        Cell::Unsigned(value) => {
+            if let Some(bytes) = bit_field_bytes(field, value) {
+                row.bytes(&bytes);
+            } else {
+                row.unsigned(value);
+            }
+        }
         Cell::Float(value) => {
             let value = pintail_types::Float64::new(value);
             row.bytes(floating_text(value, field).as_bytes());
@@ -3306,6 +3340,16 @@ fn text_column_value(value: &Value) -> Option<Vec<u8>> {
 // One arm per wire type: splitting it hides the correspondence.
 #[allow(clippy::too_many_lines)]
 fn binary_column_value(field: &QueryField, value: &Value) -> io::Result<Option<Vec<u8>>> {
+    if let Some(number) = match value {
+        Value::Int64(number) => Some(u64::from_ne_bytes(number.to_ne_bytes())),
+        Value::UInt64(number) => Some(*number),
+        _ => None,
+    } && let Some(bytes) = bit_field_bytes(field, number)
+    {
+        let mut encoded = Vec::new();
+        put_length_encoded_bytes(&mut encoded, &bytes);
+        return Ok(Some(encoded));
+    }
     if let Some(column) = &field.wire_column {
         if matches!(column.coltype, ColumnType::MysqlTypeNewdecimal)
             && !matches!(value, Value::Null)
@@ -6138,6 +6182,38 @@ mod result_ceiling_tests {
         for row in encoded.iter() {
             assert_eq!(&row[1..], &[b'[', b'"', 0xE4, b'"', b']']);
         }
+    }
+
+    #[test]
+    fn bit_cells_use_big_endian_bytes_in_both_protocols() {
+        let mut declaration = super::Column::new("flags", super::ColumnType::MysqlTypeBit);
+        declaration.column_length = 16;
+        let field = super::QueryField {
+            wire_column: Some(declaration),
+            name: "flags".to_owned(),
+            data_type: Some(super::DataType::UInt64),
+            nullable: false,
+            collation: None,
+            group_concat: false,
+            geometry: false,
+            timestamp: false,
+            wire_hint: None,
+        };
+        let value = super::Value::UInt64(0x12ff);
+        let mut encoded = super::EncodedRows::with_capacity(2);
+        super::put_text_value(&mut encoded.text_row(), &value, &field);
+        super::put_text_cell(
+            &mut encoded.text_row(),
+            super::Cell::Unsigned(0x12ff),
+            &field,
+        );
+        for row in encoded.iter() {
+            assert_eq!(&row[1..], &[0x12, 0xff]);
+        }
+        assert_eq!(
+            super::binary_column_value(&field, &value).unwrap(),
+            Some(vec![2, 0x12, 0xff])
+        );
     }
 
     #[test]

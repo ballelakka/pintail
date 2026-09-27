@@ -933,6 +933,34 @@ pub(super) fn extract_time(
     Ok(if time.micros < 0 { -number } else { number })
 }
 
+/// Pack fractional seconds after a signed clock extraction. The fraction is
+/// always six decimal places in a composite result.
+pub(super) fn extract_micros(value: &Value, leading: Option<DatePart>) -> Result<i64, ExecError> {
+    let text = scalar_string(value)?;
+    let text = text.trim();
+    let clock = super::canonical_temporal_parts(text, true)
+        .map_or(text, |(_, clock)| clock.unwrap_or("00:00:00"));
+    let micros = super::parse_temporal_micros(clock)
+        .ok_or(ExecError::InvalidDateTime)?
+        .micros;
+    let fraction =
+        i64::try_from(micros.abs() % 1_000_000).map_err(|_| ExecError::NumericOverflow)?;
+    let Some(leading) = leading else {
+        return Ok(fraction);
+    };
+    let whole = extract_time(value, leading, DatePart::Second)?;
+    let packed = whole
+        .abs()
+        .checked_mul(1_000_000)
+        .and_then(|whole| whole.checked_add(fraction))
+        .ok_or(ExecError::NumericOverflow)?;
+    Ok(if micros < 0 || text.starts_with('-') {
+        -packed
+    } else {
+        packed
+    })
+}
+
 /// HHMMSS packed into an integer, up to the largest TIME.
 fn packed_time(number: u128) -> Option<(u64, u64, u64)> {
     let minutes = u64::try_from(number / 100 % 100).ok()?;

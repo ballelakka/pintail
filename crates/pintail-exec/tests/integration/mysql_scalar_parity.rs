@@ -1066,9 +1066,51 @@ fn extract_time_fields_preserve_duration_sign_and_day_prefix() {
         ("EXTRACT(DAY_SECOND FROM '2020-03-17 10:11:12')", "17101112"),
         ("EXTRACT(DAY_HOUR FROM '2020-03-17 10:11:12')", "1710"),
         ("EXTRACT(YEAR_MONTH FROM '2020-03-17 10:11:12')", "202003"),
+        (
+            "EXTRACT(MICROSECOND FROM '2020-03-17 10:11:12.123456')",
+            "123456",
+        ),
+        (
+            "EXTRACT(SECOND_MICROSECOND FROM '2020-03-17 10:11:12.123456')",
+            "12123456",
+        ),
+        (
+            "EXTRACT(MINUTE_MICROSECOND FROM '2020-03-17 10:11:12.123456')",
+            "1112123456",
+        ),
+        (
+            "EXTRACT(HOUR_MICROSECOND FROM '2020-03-17 10:11:12.123456')",
+            "101112123456",
+        ),
+        (
+            "EXTRACT(DAY_MICROSECOND FROM '2020-03-17 10:11:12.123456')",
+            "17101112123456",
+        ),
     ] {
         assert_eq!(scalar(expression), expected, "{expression}");
     }
+}
+
+#[test]
+fn soundex_and_trigonometric_scalars_match_mysql_examples() {
+    assert_answers(&[
+        ("SOUNDEX('Hello')", "H400"),
+        ("SOUNDEX('Quadratically')", "Q36324"),
+        ("SOUNDEX('a!b-2c')", "A120"),
+        ("SOUNDEX('')", ""),
+        ("SOUNDEX(NULL)", "NULL"),
+        ("SIN(0)", "float 0"),
+        ("COS(0)", "float 1"),
+        ("TAN(0)", "float 0"),
+        ("ASIN(2)", "NULL"),
+        ("ACOS(2)", "NULL"),
+        ("ATAN(0)", "float 0"),
+        ("ATAN(0, 1)", "float 0"),
+        ("ATAN2(0, 1)", "float 0"),
+        ("DEGREES(0)", "float 0"),
+        ("RADIANS(0)", "float 0"),
+    ]);
+    assert!(scalar("COT(0)").starts_with("error"));
 }
 
 #[test]

@@ -497,6 +497,17 @@ pub(super) fn bind_scalar_function(
         "SUBSTRING" | "SUBSTR" if matches!(args.len(), 2 | 3) => ScalarFunction::Substring,
         "LOWER" | "LCASE" if args.len() == 1 => ScalarFunction::Lower,
         "UPPER" | "UCASE" if args.len() == 1 => ScalarFunction::Upper,
+        "SOUNDEX" if args.len() == 1 => ScalarFunction::Soundex,
+        "SIN" if args.len() == 1 => ScalarFunction::Sin,
+        "COS" if args.len() == 1 => ScalarFunction::Cos,
+        "TAN" if args.len() == 1 => ScalarFunction::Tan,
+        "COT" if args.len() == 1 => ScalarFunction::Cot,
+        "ASIN" if args.len() == 1 => ScalarFunction::Asin,
+        "ACOS" if args.len() == 1 => ScalarFunction::Acos,
+        "ATAN" if args.len() == 1 => ScalarFunction::Atan,
+        "ATAN" | "ATAN2" if args.len() == 2 => ScalarFunction::Atan2,
+        "DEGREES" if args.len() == 1 => ScalarFunction::Degrees,
+        "RADIANS" if args.len() == 1 => ScalarFunction::Radians,
         "TRIM" if args.len() == 1 => ScalarFunction::Trim,
         "LENGTH" if args.len() == 1 => ScalarFunction::Length,
         "CHAR_LENGTH" | "CHARACTER_LENGTH" if args.len() == 1 => ScalarFunction::CharLength,
@@ -1615,6 +1626,16 @@ pub(super) fn bind_scalar(
             | ScalarFunction::Log10
             | ScalarFunction::LogBase
             | ScalarFunction::Power
+            | ScalarFunction::Sin
+            | ScalarFunction::Cos
+            | ScalarFunction::Tan
+            | ScalarFunction::Cot
+            | ScalarFunction::Asin
+            | ScalarFunction::Acos
+            | ScalarFunction::Atan
+            | ScalarFunction::Atan2
+            | ScalarFunction::Degrees
+            | ScalarFunction::Radians
     ) {
         args.into_iter()
             .map(super::temporal_extremum_as_number)
@@ -1792,6 +1813,7 @@ pub(super) fn bind_scalar(
         | ScalarFunction::Substring
         | ScalarFunction::Lower
         | ScalarFunction::Upper
+        | ScalarFunction::Soundex
         | ScalarFunction::Trim
         | ScalarFunction::Replace
         | ScalarFunction::Left
@@ -1849,7 +1871,7 @@ pub(super) fn bind_scalar(
         ScalarFunction::Ceil { decimal: true }
         | ScalarFunction::Floor { decimal: true }
         | ScalarFunction::Sign
-        | ScalarFunction::JsonDepth | ScalarFunction::ExtractTime { .. } | ScalarFunction::PackedDateParts { .. } => (Some(DataType::Int64), args[0].nullable),
+        | ScalarFunction::JsonDepth | ScalarFunction::ExtractTime { .. } | ScalarFunction::ExtractMicros { .. } | ScalarFunction::PackedDateParts { .. } => (Some(DataType::Int64), args[0].nullable),
         ScalarFunction::Truncate { decimal: true } => {
             let Some(DataType::Decimal { precision, scale }) = args[0].data_type else {
                 return Err(BindError::UnsupportedExpression("TRUNCATE".to_owned()));
@@ -1892,6 +1914,16 @@ pub(super) fn bind_scalar(
             args[0].nullable,
         ),
         ScalarFunction::Power
+        | ScalarFunction::Sin
+        | ScalarFunction::Cos
+        | ScalarFunction::Tan
+        | ScalarFunction::Cot
+        | ScalarFunction::Asin
+        | ScalarFunction::Acos
+        | ScalarFunction::Atan
+        | ScalarFunction::Atan2
+        | ScalarFunction::Degrees
+        | ScalarFunction::Radians
         | ScalarFunction::Sqrt
         | ScalarFunction::Exp
         | ScalarFunction::Ln

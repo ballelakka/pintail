@@ -1581,6 +1581,7 @@ impl CompiledExpr {
                     | ScalarFunction::JsonMemberOf | ScalarFunction::FloatString => 24,
                     ScalarFunction::FixedFloatString(_) => 342,
                     ScalarFunction::Lower | ScalarFunction::Upper => first.saturating_mul(12),
+                    ScalarFunction::Soundex => first.saturating_add(4),
                     ScalarFunction::Locate | ScalarFunction::Instr => string_arguments.saturating_mul(32).saturating_add(8),
                     ScalarFunction::Replace | ScalarFunction::RegexpReplace => {
                         first.saturating_add(first.saturating_add(1).saturating_mul(string(2)))
@@ -1647,6 +1648,7 @@ impl CompiledExpr {
                     | ScalarFunction::Between { .. }
                     | ScalarFunction::DatePart(_)
                     | ScalarFunction::ExtractTime { .. }
+                    | ScalarFunction::ExtractMicros { .. }
                     | ScalarFunction::PackedDateParts { .. }
                     | ScalarFunction::DateDiff
                     | ScalarFunction::UnixTimestamp
@@ -1655,6 +1657,16 @@ impl CompiledExpr {
                     | ScalarFunction::Floor { .. }
                     | ScalarFunction::Sign
                     | ScalarFunction::Power
+                    | ScalarFunction::Sin
+                    | ScalarFunction::Cos
+                    | ScalarFunction::Tan
+                    | ScalarFunction::Cot
+                    | ScalarFunction::Asin
+                    | ScalarFunction::Acos
+                    | ScalarFunction::Atan
+                    | ScalarFunction::Atan2
+                    | ScalarFunction::Degrees
+                    | ScalarFunction::Radians
                     | ScalarFunction::Sqrt
                     | ScalarFunction::Exp
                     | ScalarFunction::Ln
@@ -1806,6 +1818,7 @@ impl CompiledExpr {
                     // JSON_TYPE returns one of a handful of fixed names.
                     ScalarFunction::JsonType => 16,
                     ScalarFunction::Lower | ScalarFunction::Upper => first.saturating_mul(12),
+                    ScalarFunction::Soundex => first.saturating_add(4),
                     ScalarFunction::Replace | ScalarFunction::RegexpReplace => {
                         first.saturating_add(first.saturating_add(1).saturating_mul(bound(2)))
                     }
@@ -1866,6 +1879,7 @@ impl CompiledExpr {
                     | ScalarFunction::Between { .. }
                     | ScalarFunction::DatePart(_)
                     | ScalarFunction::ExtractTime { .. }
+                    | ScalarFunction::ExtractMicros { .. }
                     | ScalarFunction::PackedDateParts { .. }
                     | ScalarFunction::DateDiff
                     | ScalarFunction::UnixTimestamp
@@ -1874,6 +1888,16 @@ impl CompiledExpr {
                     | ScalarFunction::Floor { .. }
                     | ScalarFunction::Sign
                     | ScalarFunction::Power
+                    | ScalarFunction::Sin
+                    | ScalarFunction::Cos
+                    | ScalarFunction::Tan
+                    | ScalarFunction::Cot
+                    | ScalarFunction::Asin
+                    | ScalarFunction::Acos
+                    | ScalarFunction::Atan
+                    | ScalarFunction::Atan2
+                    | ScalarFunction::Degrees
+                    | ScalarFunction::Radians
                     | ScalarFunction::Sqrt
                     | ScalarFunction::Exp
                     | ScalarFunction::Ln
@@ -2362,6 +2386,7 @@ fn evaluate_eager_scalar_inner(
                 text.to_uppercase()
             }))
         }
+        ScalarFunction::Soundex => Ok(Value::Utf8(mysql_soundex(&scalar_string(&values[0])?))),
         ScalarFunction::Utf8Prefix => match &values[0] {
             Value::Binary(bytes) => Ok(Value::Binary(pintail_types::utf8_prefix(bytes).to_vec())),
             _ => Err(ExecError::InvalidExpressionType),
@@ -2452,6 +2477,9 @@ fn evaluate_eager_scalar_inner(
         }
         ScalarFunction::ExtractTime { leading, trailing } => {
             temporal::extract_time(&values[0], leading, trailing).map(Value::Int64)
+        }
+        ScalarFunction::ExtractMicros { leading } => {
+            temporal::extract_micros(&values[0], leading).map(Value::Int64)
         }
         ScalarFunction::Collate { .. } | ScalarFunction::PackedDateParts { .. } => {
             Ok(values[0].clone())
@@ -2814,6 +2842,38 @@ fn evaluate_eager_scalar_inner(
                 Ok(Value::float64(result))
             } else {
                 Err(ExecError::NumericOverflow)
+            }
+        }
+        ScalarFunction::Sin
+        | ScalarFunction::Cos
+        | ScalarFunction::Tan
+        | ScalarFunction::Cot
+        | ScalarFunction::Asin
+        | ScalarFunction::Acos
+        | ScalarFunction::Atan
+        | ScalarFunction::Atan2
+        | ScalarFunction::Degrees
+        | ScalarFunction::Radians => {
+            let value = mysql_f64(&values[0])?;
+            let result = match function {
+                ScalarFunction::Sin => value.sin(),
+                ScalarFunction::Cos => value.cos(),
+                ScalarFunction::Tan => value.tan(),
+                ScalarFunction::Cot => 1.0 / value.tan(),
+                ScalarFunction::Asin => value.asin(),
+                ScalarFunction::Acos => value.acos(),
+                ScalarFunction::Atan => value.atan(),
+                ScalarFunction::Atan2 => value.atan2(mysql_f64(&values[1])?),
+                ScalarFunction::Degrees => value.to_degrees(),
+                ScalarFunction::Radians => value.to_radians(),
+                _ => unreachable!(),
+            };
+            if result.is_nan() {
+                Ok(Value::Null)
+            } else if !result.is_finite() {
+                Err(ExecError::NumericOverflow)
+            } else {
+                Ok(Value::float64(result))
             }
         }
         ScalarFunction::Sqrt => {
@@ -6478,12 +6538,42 @@ fn mysql_json_array_text(items: &[JsonScalar]) -> String {
     output
 }
 
-/// Resolves a `MySQL` JSON path of the `$.key.nested[0]` form. Wildcards
-/// and range selectors are unsupported and error explicitly.
-/// `MySQL` `SUBSTRING_INDEX`: everything before the `count`-th delimiter from
-/// the left, or after it from the right when `count` is negative. Fewer
-/// occurrences than requested returns the whole subject rather than NULL,
-/// which is what makes it usable for URL and UTM splitting.
+/// Keep the first letter, drop vowels before deduplicating sound classes,
+/// and retain every distinct consonant class after the fourth character.
+fn mysql_soundex(text: &str) -> String {
+    let mut letters = text
+        .chars()
+        .filter(|letter| letter.is_ascii_alphabetic() || u32::from(*letter) >= 0xc0);
+    let Some(first) = letters.next() else {
+        return String::new();
+    };
+    let mut result = first.to_ascii_uppercase().to_string();
+    let code = |letter: char| match letter.to_ascii_uppercase() {
+        'B' | 'F' | 'P' | 'V' => Some('1'),
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => Some('2'),
+        'D' | 'T' => Some('3'),
+        'L' => Some('4'),
+        'M' | 'N' => Some('5'),
+        'R' => Some('6'),
+        _ => None,
+    };
+    let mut previous = code(first);
+    for letter in letters {
+        if let Some(next) = code(letter) {
+            if Some(next) != previous {
+                result.push(next);
+            }
+            previous = Some(next);
+        }
+    }
+    while result.chars().count() < 4 {
+        result.push('0');
+    }
+    result
+}
+
+/// `SUBSTRING_INDEX`: everything before the `count`-th delimiter from the
+/// left, or after it from the right when `count` is negative.
 fn substring_index(text: &str, delimiter: &str, count: i64) -> String {
     if delimiter.is_empty() || count == 0 {
         return String::new();

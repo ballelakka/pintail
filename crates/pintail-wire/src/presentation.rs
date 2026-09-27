@@ -20,6 +20,13 @@ pub(crate) fn columns(
         .enumerate()
         .map(|(index, projection)| {
             let mut column = expression(&projection.expr, query, catalog, facts);
+            if let Some(width) = query.result_bit_width(&projection.expr) {
+                column.coltype = ColumnType::MysqlTypeBit;
+                column.column_length = u32::from(width);
+                column.character_set = 63;
+                column.decimals = 0;
+                column.colflags |= ColumnFlags::BINARY_FLAG;
+            }
             column.column.clone_from(&projection.name);
             for branch in query
                 .union_all
@@ -542,6 +549,9 @@ fn expression(
                         column = first.clone();
                     }
                 }
+                ScalarFunction::Soundex => {
+                    column.column_length = first.map_or(16, |input| input.column_length.max(16));
+                }
                 ScalarFunction::TextCharset(_, _)
                 | ScalarFunction::CoerceText(_)
                 | ScalarFunction::Upper
@@ -1054,6 +1064,46 @@ fn source_declaration(column: &mut Column, fact: &pintail_sql::ColumnFacts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bit_projection_keeps_wire_type_and_numeric_expression_does_not() {
+        use pintail_catalog::{DatabaseEntry, DatabaseId, TableEntry, TableId};
+        use pintail_types::{Column as SchemaColumn, TableSchema};
+
+        let schema = TableSchema::new(
+            1,
+            vec![SchemaColumn::new(0, "flags", DataType::UInt64, false).with_bit_width(Some(16))],
+        )
+        .unwrap();
+        let catalog = CatalogSnapshot::new([DatabaseEntry::new(
+            DatabaseId::new(1),
+            "sample",
+            [TableEntry::new(
+                TableId::new(1),
+                "flags_table",
+                schema,
+                pintail_catalog::TableStatistics::default(),
+            )
+            .unwrap()],
+        )
+        .unwrap()])
+        .unwrap();
+        let statement =
+            pintail_sql::parse_statement("SELECT flags, flags + 0 FROM flags_table").unwrap();
+        let query = pintail_sql::Binder::new(&catalog, Some("sample"))
+            .bind(&statement)
+            .unwrap();
+        let fields = columns(&query, &catalog, &SourceFacts::default());
+        assert_eq!(
+            (
+                fields[0].coltype,
+                fields[0].column_length,
+                fields[0].character_set
+            ),
+            (ColumnType::MysqlTypeBit, 16, 63)
+        );
+        assert_ne!(fields[1].coltype, ColumnType::MysqlTypeBit);
+    }
 
     #[test]
     fn spatial_and_text_carried_temporal_declarations_survive_binding() {

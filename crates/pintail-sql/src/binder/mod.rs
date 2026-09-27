@@ -3183,17 +3183,25 @@ fn bind_expr_inner(
                         "year_month" => &[DatePart::Year, DatePart::Month],
                         "day_hour" => &[DatePart::Day, DatePart::Hour],
                         "day_minute" => &[DatePart::Day, DatePart::Hour, DatePart::Minute],
-                        "day_second" => &[
+                        // The _microsecond units share their seconds-and-up
+                        // parts; the fraction is appended below.
+                        "day_second" | "day_microsecond" => &[
                             DatePart::Day,
                             DatePart::Hour,
                             DatePart::Minute,
                             DatePart::Second,
                         ],
                         "hour_minute" => &[DatePart::Hour, DatePart::Minute],
-                        "hour_second" => &[DatePart::Hour, DatePart::Minute, DatePart::Second],
-                        "minute_second" => &[DatePart::Minute, DatePart::Second],
+                        "hour_second" | "hour_microsecond" => {
+                            &[DatePart::Hour, DatePart::Minute, DatePart::Second]
+                        }
+                        "minute_second" | "minute_microsecond" => {
+                            &[DatePart::Minute, DatePart::Second]
+                        }
+                        "second_microsecond" => &[DatePart::Second],
                         _ => return Err(BindError::UnsupportedExpression(expr.to_string())),
                     };
+                    let micros = ident.value.to_ascii_lowercase().ends_with("_microsecond");
                     let operand = bind_expr_inner(inner, tables, aggregates, windows, subqueries)?;
                     let folded = if parts[0] == DatePart::Year {
                         let mut folded: Option<BoundExpr> = None;
@@ -3232,6 +3240,13 @@ fn bind_expr_inner(
                             });
                         }
                         folded.expect("composite fields list at least two parts")
+                    } else if micros {
+                        bind_scalar(
+                            ScalarFunction::ExtractMicros {
+                                leading: Some(parts[0]),
+                            },
+                            vec![operand],
+                        )?
                     } else {
                         bind_scalar(
                             ScalarFunction::ExtractTime {
@@ -3242,7 +3257,10 @@ fn bind_expr_inner(
                         )?
                     };
                     let width = u8::try_from(
-                        parts.len() * 2 + 1 + usize::from(parts[0] == DatePart::Year) * 2,
+                        parts.len() * 2
+                            + 1
+                            + usize::from(parts[0] == DatePart::Year) * 2
+                            + if micros { 6 } else { 0 },
                     )
                     .unwrap_or(9);
                     return Ok(BoundExpr {
@@ -3253,6 +3271,14 @@ fn bind_expr_inner(
                             args: vec![folded],
                         },
                     });
+                }
+                DateTimeField::Microsecond => {
+                    return bind_scalar(
+                        ScalarFunction::ExtractMicros { leading: None },
+                        vec![bind_expr_inner(
+                            inner, tables, aggregates, windows, subqueries,
+                        )?],
+                    );
                 }
                 _ => return Err(BindError::UnsupportedExpression(expr.to_string())),
             };

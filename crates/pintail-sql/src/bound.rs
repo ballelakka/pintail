@@ -1056,6 +1056,19 @@ pub enum ScalarFunction {
     Lower,
     /// Unicode uppercase conversion.
     Upper,
+    /// Original, unbounded phonetic key.
+    Soundex,
+    /// Trigonometric and angle conversion functions.
+    Sin,
+    Cos,
+    Tan,
+    Cot,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Degrees,
+    Radians,
     /// Trim surrounding whitespace.
     Trim,
     /// `expr COLLATE name`: an identity pass-through whose collation
@@ -1401,6 +1414,11 @@ pub enum ScalarFunction {
         leading: DatePart,
         /// Last component in the packed result.
         trailing: DatePart,
+    },
+    /// Extract fractional seconds, optionally packed after clock fields.
+    ExtractMicros {
+        /// First clock component, or none for MICROSECOND alone.
+        leading: Option<DatePart>,
     },
     /// Concatenated decimal date/time components with their display width.
     PackedDateParts {

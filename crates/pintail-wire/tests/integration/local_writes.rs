@@ -509,6 +509,20 @@ fn bit_columns_keep_declared_bytes_when_concatenated() {
         "INSERT INTO flag_values VALUES (1,1),(2,18446744073709551615)",
     )
     .unwrap();
+    let direct = run(
+        &fixture,
+        "SELECT bits, bits + 0 FROM flag_values ORDER BY id",
+    )
+    .unwrap();
+    assert_eq!(
+        direct.fields[0].wire_column.as_ref().unwrap().coltype,
+        pintail_protocol::ColumnType::MysqlTypeBit
+    );
+    assert_ne!(
+        direct.fields[1].wire_column.as_ref().unwrap().coltype,
+        pintail_protocol::ColumnType::MysqlTypeBit
+    );
+    assert_eq!(direct.rows[0][0], pintail_types::Value::UInt64(1));
     for sql in [
         "SELECT HEX(CONCAT(bits)) FROM flag_values ORDER BY id",
         "SELECT HEX(CONCAT(payload)) FROM (SELECT id,bits AS payload FROM flag_values) AS derived ORDER BY id",

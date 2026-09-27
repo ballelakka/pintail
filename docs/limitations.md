@@ -78,7 +78,6 @@ stays readable as a list of things to fix.
   parenthesized group still rejects.
 - MySQL warning categories other than `GROUP_CONCAT` truncation are not yet
   retained in a general diagnostics area.
-- `SOUNDEX` and the trigonometric family are unimplemented.
 - `JSON_TYPE` matches MySQL for JSON parsed from text — `DOUBLE`, `INTEGER`,
   `STRING`, `BOOLEAN`, `NULL`, `ARRAY`, `OBJECT` all agree, measured. It
   diverges only for a value carrying a SQL type into the document, where MySQL
@@ -159,8 +158,8 @@ stays readable as a list of things to fix.
 
 - Date parsing is limited to canonical date and date-time forms. Compound
   interval quantities must be literals; dynamic compound interval expressions
-  are not implemented. `EXTRACT(MICROSECOND ...)` and its microsecond composite
-  qualifiers remain unsupported.
+  are not implemented. Compound intervals with microsecond qualifiers remain
+  unsupported.
 
 - Unix timestamp conversions round excess fractional digits to microseconds;
   `TIME_TRUNCATE_FRACTIONAL` does not switch them to truncation.
@@ -492,10 +491,6 @@ stays readable as a list of things to fix.
 
 ## MySQL wire protocol
 
-- A `BIT` column is returned as an integer. `MySQL` returns it as the raw
-  bytes of the value (`BIT(16)` holding all ones reaches a client as
-  `0xffff`, not `65535`), so a client that reads the column as a byte string
-  sees a different type and a different value on the two engines.
 - User variables are assigned only by `SET @name = expr`. An assignment inside
   a query - `SELECT @n := @n + 1`, `SELECT ... INTO @n` - is refused, and a
   variable holds the literal its expression answered, so one assigned from a
@@ -618,10 +613,6 @@ but may be wrong.
   MySQL's own column types (TIME, DATETIME, LONG_BLOB) as direct
   projections; wrapped in another expression they fall back to
   MYSQL_TYPE_VAR_STRING, because the wrapper's shape owns the result.
-
-- EXTRACT with a composite unit (YEAR_MONTH, DAY_HOUR, ...) is rejected
-  at parse: the SQL parser dependency does not recognize MySQL's
-  composite date-time fields. Single units work.
 
 - Comparing two JSON values (json_col = json_col) and JSON arithmetic
   are unsupported; MySQL compares JSON semantically (1.0 equals 1),
