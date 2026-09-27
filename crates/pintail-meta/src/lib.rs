@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, types::ValueRef};
 
 mod backup;
 mod control;
+mod maintenance;
 
 pub use backup::{
     BackupConfigRecord, BackupRecord, NewBackup, NewBackupConfig, RestoredCheckpoint,

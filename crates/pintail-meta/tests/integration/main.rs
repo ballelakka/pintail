@@ -7,6 +7,7 @@ mod cdc;
 mod control;
 mod copy_complete;
 mod interrupted_snapshots;
+mod maintenance;
 mod migrations;
 mod poll;
 mod recovery_failpoints;
