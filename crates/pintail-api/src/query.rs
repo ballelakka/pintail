@@ -24,6 +24,43 @@ const MAX_PREVIEW_ROWS: usize = 1_000;
 pub(crate) struct QueryRequest {
     db: String,
     sql: String,
+    /// The time zone the statement runs under, spelled as `SET time_zone`
+    /// takes it; the server's zone when absent. `TIMESTAMP` columns and
+    /// the clock functions read in it.
+    #[serde(default)]
+    time_zone: Option<String>,
+    /// A fixed statement clock in Unix seconds, as `SET timestamp` takes it.
+    #[serde(default)]
+    timestamp: Option<f64>,
+}
+
+/// The session state an HTTP request carries for its one statement.
+#[derive(Clone, Default)]
+struct QuerySession {
+    time_zone: Option<String>,
+    timestamp_micros: Option<i64>,
+}
+
+impl QuerySession {
+    fn of(request: &QueryRequest) -> Result<Self, ApiError> {
+        let timestamp_micros = match request.timestamp {
+            None => None,
+            Some(seconds) if seconds.is_finite() && (0.0..=32_536_771_199.0).contains(&seconds) =>
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                Some((seconds * 1_000_000.0).round() as i64)
+            }
+            Some(seconds) => {
+                return Err(ApiError::bad_request(format!(
+                    "Incorrect timestamp value: '{seconds}'"
+                )));
+            }
+        };
+        Ok(Self {
+            time_zone: request.time_zone.clone(),
+            timestamp_micros,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -270,7 +307,8 @@ pub(crate) async fn query(
     principal.require_scope("query")?;
     principal.authorize_database(&request.db)?;
     crate::databases::load_database(&state, &principal, &request.db)?;
-    let response = execute_query(&state, &request.db, &request.sql).await?;
+    let session = QuerySession::of(&request)?;
+    let response = execute_query(&state, &request.db, &request.sql, session).await?;
     audit::record(
         &state,
         &principal,
@@ -370,7 +408,9 @@ pub(crate) async fn table_data(
         quote_identifier(&name),
         query.offset
     );
-    execute_query(&state, &query.db, &sql).await.map(Json)
+    execute_query(&state, &query.db, &sql, QuerySession::default())
+        .await
+        .map(Json)
 }
 
 pub(crate) async fn table_count(
@@ -386,7 +426,7 @@ pub(crate) async fn table_count(
         "SELECT COUNT(*) AS `count` FROM `{}`",
         quote_identifier(&name)
     );
-    let response = execute_query(&state, &query.db, &sql).await?;
+    let response = execute_query(&state, &query.db, &sql, QuerySession::default()).await?;
     let count = match response.rows.first_cell() {
         Some(Value::UInt64(count)) => Some(*count),
         Some(Value::Int64(count)) => u64::try_from(*count).ok(),
@@ -408,6 +448,7 @@ async fn execute_query(
     state: &ApiState,
     database_id: &str,
     sql: &str,
+    session: QuerySession,
 ) -> Result<QueryResponse, ApiError> {
     let debug = std::env::var_os("PINTAIL_API_DEBUG").is_some();
     let started = Instant::now();
@@ -427,6 +468,24 @@ async fn execute_query(
         // uninstalled it took whatever the blocking thread last held, and a
         // fresh thread holds the process default - so the two doors into the
         // same engine disagreed about zero dates and strict conversion.
+        //
+        // The request's zone and clock bracket exactly this statement on
+        // this thread, which the pool hands to the next request afterwards.
+        struct RestoreSession;
+        impl Drop for RestoreSession {
+            fn drop(&mut self) {
+                let _ = pintail_exec::set_session_time_zone(None);
+                pintail_exec::set_session_timestamp_micros(None);
+            }
+        }
+        let _restore = RestoreSession;
+        if !pintail_exec::set_session_time_zone(session.time_zone.as_deref()) {
+            return Err(QueryError::Invalid(format!(
+                "Unknown or incorrect time zone: '{}'",
+                session.time_zone.unwrap_or_default()
+            )));
+        }
+        pintail_exec::set_session_timestamp_micros(session.timestamp_micros);
         pintail_sql::with_parse_mode(pintail_sql::ParseMode::default(), || {
             pintail_exec::with_execution_cancellation(
                 pintail_exec::ExecutionCancellation::new(),

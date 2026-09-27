@@ -939,6 +939,55 @@ async fn snapshot_jobs_reject_paused_databases_without_leaking_a_job_slot() {
     }
 }
 
+/// A request carries its own zone and clock for its one statement.
+async fn assert_request_sessions(app: &axum::Router, authorization: &str, database_id: &str) {
+    let session_query = |body: String| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    };
+    let zoned = session_query(format!(
+        r#"{{"db":"{database_id}","sql":"SELECT NOW(), FROM_UNIXTIME(0)","time_zone":"+05:30","timestamp":86400}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(zoned.status(), StatusCode::OK);
+    let zoned = json_response(zoned).await;
+    assert_eq!(zoned["rows"][0][0], "1970-01-02 05:30:00");
+    assert_eq!(zoned["rows"][0][1], "1970-01-01 05:30:00");
+    let unpinned = session_query(format!(
+        r#"{{"db":"{database_id}","sql":"SELECT UNIX_TIMESTAMP()"}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(unpinned.status(), StatusCode::OK);
+    let now = json_response(unpinned).await["rows"][0][0].clone();
+    let seconds = now
+        .as_i64()
+        .or_else(|| now.as_str().and_then(|text| text.parse().ok()))
+        .unwrap_or_default();
+    assert!(
+        seconds > 1_000_000,
+        "the clock does not outlive its request: {now}"
+    );
+    let unknown = session_query(format!(
+        r#"{{"db":"{database_id}","sql":"SELECT 1","time_zone":"Mars/Olympus"}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_response(unknown).await["error"],
+        "Unknown or incorrect time zone: 'Mars/Olympus'"
+    );
+}
+
 #[tokio::test]
 async fn query_and_table_routes_read_the_same_mirrored_snapshot() {
     let data = tempfile::tempdir().expect("API data directory");
@@ -996,6 +1045,8 @@ async fn query_and_table_routes_read_the_same_mirrored_snapshot() {
         json_response(write).await["error"],
         "Pintail's HTTP query surface is read-only"
     );
+
+    assert_request_sessions(&app, &authorization, database_id).await;
 
     let schema = app
         .clone()
