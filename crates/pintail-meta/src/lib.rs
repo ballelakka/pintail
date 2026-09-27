@@ -3,12 +3,7 @@
 //! This crate stores configuration and replication metadata only. Analytical
 //! row data belongs exclusively to `pintail-store`.
 
-use std::{
-    collections::{BTreeSet, HashSet},
-    path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, types::ValueRef};
@@ -27,34 +22,6 @@ pub use control::{
 };
 
 const CURRENT_SCHEMA_VERSION: u32 = 23;
-
-#[derive(Eq, Hash, PartialEq)]
-struct DatabaseIdentity {
-    path: PathBuf,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-fn database_identity(path: PathBuf) -> Result<DatabaseIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        let metadata = std::fs::metadata(&path)
-            .with_context(|| format!("failed to inspect metadata database {}", path.display()))?;
-        Ok(DatabaseIdentity {
-            path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(DatabaseIdentity { path })
-    }
-}
 
 /// An initialized Pintail control-plane database.
 pub struct MetaStore {
@@ -207,8 +174,7 @@ impl StoredSetting {
 }
 
 impl MetaStore {
-    /// Opens a control-plane database, applying pending migrations on its first
-    /// open in this process.
+    /// Opens a control-plane database and applies all pending migrations.
     ///
     /// # Errors
     ///
@@ -219,7 +185,6 @@ impl MetaStore {
         let path = path
             .canonicalize()
             .with_context(|| format!("failed to resolve metadata database {}", path.display()))?;
-        let identity = database_identity(path.clone())?;
         let mut connection = Connection::open(&path)
             .with_context(|| format!("failed to open metadata database {}", path.display()))?;
         connection
@@ -228,17 +193,19 @@ impl MetaStore {
         connection
             .pragma_update(None, "foreign_keys", true)
             .context("failed to enable SQLite foreign keys")?;
-        static INITIALIZED: OnceLock<Mutex<HashSet<DatabaseIdentity>>> = OnceLock::new();
-        let mut initialized = INITIALIZED
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .map_err(|_| anyhow::anyhow!("metadata initialization lock poisoned"))?;
-        if !initialized.contains(&identity) {
+        // Only a file behind the current schema needs WAL set and migrations
+        // run: re-running them on every open took write locks on the live
+        // file for nothing. Reading the version each time, rather than
+        // remembering a file as done, still upgrades one restored or
+        // replaced under the same path.
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .context("failed to read metadata schema version")?;
+        if version < CURRENT_SCHEMA_VERSION {
             connection
                 .pragma_update(None, "journal_mode", "WAL")
                 .context("failed to enable SQLite WAL mode")?;
             migrate(&mut connection)?;
-            initialized.insert(identity);
         }
         Ok(Self { connection })
     }

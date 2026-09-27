@@ -31,17 +31,17 @@ fn seed(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_loop(path: PathBuf, worker: usize, until: Instant) -> Result<()> {
+fn write_loop(path: &Path, worker: usize, until: Instant) -> Result<()> {
     let mut sequence = 0_u64;
     while Instant::now() < until {
         let database = DATABASES[worker % DATABASES.len()];
         let table = TABLES[worker % TABLES.len()];
         let id = format!("worker-{worker}-{sequence}");
-        MetaStore::open(&path)?.upsert_snapshot_table(database, table, None, None)?;
-        MetaStore::open(&path)?.start_snapshot_chunk(database, table, &id, None, None)?;
-        MetaStore::open(&path)?.complete_snapshot_chunk(database, table, &id, 1)?;
-        MetaStore::open(&path)?.start_sync_run(&id, database, Some(table), "snapshot", "now")?;
-        MetaStore::open(&path)?.finish_sync_run(&id, "completed", 1, 1, 1, None)?;
+        MetaStore::open(path)?.upsert_snapshot_table(database, table, None, None)?;
+        MetaStore::open(path)?.start_snapshot_chunk(database, table, &id, None, None)?;
+        MetaStore::open(path)?.complete_snapshot_chunk(database, table, &id, 1)?;
+        MetaStore::open(path)?.start_sync_run(&id, database, Some(table), "snapshot", "now")?;
+        MetaStore::open(path)?.finish_sync_run(&id, "completed", 1, 1, 1, None)?;
         sequence += 1;
         thread::sleep(Duration::from_millis(2));
     }
@@ -89,7 +89,7 @@ fn run_case(foreign_fd: bool, second_process: bool) -> Result<()> {
     let mut workers = Vec::new();
     for worker in 0..8 {
         let path = path.clone();
-        workers.push(thread::spawn(move || write_loop(path, worker, until)));
+        workers.push(thread::spawn(move || write_loop(&path, worker, until)));
     }
     let reader_path = path.clone();
     workers.push(thread::spawn(move || {
@@ -128,10 +128,10 @@ fn run_case(foreign_fd: bool, second_process: bool) -> Result<()> {
             worker_error.get_or_insert(error);
         }
     }
-    if let Some(mut child) = child {
-        if !child.wait()?.success() {
-            worker_error.get_or_insert_with(|| anyhow::anyhow!("second process failed"));
-        }
+    if let Some(mut child) = child
+        && !child.wait()?.success()
+    {
+        worker_error.get_or_insert_with(|| anyhow::anyhow!("second process failed"));
     }
     integrity_check(&path)?;
     if let Some(error) = worker_error {
@@ -149,9 +149,9 @@ fn second_process_worker() -> Result<()> {
     let path = PathBuf::from(path);
     let a = thread::spawn({
         let path = path.clone();
-        move || write_loop(path, 100, until)
+        move || write_loop(&path, 100, until)
     });
-    let b = thread::spawn(move || write_loop(path, 101, until));
+    let b = thread::spawn(move || write_loop(&path, 101, until));
     a.join().expect("child writer panicked")?;
     b.join().expect("child writer panicked")?;
     Ok(())
