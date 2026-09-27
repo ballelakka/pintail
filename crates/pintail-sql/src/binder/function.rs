@@ -746,17 +746,14 @@ fn bind_timestamp_add(
     let Expr::Identifier(unit) = unit else {
         return Err(BindError::UnsupportedExpression(function.to_string()));
     };
-    let unit = match unit.value.to_ascii_uppercase().as_str() {
-        "YEAR" => IntervalUnit::Year,
-        "MONTH" => IntervalUnit::Month,
-        "DAY" => IntervalUnit::Day,
-        "HOUR" => IntervalUnit::Hour,
-        "MINUTE" => IntervalUnit::Minute,
-        "SECOND" => IntervalUnit::Second,
-        _ => return Err(BindError::UnsupportedExpression(function.to_string())),
+    let Some((unit, factor)) = interval_unit_named(&unit.value) else {
+        return Err(BindError::UnsupportedExpression(function.to_string()));
     };
     let datetime = bind_expr_inner(datetime, tables, aggregates, windows, subqueries)?;
-    let amount = bind_expr_inner(amount, tables, aggregates, windows, subqueries)?;
+    let amount = scaled_amount(
+        bind_expr_inner(amount, tables, aggregates, windows, subqueries)?,
+        factor,
+    )?;
     bind_scalar(
         ScalarFunction::DateInterval {
             unit,
@@ -806,28 +803,80 @@ pub(super) fn bind_interval_arithmetic(
     {
         return Err(BindError::UnsupportedExpression(interval.to_string()));
     }
-    let Some(unit) = interval_unit_of(interval.leading_field.as_ref()) else {
+    let Some((unit, factor)) = interval_unit_of(interval.leading_field.as_ref()) else {
         return Err(BindError::UnsupportedExpression(interval.to_string()));
     };
+    let amount = bind_expr_inner(&interval.value, tables, aggregates, windows, subqueries)?;
     bind_scalar(
         ScalarFunction::DateInterval { unit, subtract },
         vec![
             bind_expr_inner(date, tables, aggregates, windows, subqueries)?,
-            bind_expr_inner(&interval.value, tables, aggregates, windows, subqueries)?,
+            scaled_amount(amount, factor)?,
         ],
     )
 }
 
-fn interval_unit_of(field: Option<&DateTimeField>) -> Option<IntervalUnit> {
-    match field {
-        Some(DateTimeField::Year) => Some(IntervalUnit::Year),
-        Some(DateTimeField::Month) => Some(IntervalUnit::Month),
-        Some(DateTimeField::Day) => Some(IntervalUnit::Day),
-        Some(DateTimeField::Hour) => Some(IntervalUnit::Hour),
-        Some(DateTimeField::Minute) => Some(IntervalUnit::Minute),
-        Some(DateTimeField::Second) => Some(IntervalUnit::Second),
+/// An interval unit as the unit it counts in and how many of those one of it
+/// is: a week is seven days and a quarter three months.
+fn interval_unit_of(field: Option<&DateTimeField>) -> Option<(IntervalUnit, i64)> {
+    match field? {
+        DateTimeField::Year => Some((IntervalUnit::Year, 1)),
+        DateTimeField::Quarter => Some((IntervalUnit::Month, 3)),
+        DateTimeField::Month => Some((IntervalUnit::Month, 1)),
+        DateTimeField::Week(None) => Some((IntervalUnit::Day, 7)),
+        DateTimeField::Day => Some((IntervalUnit::Day, 1)),
+        DateTimeField::Hour => Some((IntervalUnit::Hour, 1)),
+        DateTimeField::Minute => Some((IntervalUnit::Minute, 1)),
+        DateTimeField::Second => Some((IntervalUnit::Second, 1)),
         _ => None,
     }
+}
+
+/// [`interval_unit_of`] for a unit written as a bare word, as `TIMESTAMPADD`
+/// and `TIMESTAMPDIFF` take it.
+fn interval_unit_named(name: &str) -> Option<(IntervalUnit, i64)> {
+    match name.to_ascii_uppercase().as_str() {
+        "YEAR" => Some((IntervalUnit::Year, 1)),
+        "QUARTER" => Some((IntervalUnit::Month, 3)),
+        "MONTH" => Some((IntervalUnit::Month, 1)),
+        "WEEK" => Some((IntervalUnit::Day, 7)),
+        "DAY" => Some((IntervalUnit::Day, 1)),
+        "HOUR" => Some((IntervalUnit::Hour, 1)),
+        "MINUTE" => Some((IntervalUnit::Minute, 1)),
+        "SECOND" => Some((IntervalUnit::Second, 1)),
+        _ => None,
+    }
+}
+
+/// An interval amount counted in a smaller unit. `MySQL` reads a week or
+/// quarter amount as an integer before it counts, so `INTERVAL 1.5 WEEK` is
+/// two weeks, not ten and a half days; the integer cast does that reading.
+fn scaled_amount(amount: BoundExpr, factor: i64) -> Result<BoundExpr, BindError> {
+    if factor == 1 {
+        return Ok(amount);
+    }
+    if let Some(value) = signed_integer_constant(&amount).and_then(|n| n.checked_mul(factor)) {
+        return Ok(BoundExpr {
+            kind: BoundExprKind::Literal(Value::Int64(value)),
+            data_type: Some(DataType::Int64),
+            nullable: false,
+        });
+    }
+    let nullable = amount.nullable;
+    let amount = bind_scalar(ScalarFunction::Cast(DataType::Int64), vec![amount])?;
+    Ok(BoundExpr {
+        kind: BoundExprKind::Binary {
+            op: BinaryOp::Multiply,
+            left: Box::new(amount),
+            right: Box::new(BoundExpr {
+                kind: BoundExprKind::Literal(Value::Int64(factor)),
+                data_type: Some(DataType::Int64),
+                nullable: false,
+            }),
+        },
+        data_type: Some(DataType::Int64),
+        nullable,
+    })
 }
 
 /// `TIMESTAMPDIFF(unit, from, to)` — the unit is a bare keyword argument.
@@ -850,22 +899,35 @@ fn bind_timestamp_diff(
     let Expr::Identifier(unit) = unit else {
         return Err(BindError::UnsupportedExpression(function.to_string()));
     };
-    let unit = match unit.value.to_ascii_uppercase().as_str() {
-        "YEAR" => IntervalUnit::Year,
-        "MONTH" => IntervalUnit::Month,
-        "DAY" => IntervalUnit::Day,
-        "HOUR" => IntervalUnit::Hour,
-        "MINUTE" => IntervalUnit::Minute,
-        "SECOND" => IntervalUnit::Second,
-        _ => return Err(BindError::UnsupportedExpression(function.to_string())),
+    let Some((unit, factor)) = interval_unit_named(&unit.value) else {
+        return Err(BindError::UnsupportedExpression(function.to_string()));
     };
-    bind_scalar(
+    let elapsed = bind_scalar(
         ScalarFunction::TimestampDiff { unit },
         vec![
             bind_expr_inner(from, tables, aggregates, windows, subqueries)?,
             bind_expr_inner(to, tables, aggregates, windows, subqueries)?,
         ],
-    )
+    )?;
+    if factor == 1 {
+        return Ok(elapsed);
+    }
+    // Whole weeks are whole days over seven, and whole quarters whole months
+    // over three: truncating twice toward zero truncates once.
+    let nullable = elapsed.nullable;
+    Ok(BoundExpr {
+        kind: BoundExprKind::Binary {
+            op: BinaryOp::IntegerDivide,
+            left: Box::new(elapsed),
+            right: Box::new(BoundExpr {
+                kind: BoundExprKind::Literal(Value::Int64(factor)),
+                data_type: Some(DataType::Int64),
+                nullable: false,
+            }),
+        },
+        data_type: Some(DataType::Int64),
+        nullable,
+    })
 }
 
 /// An `IN` list whose items `MySQL` compares in different domains, rewritten

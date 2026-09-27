@@ -2192,3 +2192,22 @@ fn negation_reads_its_operand_as_a_number() {
     ]);
 }
 
+#[test]
+fn week_and_quarter_intervals_count_days_and_months() {
+    assert_answers(&[
+        ("DATE_ADD('2024-01-01', INTERVAL 2 WEEK)", "2024-01-15"),
+        ("DATE_ADD('2024-01-01', INTERVAL id WEEK)", "2024-01-08"),
+        ("DATE_ADD('2024-01-01', INTERVAL 1.5 WEEK)", "2024-01-15"),
+        ("DATE('2024-01-10') - INTERVAL 1 WEEK", "2024-01-03"),
+        ("DATE_ADD('2024-01-31', INTERVAL 1 QUARTER)", "2024-04-30"),
+        (
+            "DATE_SUB('2024-05-31 10:00:00', INTERVAL id QUARTER)",
+            "2024-02-29 10:00:00",
+        ),
+        ("TIMESTAMPADD(WEEK, 1, '2024-01-01')", "2024-01-08"),
+        ("TIMESTAMPADD(QUARTER, -1, '2024-03-31')", "2023-12-31"),
+        ("TIMESTAMPDIFF(WEEK, '2024-01-01', '2024-01-14')", "1"),
+        ("TIMESTAMPDIFF(WEEK, '2024-01-14', '2024-01-01')", "-1"),
+        ("TIMESTAMPDIFF(QUARTER, '2024-01-15', '2024-07-14')", "1"),
+    ]);
+}

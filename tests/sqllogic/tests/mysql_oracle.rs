@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1929;
+const EXPECTED_CASES: usize = 1931;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2164,6 +2164,19 @@ fn hand_written_cases() -> Vec<OracleCase> {
         ordered(
             "hex literals as numbers",
             "SELECT 0x61 = 'a', HEX(0x61), 0x61 < 'b'",
+        ),
+        ordered(
+            "week and quarter intervals",
+            "SELECT DATE_ADD('2024-01-01', INTERVAL 2 WEEK), DATE_ADD('2024-01-01', INTERVAL 1.5 WEEK), \
+                    DATE('2024-01-10') - INTERVAL 1 WEEK, DATE_ADD('2024-01-31', INTERVAL 1 QUARTER), \
+                    DATE_SUB('2024-05-31 10:00:00', INTERVAL 1 QUARTER), TIMESTAMPADD(WEEK, 1, '2024-01-01'), \
+                    TIMESTAMPADD(QUARTER, -1, '2024-03-31'), TIMESTAMPDIFF(WEEK, '2024-01-01', '2024-01-14'), \
+                    TIMESTAMPDIFF(WEEK, '2024-01-14', '2024-01-01'), TIMESTAMPDIFF(QUARTER, '2024-01-15', '2024-07-14')",
+        ),
+        ordered(
+            "week and quarter intervals",
+            "SELECT id, DATE_ADD(placed_at, INTERVAL user_id WEEK), TIMESTAMPDIFF(QUARTER, placed_at, '2026-01-01') \
+             FROM orders ORDER BY id",
         ),
         ordered(
             "negation of non-numeric operands",

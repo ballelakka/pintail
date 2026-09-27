@@ -9649,9 +9649,19 @@ mod tests {
                 .iter()
                 .all(|item| item.expr.data_type == Some(DataType::Int64))
         );
-        // WEEK parses but is outside the supported unit set.
+        // A week counts whole days and a quarter whole months.
+        let query = bind(
+            "SELECT TIMESTAMPDIFF(WEEK, Name, Name), TIMESTAMPDIFF(QUARTER, Name, Name) FROM Events",
+        )
+        .expect("week and quarter differences bind");
+        assert!(
+            query
+                .projection
+                .iter()
+                .all(|item| item.expr.data_type == Some(DataType::Int64))
+        );
         assert!(matches!(
-            bind("SELECT TIMESTAMPDIFF(WEEK, Name, Name) FROM Events"),
+            bind("SELECT TIMESTAMPDIFF(MICROSECOND, Name, Name) FROM Events"),
             Err(BindError::UnsupportedExpression(_))
         ));
     }
