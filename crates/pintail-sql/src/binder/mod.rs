@@ -5682,11 +5682,13 @@ fn bind_aggregate(
                         &key.expr
                     };
                     let bound = bind_expr(expression, tables, subqueries)?;
-                    if bound.data_type == Some(DataType::Json) {
-                        return Err(BindError::UnsupportedAggregate(format!(
-                            "{function}: ORDER BY over JSON requires JSON-aware ordering"
-                        )));
-                    }
+                    // A JSON key orders by the JSON ladder, which its sort
+                    // key's bytes preserve.
+                    let bound = if bound.data_type == Some(DataType::Json) {
+                        json_sort_key_expr(bound)
+                    } else {
+                        bound
+                    };
                     ensure_supported_text_collation(&[&bound])?;
                     order_within.push((bound, key.options.asc.unwrap_or(true)));
                 }
@@ -6082,9 +6084,9 @@ fn aggregate_result_type(
             };
             Ok((Some(result), true))
         }
-        AggregateFunction::Minimum | AggregateFunction::Maximum
-            if is_mysql_scalar(input_type) && input_type != Some(DataType::Json) =>
-        {
+        // JSON compares by the JSON ladder, which the executor applies to
+        // a JSON-typed extreme.
+        AggregateFunction::Minimum | AggregateFunction::Maximum if is_mysql_scalar(input_type) => {
             Ok((input_type, true))
         }
         AggregateFunction::GroupConcat if is_mysql_scalar(input_type) => {
@@ -6848,12 +6850,14 @@ fn has_json_projection(query: &BoundQuery) -> bool {
 
 fn rewrite_json_comparison(left: BoundExpr, right: BoundExpr) -> (BoundExpr, BoundExpr) {
     let json = |data_type| data_type == Some(DataType::Json);
-    if json(left.data_type) && (json(right.data_type) || is_json_number(right.data_type))
-        || json(right.data_type) && is_json_number(left.data_type)
+    let joins_json =
+        |data_type| json(data_type) || is_json_number(data_type) || is_json_text(data_type);
+    if json(left.data_type) && joins_json(right.data_type)
+        || json(right.data_type) && joins_json(left.data_type)
     {
         (
-            json_sort_key_expr(as_json(left)),
-            json_sort_key_expr(as_json(right)),
+            json_sort_key_expr(as_json(json_text_operand(left))),
+            json_sort_key_expr(as_json(json_text_operand(right))),
         )
     } else {
         (left, right)
@@ -6868,11 +6872,13 @@ fn rewrite_json_comparison_list(args: Vec<BoundExpr>) -> Vec<BoundExpr> {
             .iter()
             .any(|argument| argument.data_type == Some(DataType::Json))
         && args.iter().all(|argument| {
-            argument.data_type == Some(DataType::Json) || is_json_number(argument.data_type)
+            argument.data_type == Some(DataType::Json)
+                || is_json_number(argument.data_type)
+                || is_json_text(argument.data_type)
         })
     {
         args.into_iter()
-            .map(|argument| json_sort_key_expr(as_json(argument)))
+            .map(|argument| json_sort_key_expr(as_json(json_text_operand(argument))))
             .collect()
     } else {
         args
@@ -6900,6 +6906,29 @@ fn is_json_number(data_type: Option<DataType>) -> bool {
                 | DataType::Decimal { .. }
         )
     )
+}
+
+/// Text compared with a JSON value becomes a JSON string in `MySQL` - it is
+/// not parsed, so `'1'` is the string "1" and unequal to the number 1.
+fn is_json_text(data_type: Option<DataType>) -> bool {
+    data_type == Some(DataType::Utf8)
+}
+
+/// Quotes a text operand so that reading it as JSON yields the string
+/// itself; anything else passes through.
+fn json_text_operand(expr: BoundExpr) -> BoundExpr {
+    if !is_json_text(expr.data_type) {
+        return expr;
+    }
+    let nullable = expr.nullable;
+    BoundExpr {
+        kind: BoundExprKind::Scalar {
+            function: ScalarFunction::JsonQuote,
+            args: vec![expr],
+        },
+        data_type: Some(DataType::Utf8),
+        nullable,
+    }
 }
 
 fn as_json(expr: BoundExpr) -> BoundExpr {
@@ -9929,7 +9958,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_json_operations_without_json_aware_key_semantics() {
+    fn json_operations_follow_the_json_ladder() {
         let json = "JSON_EXTRACT(Name, '$.a')";
         // JSON-to-JSON comparison and key semantics ride MySQL's ladder now.
         for sql in [
@@ -9948,35 +9977,18 @@ mod tests {
         // A JSON comparison binds as a byte comparison of ladder keys.
         let bound = bind(&format!("SELECT {json} = {json} FROM Events")).expect("json equality");
         assert_eq!(bound.projection[0].expr.data_type, Some(DataType::Boolean));
-        // Residuals that stay rejected: mixed JSON/scalar comparison (MySQL
-        // coerces the scalar to JSON; Pintail does not guess), MIN/MAX,
-        // window keys, GROUP_CONCAT internal ordering.
-        assert!(matches!(
-            bind(&format!("SELECT {json} = 'a' FROM Events")),
-            Err(BindError::InvalidBinaryTypes { .. })
-        ));
-        assert!(matches!(
-            bind(&format!("SELECT MIN({json}) FROM Events")),
-            Err(BindError::InvalidAggregateType { .. })
-        ));
-        assert!(matches!(
-            bind(&format!(
-                "SELECT ROW_NUMBER() OVER (PARTITION BY {json}) FROM Events"
-            )),
-            Err(BindError::InvalidGrouping(_))
-        ));
-        assert!(matches!(
-            bind(&format!(
-                "SELECT ROW_NUMBER() OVER (ORDER BY {json}) FROM Events"
-            )),
-            Err(BindError::InvalidOrderBy(_))
-        ));
-        assert!(matches!(
-            bind(&format!(
-                "SELECT GROUP_CONCAT(Name ORDER BY {json}) FROM Events"
-            )),
-            Err(BindError::UnsupportedAggregate(_))
-        ));
+        // Text against JSON, MIN/MAX, window keys and GROUP_CONCAT's own
+        // ordering all ride the ladder too.
+        for sql in [
+            format!("SELECT {json} = 'a' FROM Events"),
+            format!("SELECT {json} IN ('a', 'b') FROM Events"),
+            format!("SELECT MIN({json}), MAX({json}) FROM Events"),
+            format!("SELECT ROW_NUMBER() OVER (PARTITION BY {json}) FROM Events"),
+            format!("SELECT ROW_NUMBER() OVER (ORDER BY {json}) FROM Events"),
+            format!("SELECT GROUP_CONCAT(Name ORDER BY {json}) FROM Events"),
+        ] {
+            bind(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
     }
 
     #[test]

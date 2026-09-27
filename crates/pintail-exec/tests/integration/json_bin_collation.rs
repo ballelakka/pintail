@@ -329,28 +329,14 @@ fn json_in_and_between_ride_the_same_keys() {
 }
 
 #[test]
-fn mixed_json_and_scalar_comparison_stays_rejected() {
-    // MySQL coerces the scalar side to JSON here; Pintail refuses rather
-    // than guessing that rule - one side wrapped would byte-compare
-    // nonsense.
-    let directory = tempfile::tempdir().expect("temporary table");
-    let mut table =
-        TableStore::open(directory.path(), schema(), StoreOptions::default()).expect("open table");
-    table
-        .bulk_ingest_snapshot(ROWS.iter().map(|(id, meta)| row(*id, *meta)).collect())
-        .expect("bulk snapshot");
-    let entry = TableEntry::new(
-        TableId::new(17),
-        "orders",
-        schema(),
-        TableStatistics::with_row_count(ROWS.len() as u64),
-    )
-    .expect("table entry");
-    let database = DatabaseEntry::new(DatabaseId::new(15), "app", [entry]).expect("database entry");
-    let catalog = CatalogSnapshot::new([database]).expect("catalog");
-    let statement =
-        parse_statement("SELECT COUNT(*) FROM orders WHERE meta = 'x'").expect("parse query");
-    assert!(Binder::new(&catalog, Some("app")).bind(&statement).is_err());
+fn text_compared_with_json_is_a_json_string() {
+    // MySQL reads the text side as a JSON string, unparsed and compared
+    // byte-exactly: "PREMIUM" is not "premium", and no document equals
+    // the text of an object.
+    let rows = run("SELECT COUNT(*) FROM orders WHERE JSON_EXTRACT(meta,'$.tags[0]') = 'premium'");
+    assert_eq!(rows, vec![vec!["2".to_owned()]]);
+    let rows = run("SELECT COUNT(*) FROM orders WHERE meta = '{\"tags\":[],\"score\":0}'");
+    assert_eq!(rows, vec![vec!["0".to_owned()]]);
 }
 
 #[test]

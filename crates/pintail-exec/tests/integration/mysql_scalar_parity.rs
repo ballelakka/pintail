@@ -2369,3 +2369,47 @@ fn recursive_ctes_take_several_members_and_a_limit() {
         ),
     ]);
 }
+
+#[test]
+fn json_meets_text_and_orders_by_its_ladder() {
+    let values = "(SELECT CAST('2' AS JSON) j, 1 k UNION ALL SELECT CAST('10' AS JSON), 2 \
+                  UNION ALL SELECT CAST('\"a\"' AS JSON), 3) t";
+    assert_answers(&[
+        (
+            "JSON_EXTRACT('{\"a\":\"x\"}', '$.a') = 'x'",
+            "Boolean(true)",
+        ),
+        ("JSON_EXTRACT('{\"a\":1}', '$.a') = '1'", "Boolean(false)"),
+        (
+            "JSON_EXTRACT('{\"a\":true}', '$.a') = 'true'",
+            "Boolean(false)",
+        ),
+        ("CAST('[1]' AS JSON) = '[1]'", "Boolean(false)"),
+        (
+            "JSON_EXTRACT('{\"a\":\"x\"}', '$.a') < 'y'",
+            "Boolean(true)",
+        ),
+        ("JSON_EXTRACT('{\"a\":2}', '$.a') < 'y'", "Boolean(true)"),
+        ("CAST('3' AS JSON) > 'a'", "Boolean(false)"),
+        ("CAST('\"x\"' AS JSON) IN ('y', 'x')", "Boolean(true)"),
+        (&format!("(SELECT MIN(j) FROM {values})"), "2"),
+        (&format!("(SELECT MAX(j) FROM {values})"), "\"a\""),
+        (
+            &format!("(SELECT GROUP_CONCAT(j ORDER BY j) FROM {values})"),
+            "2,10,\"a\"",
+        ),
+        (
+            &format!(
+                "(SELECT GROUP_CONCAT(r ORDER BY r) FROM \
+                 (SELECT ROW_NUMBER() OVER (ORDER BY j DESC) * 10 + k r FROM {values}) u)"
+            ),
+            "13,22,31",
+        ),
+        (
+            "(SELECT GROUP_CONCAT(c ORDER BY c) FROM (SELECT COUNT(*) OVER (PARTITION BY j) c FROM \
+             (SELECT CAST('{\"a\":1,\"b\":2}' AS JSON) j UNION ALL \
+              SELECT CAST('{\"b\":2,\"a\":1}' AS JSON) UNION ALL SELECT CAST('1.0' AS JSON)) t) u)",
+            "1,2,2",
+        ),
+    ]);
+}

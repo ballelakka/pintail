@@ -360,22 +360,27 @@ pub(super) fn bind_window_function(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if partition_by
-        .iter()
-        .any(|expression| expression.data_type == Some(DataType::Json))
-    {
-        return Err(BindError::InvalidGrouping(
-            "window PARTITION BY over JSON requires JSON-aware equality".to_owned(),
-        ));
-    }
-    if order_by
-        .iter()
-        .any(|key| key.expr.data_type == Some(DataType::Json))
-    {
-        return Err(BindError::InvalidOrderBy(
-            "window ORDER BY over JSON requires JSON-aware ordering".to_owned(),
-        ));
-    }
+    // JSON keys partition and order by the JSON ladder: equal documents
+    // share a sort key, and its bytes order as the ladder does.
+    let partition_by = partition_by
+        .into_iter()
+        .map(|expression| {
+            if expression.data_type == Some(DataType::Json) {
+                super::json_sort_key_expr(expression)
+            } else {
+                expression
+            }
+        })
+        .collect::<Vec<_>>();
+    let order_by = order_by
+        .into_iter()
+        .map(|mut key| {
+            if key.expr.data_type == Some(DataType::Json) {
+                key.expr = super::json_sort_key_expr(key.expr);
+            }
+            key
+        })
+        .collect::<Vec<_>>();
     let frame = bind_window_frame(spec, function, &order_by)?;
     // FIRST_VALUE and LAST_VALUE read the frame by definition — LAST_VALUE's
     // whole reputation for surprise comes from the default frame — so a

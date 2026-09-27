@@ -6175,6 +6175,15 @@ pub(super) fn compare_aggregate_values(
         };
         return compare_decimal_text(left, right);
     }
+    // JSON orders by the JSON ladder: numbers numerically, then by type.
+    if matches!(data_type, Some(DataType::Json))
+        && let (Some(left), Some(right)) = (left.text(), right.text())
+    {
+        let key = |text: &str| {
+            crate::json_order::json_sort_key(text).unwrap_or_else(|| text.as_bytes().to_vec())
+        };
+        return Ok(key(left).cmp(&key(right)));
+    }
     // TIME is a signed duration: '100:00:00' is past '11:11:11' and
     // '-11:11:11' before '-1:00:00', which text order has backwards.
     if matches!(data_type, Some(DataType::Time64 { .. }))

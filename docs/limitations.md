@@ -104,11 +104,12 @@ stays readable as a list of things to fix.
 - JSON-to-JSON comparison, `IN`/`BETWEEN`, ordering, grouping, and
   DISTINCT/set duplicate handling follow MySQL's JSON type-precedence ladder
   (numbers compare numerically across integer/double spellings; objects are
-  equal regardless of member order). Residuals that still reject explicitly:
-  comparing JSON against a non-JSON scalar (MySQL coerces the scalar to JSON;
-  Pintail does not yet), JSON arithmetic, `MIN`/`MAX` over JSON, window
-  partition/order keys over JSON, `GROUP_CONCAT ... ORDER BY` a JSON key, and
-  the recursive-CTE `UNION DISTINCT` fixpoint over JSON rows. The relative
+  equal regardless of member order), and so do text compared with JSON (as a
+  JSON string), `MIN`/`MAX`, window keys and `GROUP_CONCAT ... ORDER BY`.
+  Residuals that still reject explicitly: comparing JSON against a date,
+  time or binary scalar (MySQL gives those their own JSON types), JSON
+  arithmetic, and the recursive-CTE `UNION DISTINCT` fixpoint over JSON
+  rows. The relative
   order of unequal objects is deterministic but unspecified, as in MySQL (#8).
 - JSON paths support member steps, numeric and `last`-relative indexes,
   ranges (`[M to N]`), wildcards (`.*`, `[*]`) and recursive descent (`**`)
