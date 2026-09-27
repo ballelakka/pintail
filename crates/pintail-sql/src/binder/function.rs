@@ -1406,14 +1406,27 @@ pub(super) fn bind_cast(
             &recast, low, high, *negated, tables, aggregates, windows, subqueries,
         );
     }
+    let mut operand = bind_expr_inner(expr, tables, aggregates, windows, subqueries)?;
+    // A hex or bit literal cast to a number is read as the unsigned integer
+    // its bytes spell: CAST(0xb3 AS SIGNED) is 179, where the bytes of a
+    // binary STRING cast the same way read as text and give 0.
+    if matches!(
+        target,
+        DataType::Int64
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal { .. }
+    ) && super::unintroduced_bit_literal(expr)
+    {
+        operand = super::numeric_bit_input(operand, expr)?;
+    }
     bind_scalar(
         ScalarFunction::DeclaredCast {
             target,
             characters: declared_characters(data_type),
         },
-        vec![bind_expr_inner(
-            expr, tables, aggregates, windows, subqueries,
-        )?],
+        vec![operand],
     )
 }
 

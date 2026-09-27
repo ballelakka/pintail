@@ -4279,6 +4279,19 @@ fn bind_binary(
         let numeric = |ty| {
             exact_numeric_type(ty) || matches!(ty, Some(DataType::Float32 | DataType::Float64))
         };
+        // A hex or bit literal compared with a number is that number:
+        // `bigint_col = 0x8000000000000000` compares 9223372036854775808, not
+        // eight bytes against an integer.
+        let left = if numeric(right.data_type) && unintroduced_bit_literal(written_left) {
+            numeric_bit_input(left, written_left)?
+        } else {
+            left
+        };
+        let right = if numeric(left.data_type) && unintroduced_bit_literal(written_right) {
+            numeric_bit_input(right, written_right)?
+        } else {
+            right
+        };
         let left = if numeric(right.data_type) {
             temporal_extremum_as_number(left)
         } else {

@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1920;
+const EXPECTED_CASES: usize = 1925;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2140,6 +2140,30 @@ fn hand_written_cases() -> Vec<OracleCase> {
         unordered(
             "group by with rollup",
             "SELECT active, COUNT(*) FROM events WHERE score < 0 GROUP BY active WITH ROLLUP",
+        ),
+        // Hex literals read as the unsigned integer their bytes spell where
+        // a number is wanted, and stay bytes where a string is.
+        ordered(
+            "hex literals as numbers",
+            "SELECT CAST(0xb3 AS SIGNED), CAST(0xfffffffffffffffe AS SIGNED), \
+                    CAST(0xffffffffffffffff AS UNSIGNED), CAST(0x8fffffffffffffff AS SIGNED), \
+                    CAST(X'0a' AS DECIMAL(5,1)), 0x0a + 0",
+        ),
+        ordered(
+            "hex literals as numbers",
+            "SELECT id FROM events WHERE id = 0x03 OR id IN (0x05, 7) ORDER BY id",
+        ),
+        ordered(
+            "hex literals as numbers",
+            "SELECT id FROM events WHERE score > 0x28 ORDER BY id",
+        ),
+        ordered(
+            "hex literals as numbers",
+            "SELECT id FROM events WHERE id IN (CAST(0x01 AS UNSIGNED), 0x02) ORDER BY id",
+        ),
+        ordered(
+            "hex literals as numbers",
+            "SELECT 0x61 = 'a', HEX(0x61), 0x61 < 'b'",
         ),
         // Row constructors: pairwise equality, lexicographic ordering, and
         // MySQL's NULL where no pair settles the answer.
