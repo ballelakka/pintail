@@ -3,7 +3,12 @@
 //! This crate stores configuration and replication metadata only. Analytical
 //! row data belongs exclusively to `pintail-store`.
 
-use std::{collections::BTreeSet, path::Path, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, types::ValueRef};
@@ -22,6 +27,34 @@ pub use control::{
 };
 
 const CURRENT_SCHEMA_VERSION: u32 = 23;
+
+#[derive(Eq, Hash, PartialEq)]
+struct DatabaseIdentity {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn database_identity(path: PathBuf) -> Result<DatabaseIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("failed to inspect metadata database {}", path.display()))?;
+        Ok(DatabaseIdentity {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(DatabaseIdentity { path })
+    }
+}
 
 /// An initialized Pintail control-plane database.
 pub struct MetaStore {
@@ -174,7 +207,8 @@ impl StoredSetting {
 }
 
 impl MetaStore {
-    /// Opens a control-plane database and applies all pending migrations.
+    /// Opens a control-plane database, applying pending migrations on its first
+    /// open in this process.
     ///
     /// # Errors
     ///
@@ -182,7 +216,11 @@ impl MetaStore {
     /// when a migration cannot be applied atomically.
     pub fn open(path: &Path) -> Result<Self> {
         prepare_private_database_file(path)?;
-        let mut connection = Connection::open(path)
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve metadata database {}", path.display()))?;
+        let identity = database_identity(path.clone())?;
+        let mut connection = Connection::open(&path)
             .with_context(|| format!("failed to open metadata database {}", path.display()))?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -190,11 +228,18 @@ impl MetaStore {
         connection
             .pragma_update(None, "foreign_keys", true)
             .context("failed to enable SQLite foreign keys")?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .context("failed to enable SQLite WAL mode")?;
-
-        migrate(&mut connection)?;
+        static INITIALIZED: OnceLock<Mutex<HashSet<DatabaseIdentity>>> = OnceLock::new();
+        let mut initialized = INITIALIZED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("metadata initialization lock poisoned"))?;
+        if !initialized.contains(&identity) {
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .context("failed to enable SQLite WAL mode")?;
+            migrate(&mut connection)?;
+            initialized.insert(identity);
+        }
         Ok(Self { connection })
     }
 
@@ -2251,29 +2296,36 @@ impl MetaStore {
 fn prepare_private_database_file(path: &Path) -> Result<()> {
     use std::{
         fs::{OpenOptions, Permissions},
+        io::ErrorKind,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
     };
 
-    let file = OpenOptions::new()
-        .read(true)
+    match OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .mode(0o600)
         .open(path)
-        .with_context(|| {
+    {
+        Ok(file) => {
+            drop(file);
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // An existing database may already have SQLite connections open.
+            std::fs::set_permissions(path, Permissions::from_mode(0o600)).with_context(|| {
+                format!(
+                    "failed to secure metadata database permissions {}",
+                    path.display()
+                )
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
             format!(
                 "failed to create private metadata database {}",
                 path.display()
             )
-        })?;
-    file.set_permissions(Permissions::from_mode(0o600))
-        .with_context(|| {
-            format!(
-                "failed to secure metadata database permissions {}",
-                path.display()
-            )
-        })
+        }),
+    }
 }
 
 #[cfg(not(unix))]
