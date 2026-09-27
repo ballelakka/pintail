@@ -72,10 +72,8 @@ stays readable as a list of things to fix.
   un-accumulated when a row leaves the window. Cost is proportional to the
   frame width, so a very wide bounded frame is expensive; a frame anchored at
   `UNBOUNDED PRECEDING` accumulates once and is linear.
-- `WITH RECURSIVE` accepts only one recursive member, which must scan the CTE
-  exactly once in its `FROM`, with no aggregates, windows, `DISTINCT`,
-  `GROUP BY`, `ORDER BY` or `LIMIT` inside the member, and member column
-  storage types matching the anchor's. Pintail bounds
+- A `WITH RECURSIVE` member's column storage types must match the anchor's;
+  MySQL instead converts member values to the anchor's types. Pintail bounds
   `cte_max_recursion_depth` to `1..=1000000`; MySQL's unbounded value `0` is
   rejected so a session cannot disable the recursive resource guard.
 - An aliased parenthesized join group rejects, as it does in MySQL (a
@@ -158,13 +156,9 @@ stays readable as a list of things to fix.
 - Locale-specific collation profiles, full per-expression coercibility, and
   collation-sensitive execution over mixed source profiles remain unsupported
   (#10).
-- The HTTP query endpoint has no per-connection time-zone or fixed-clock
-  session controls and reads `TIMESTAMP` columns as stored, in UTC.
-
-- Date parsing is limited to canonical date and date-time forms. Compound
-  interval quantities must be literals; dynamic compound interval expressions
-  are not implemented. Compound intervals with microsecond qualifiers remain
-  unsupported.
+- Date parsing is limited to canonical date and date-time forms. The plain
+  `MICROSECOND` interval unit is not implemented; the compound
+  `*_MICROSECOND` qualifiers are.
 
 - Unix timestamp conversions round excess fractional digits to microseconds;
   `TIME_TRUNCATE_FRACTIONAL` does not switch them to truncation.
@@ -175,12 +169,10 @@ stays readable as a list of things to fix.
 - Replicas created before zero-date preservation keep their previous
   normalized values until the affected rows are re-ingested.
 
-- `TIME` values are stored and compared as their canonical text. Ordering
-  and comparison are exact for non-negative times under 100 hours; negative
-  times and hours of three digits order as text, not as durations. A
-  `TIME`-valued function result (`SEC_TO_TIME`, `ADDTIME`, `TIMEDIFF`) is
-  typed as text, so used in arithmetic it coerces as a string would
-  (`SEC_TO_TIME(9001) + 0` is 2), where MySQL yields the `HHMMSS` number.
+- `ADDTIME` and `SUBTIME` over text columns return text, so used in
+  arithmetic they coerce as a string would (the leading number), where MySQL
+  reads the result as a `TIME` and yields its `HHMMSS` number. Over `TIME`
+  values and over literals they follow MySQL.
 - Pintail maps an empty scalar-subquery result to `NULL`. During oracle development, MySQL 8.4's constant `SELECT` with `LIMIT 0` produced a special-case result that did not follow this behavior; that MySQL-only corner is excluded from the common-workload corpus.
 
 - Source `DECIMAL` columns above precision 38 are replicated as text with a
@@ -261,12 +253,12 @@ stays readable as a list of things to fix.
   row when memoization is unavailable.
 - A cross join holds every input after the first in memory; only the first
   streams.
-- General aggregate pre-aggregation across equi-joins is not implemented.
-  Aggregate pushdown removes only unreferenced predicate-free cross-join inputs
-  with an exact catalog cardinality of one. The optimizer has no general rule
-  that proves aggregate decomposability and preservation of join comparison,
-  multiplicity and grouping semantics, then costs pre-aggregation against the
-  original plan. A declared storage key alone does not establish those conditions.
+- Aggregation runs below a join only for a GROUP BY over inner joins whose
+  `SUM`, `COUNT`, `MIN` and `MAX` all read one base table of at least 50,000
+  rows, grouped and joined on integer or temporal columns. Outer joins, text
+  join or grouping keys, `AVG`, float sums, `DISTINCT` aggregates and
+  ungrouped queries join every row first. The choice is a size rule, not a
+  cost comparison, and it does not use the key's distinct-value count.
 - `EXPLAIN ANALYZE` scan counters accumulate work from all executions of a
   stable table in the statement, including uncorrelated subqueries.
 - Grouped sub-cubes and predicate-covered blocks are not covered by the
