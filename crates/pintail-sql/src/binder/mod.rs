@@ -2,6 +2,7 @@ mod dependency;
 mod function;
 mod outer_aggregate;
 mod rollup;
+mod row;
 
 use function::{
     bind_between, bind_case, bind_cast, bind_convert, bind_in_list, bind_interval_arithmetic,
@@ -3365,9 +3366,10 @@ fn bind_expr_inner(
                 ],
             )
         }
-        Expr::BinaryOp { left, op, right } => {
-            bind_binary(left, op, right, tables, aggregates, windows, subqueries)
-        }
+        Expr::BinaryOp { left, op, right } => match row::comparison(left, op, right)? {
+            Some(columns) => bind_expr_inner(&columns, tables, aggregates, windows, subqueries),
+            None => bind_binary(left, op, right, tables, aggregates, windows, subqueries),
+        },
         Expr::IsNull(expr) | Expr::IsUnknown(expr) => {
             bind_is_null(expr, false, tables, aggregates, windows, subqueries)
         }
@@ -3428,12 +3430,15 @@ fn bind_expr_inner(
             bind_scalar_function(function, tables, aggregates, windows, subqueries)
         }
         Expr::InList {
-            expr,
+            expr: operand,
             list,
             negated,
-        } => bind_in_list(
-            expr, list, *negated, tables, aggregates, windows, subqueries,
-        ),
+        } => match row::in_list(operand, list, *negated)? {
+            Some(rows) => bind_expr_inner(&rows, tables, aggregates, windows, subqueries),
+            None => bind_in_list(
+                operand, list, *negated, tables, aggregates, windows, subqueries,
+            ),
+        },
         Expr::Between {
             expr,
             negated,

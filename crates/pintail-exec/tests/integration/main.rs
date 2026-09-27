@@ -50,6 +50,7 @@ mod point_scan_memo;
 mod prefiltered_scan;
 mod profile;
 mod range_prune_bench;
+mod row_constructors;
 mod runtime_join_filter;
 mod scalar_fallback_cost;
 mod segment_subcube;

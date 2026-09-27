@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1916;
+const EXPECTED_CASES: usize = 1920;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2140,6 +2140,27 @@ fn hand_written_cases() -> Vec<OracleCase> {
         unordered(
             "group by with rollup",
             "SELECT active, COUNT(*) FROM events WHERE score < 0 GROUP BY active WITH ROLLUP",
+        ),
+        // Row constructors: pairwise equality, lexicographic ordering, and
+        // MySQL's NULL where no pair settles the answer.
+        ordered(
+            "row constructor comparisons",
+            "SELECT (1, NULL) = (1, 2), (1, NULL) = (2, 2), ROW(1, 2) <=> ROW(1, 2), \
+                    (1, 2) <=> (1, NULL), (1, 2) < (1, 3), (2, NULL) > (1, 5), \
+                    (1, NULL) NOT IN ((1, 2), (3, 4)), (1, 2) IN ((3, 4), (1, 2))",
+        ),
+        ordered(
+            "row constructor comparisons",
+            "SELECT id FROM events WHERE (active, score) > (0, 50) ORDER BY id",
+        ),
+        ordered(
+            "row constructor comparisons",
+            "SELECT id FROM events WHERE (tag, active) IN (('red', 0), ('blue', 1)) ORDER BY id",
+        ),
+        ordered(
+            "row constructor comparisons",
+            "SELECT id, (note, id) <> ('Alpha', 1) FROM events \
+             WHERE (id, score) <= (4, 40) ORDER BY id",
         ),
         // Composite EXTRACT units: concatenated decimal per MySQL.
         ordered(
