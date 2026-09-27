@@ -1156,7 +1156,22 @@ impl ReplicaEngine {
                 wire_hint: wire_hints.get(index).copied().flatten(),
             })
             .collect::<Vec<_>>();
-        let collected = collect_rows(&mut execution, max_rows, &fields, sink)?;
+        let collected = match collect_rows(&mut execution, max_rows, &fields, sink) {
+            Ok(collected) => collected,
+            Err(error) => {
+                // The failed query is the one whose operator tree matters
+                // most: a memory ceiling hit names only the operator that
+                // asked last, and the peaks below name the ones holding it.
+                if let Some(profile) = execution.profile() {
+                    let shown: String = sql.trim().chars().take(160).collect();
+                    pintail_log::log_info!(
+                        "pintail profile db={database_name} failed=\"{error}\" sql={shown:?}\n{}",
+                        profile.render().trim_end()
+                    );
+                }
+                return Err(error);
+            }
+        };
         let (row_count, batches) = match &collected {
             Collected::Whole { rows, batches, .. } => (rows.len(), *batches),
             Collected::Streamed { rows, batches } => (*rows, *batches),
