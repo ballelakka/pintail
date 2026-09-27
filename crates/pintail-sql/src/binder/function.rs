@@ -1128,10 +1128,22 @@ pub(super) fn bind_in_list(
     args.push(bind_expr_inner(
         expr, tables, aggregates, windows, subqueries,
     )?);
+    // Against a numeric subject a hex or bit literal is the number its
+    // bytes spell, exactly as in `=`.
+    let numeric_subject = super::exact_numeric_type(args[0].data_type)
+        || matches!(
+            args[0].data_type,
+            Some(DataType::Float32 | DataType::Float64)
+        );
     for value in list {
-        args.push(bind_expr_inner(
-            value, tables, aggregates, windows, subqueries,
-        )?);
+        let bound = bind_expr_inner(value, tables, aggregates, windows, subqueries)?;
+        args.push(
+            if numeric_subject && super::unintroduced_bit_literal(value) {
+                super::numeric_bit_input(bound, value)?
+            } else {
+                bound
+            },
+        );
     }
     let args = super::unify_temporal_list(args);
     let args = super::unify_time_list(args);
