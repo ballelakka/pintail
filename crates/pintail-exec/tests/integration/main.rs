@@ -40,6 +40,7 @@ mod mixed_collation_grouping;
 mod morsel_bench;
 mod mtr_answer_drift;
 mod multi_core;
+mod mutated_scan_cost;
 mod mysql_scalar_parity;
 mod no_unsigned_subtraction;
 mod null_safe_join;

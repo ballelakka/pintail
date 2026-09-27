@@ -1283,6 +1283,7 @@ impl TableStore {
             return Ok(());
         }
         let full_merge = plan.indices.len() == self.manifest.segments.len();
+        let drop_tombstones = merge_drops_tombstones(&self.manifest.segments, &plan.indices);
         let input_metas = plan
             .indices
             .iter()
@@ -1320,6 +1321,7 @@ impl TableStore {
                     options,
                     &input_metas,
                     full_merge,
+                    drop_tombstones,
                     id_base,
                 );
                 // The owner joins this worker before releasing its writer
@@ -1337,9 +1339,10 @@ impl TableStore {
 
     /// Runs one bounded size-tier merge of similarly sized overlapping files.
     ///
-    /// A merge that covers the complete manifest drops tombstones immediately
-    /// and writes zstd at the coldest tier. Partial merges retain tombstones so
-    /// they can still suppress older versions outside the selected set.
+    /// A merge that covers the complete manifest writes zstd at the coldest
+    /// tier. A merge drops tombstones when nothing left out of it could hold
+    /// an older version of a key they delete (see `merge_drops_tombstones`);
+    /// otherwise it keeps them to suppress those versions.
     ///
     /// # Errors
     ///
@@ -1378,6 +1381,7 @@ impl TableStore {
             });
         }
         let full_merge = plan.indices.len() == self.manifest.segments.len();
+        let drop_tombstones = merge_drops_tombstones(&self.manifest.segments, &plan.indices);
         let _published = self.publication.publishing();
         let mut streams = Vec::with_capacity(plan.indices.len());
         for index in &plan.indices {
@@ -1461,7 +1465,7 @@ impl TableStore {
                     "compaction minimum has no winning row".into(),
                 ));
             };
-            if !full_merge || !winner.is_deleted() {
+            if !drop_tombstones || !winner.is_deleted() {
                 buffered_bytes = buffered_bytes.saturating_add(winner.estimated_bytes());
                 rows.push(winner);
                 output_rows = output_rows.saturating_add(1);
@@ -1474,7 +1478,6 @@ impl TableStore {
                     &self.schema,
                     self.options.block_rows,
                     compression,
-                    full_merge,
                     &mut next_manifest,
                     &rows,
                 )?;
@@ -1489,7 +1492,6 @@ impl TableStore {
                 &self.schema,
                 self.options.block_rows,
                 compression,
-                full_merge,
                 &mut next_manifest,
                 &rows,
             )?;
@@ -1502,6 +1504,12 @@ impl TableStore {
             readers: Arc::downgrade(&previous),
             paths: retired_paths,
         });
+        pintail_log::log_debug!(
+            "pintail store compaction merged {} of {} segments into {output_rows} rows, tombstones {}",
+            plan.indices.len(),
+            previous.segments.len(),
+            if drop_tombstones { "dropped" } else { "kept" }
+        );
         Ok(CompactionOutcome {
             input_segments: plan.indices.len(),
             output_rows,
@@ -1678,7 +1686,7 @@ impl TableStore {
                 .map(|candidate| candidate.row_count)
                 .sum::<u64>();
             if rows <= self.options.max_compaction_input_rows {
-                return Ok(Some(plan_for(&selected)));
+                return Ok(Some(plan_for(&self.overlap_cluster(&candidates, selected))));
             }
         }
         // Nothing overlaps, so no merge would collapse a row version. Merging
@@ -1697,6 +1705,50 @@ impl TableStore {
             }
         }
         Ok(None)
+    }
+
+    /// Grows an overlapping pair to every segment its key span reaches, while
+    /// the row budget allows. A tail of changes spread across a table
+    /// overlaps each of the disjoint files an earlier merge left behind;
+    /// merging it with only one of them keeps its deletes for the others
+    /// and leaves the output overlapping them still, so every scan stays on
+    /// the row-wise merge. Taking the whole cluster resolves it in one pass.
+    fn overlap_cluster<'a>(
+        &self,
+        candidates: &'a [CompactionCandidate],
+        pair: Vec<&'a CompactionCandidate>,
+    ) -> Vec<&'a CompactionCandidate> {
+        let mut selected = pair;
+        loop {
+            let (Some(low), Some(high)) = (
+                selected.iter().map(|candidate| &candidate.minimum).min(),
+                selected.iter().map(|candidate| &candidate.maximum).max(),
+            ) else {
+                return selected;
+            };
+            let reached = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.minimum <= *high
+                        && candidate.maximum >= *low
+                        && !selected
+                            .iter()
+                            .any(|chosen| chosen.index == candidate.index)
+                })
+                .collect::<Vec<_>>();
+            if reached.is_empty() {
+                return selected;
+            }
+            let rows = selected
+                .iter()
+                .chain(&reached)
+                .map(|candidate| candidate.row_count)
+                .sum::<u64>();
+            if rows > self.options.max_compaction_input_rows {
+                return selected;
+            }
+            selected.extend(reached);
+        }
     }
 
     /// Reports whether one candidate window fits the configured size tier and
@@ -1813,6 +1865,7 @@ fn run_background_merge(
     options: StoreOptions,
     input_metas: &[segment::SegmentMeta],
     full_merge: bool,
+    drop_tombstones: bool,
     id_base: u64,
 ) -> Result<Vec<segment::SegmentMeta>, StoreError> {
     let mut streams = Vec::with_capacity(input_metas.len());
@@ -1841,7 +1894,9 @@ fn run_background_merge(
             rows,
             options.block_rows,
             compression,
-            full_merge,
+            // A merge emits one row per key; the flag also promises no
+            // tombstones, which only a chunk without them can keep.
+            rows.iter().all(|row| !row.is_deleted()),
         )?;
         *next_id = next_id.checked_add(1).ok_or(StoreError::SequenceOverflow)?;
         outputs.push(output);
@@ -1875,7 +1930,7 @@ fn run_background_merge(
                 "compaction minimum has no winning row".into(),
             ));
         };
-        if !full_merge || !winner.is_deleted() {
+        if !drop_tombstones || !winner.is_deleted() {
             buffered_bytes = buffered_bytes.saturating_add(winner.estimated_bytes());
             rows.push(winner);
         }
@@ -1896,7 +1951,6 @@ fn write_compaction_chunk(
     schema: &TableSchema,
     block_rows: usize,
     compression: segment::Compression,
-    unique_keys: bool,
     manifest: &mut Manifest,
     rows: &[StoredRow],
 ) -> Result<PathBuf, StoreError> {
@@ -1907,7 +1961,9 @@ fn write_compaction_chunk(
         rows,
         block_rows,
         compression,
-        unique_keys,
+        // A merge emits one row per key; the flag also promises no
+        // tombstones, which only a chunk without them can keep.
+        rows.iter().all(|row| !row.is_deleted()),
     )?;
     manifest.next_segment_id = manifest
         .next_segment_id
@@ -2150,4 +2206,29 @@ fn append_row_id(key: &PrimaryKey) -> Result<u64, StoreError> {
             "append-rowid table contains a non-generated storage key".into(),
         )),
     }
+}
+
+/// Whether a merge of the `selected` segments may drop its tombstones:
+/// nothing left out of it could hold an older version of a key they delete.
+/// A segment left out is harmless when its keys lie outside the merged
+/// span, or when every row it holds is newer than every merged row - its
+/// row for a key then wins over the tombstone whether that is kept or not.
+fn merge_drops_tombstones(segments: &[segment::SegmentMeta], selected: &[usize]) -> bool {
+    let chosen = selected
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let merged = || selected.iter().filter_map(|index| segments.get(*index));
+    let (Some(low), Some(high), Some(newest)) = (
+        merged().map(|meta| &meta.min_key).min(),
+        merged().map(|meta| &meta.max_key).max(),
+        merged().map(|meta| meta.max_version).max(),
+    ) else {
+        return true;
+    };
+    segments
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !chosen.contains(index))
+        .all(|(_, meta)| meta.max_key < *low || meta.min_key > *high || meta.min_version > newest)
 }

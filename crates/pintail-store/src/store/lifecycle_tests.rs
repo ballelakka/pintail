@@ -81,7 +81,7 @@ fn reset_discards_completed_unpublished_compaction_outputs() {
     }
     let inputs = table.manifest.segments.clone();
     let outputs =
-        run_background_merge(directory.path(), &schema, options, &inputs, true, 999).unwrap();
+        run_background_merge(directory.path(), &schema, options, &inputs, true, true, 999).unwrap();
     let (sender, receiver) = mpsc::channel();
     let (ready, sent) = mpsc::channel();
     let worker = std::thread::spawn(move || {

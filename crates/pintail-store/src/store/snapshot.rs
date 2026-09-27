@@ -967,6 +967,7 @@ impl TableSnapshot {
             }
         }
         let Some((split, _)) = best else {
+            log_unlayered_cluster(&by_age);
             return Ok(None);
         };
         let mut bases = by_age[..split]
@@ -1016,6 +1017,9 @@ impl TableSnapshot {
         if bound_range_is_searchable(lo, hi) {
             for (_, row) in self.memtable.range((lo.clone(), hi.clone())) {
                 if row.version() < base_version {
+                    pintail_log::log_debug!(
+                        "store scan merges a cluster row by row: a memtable row is older than its bases"
+                    );
                     return Ok(None);
                 }
                 keep(row.clone());
@@ -1401,4 +1405,25 @@ impl TableSnapshot {
             retained_bytes,
         })
     }
+}
+
+/// Says, at debug, why a merge cluster is read row by row: the shape of its
+/// segments, oldest first, is what decides whether it can be layered.
+fn log_unlayered_cluster(by_age: &[&segment::SegmentMeta]) {
+    if !pintail_log::enabled(pintail_log::DEBUG) {
+        return;
+    }
+    let shape = by_age
+        .iter()
+        .map(|meta| {
+            format!(
+                "{} rows v{}..={} unique={}",
+                meta.row_count, meta.min_version, meta.max_version, meta.unique_keys
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    pintail_log::log_debug!(
+        "store scan merges a cluster row by row: no sound, cheap split into bases and newer rows [{shape}]"
+    );
 }

@@ -1653,6 +1653,14 @@ impl ProjectedScanStream {
                     .is_ok_and(|sparse| !sparse.is_empty())
             });
         if !layerable {
+            pintail_log::log_debug!(
+                "store scan merges a layered cluster row by row: {}",
+                if self.overlay_key.is_none() {
+                    "the scan names no integer key to mask by"
+                } else {
+                    "a base has no sparse index"
+                }
+            );
             return self
                 .snapshot
                 .refine_merge_parts(
