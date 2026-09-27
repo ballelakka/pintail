@@ -3997,14 +3997,36 @@ impl PullOperator {
                 column_types,
                 state,
             } => {
+                // Every input but the first is held; the first varies
+                // slowest in the output, so it streams a batch at a time
+                // against the held ones and only its current batch is kept.
                 if state.is_none() {
                     let mut materialized = Vec::with_capacity(inputs.len());
-                    for input in inputs {
+                    materialized.push(Vec::new());
+                    for input in inputs.iter_mut().skip(1) {
                         materialized.push(materialize(input, memory)?);
                     }
                     *state = Some(CrossJoinState::new(materialized));
                 }
                 let state = state.as_mut().expect("initialized above");
+                while state.remaining_rows() == 0 {
+                    if state.inputs[1..].iter().any(Vec::is_empty) {
+                        return Ok(None);
+                    }
+                    let Some(first) = inputs.first_mut() else {
+                        return Ok(None);
+                    };
+                    let Some(batch) = first.next_batch(memory)? else {
+                        return Ok(None);
+                    };
+                    memory.ensure_transient(batch.estimated_bytes().saturating_mul(2))?;
+                    let rows = batch
+                        .selection()
+                        .selected_rows()
+                        .map(|row| batch_row(&batch, row))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    state.restart_with_first(rows);
+                }
                 let per_row = state.next_batch_memory_upper_bound(1, column_types.len());
                 let planned = affordable_batch_rows(memory, per_row);
                 let transient = state.next_batch_memory_upper_bound(planned, column_types.len());
@@ -5896,6 +5918,14 @@ impl CrossJoinState {
             inputs,
             done,
         }
+    }
+
+    /// Replaces the first input's rows with the next batch of them and
+    /// starts the product over.
+    fn restart_with_first(&mut self, rows: Vec<Vec<Value>>) {
+        self.inputs[0] = rows;
+        self.indexes.fill(0);
+        self.done = self.inputs.iter().any(Vec::is_empty);
     }
 
     fn next_rows(&mut self, maximum: usize) -> Vec<Vec<Value>> {
