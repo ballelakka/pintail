@@ -7731,9 +7731,12 @@ fn resolve_order_index(
     // A qualified name (e.id) refers to the source scope first, so two
     // outputs sharing its last part are not ambiguous; the output-name
     // match below stays as the fallback for rewritten projections.
-    if let Expr::CompoundIdentifier(identifiers) = expr
-        && let Ok(column) = bind_column(identifiers, tables)
-        && let Some(index) = projection.iter().position(|item| item.expr == column)
+    let qualified = match expr {
+        Expr::CompoundIdentifier(identifiers) => bind_column(identifiers, tables).ok(),
+        _ => None,
+    };
+    if let Some(column) = &qualified
+        && let Some(index) = projection.iter().position(|item| item.expr == *column)
     {
         return Ok(index);
     }
@@ -7745,6 +7748,13 @@ fn resolve_order_index(
         .iter()
         .enumerate()
         .filter(|(_, item)| item.name.eq_ignore_ascii_case(&requested))
+        // A qualified name that binds is that source column, never an
+        // output that merely shares its last part: `ORDER BY t.id` beside a
+        // selected `e.id` sorts by `t.id`, which is not projected and so
+        // becomes a hidden sort column below.
+        .filter(|(_, item)| {
+            qualified.is_none() || !matches!(item.expr.kind, BoundExprKind::Column(_))
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     match matches.as_slice() {
@@ -9741,6 +9751,14 @@ mod tests {
             bind("SELECT e.id AS key_id FROM Events e ORDER BY e.id").expect("projected ref");
         assert_eq!(projected.hidden_sort_columns, 0);
         assert_eq!(projected.order_by[0].index, 0);
+        // A qualified ref to another table's column of the same name is
+        // that column, not the output sharing its name: it sorts by a
+        // hidden column rather than by the selected one.
+        let other = bind("SELECT a.id FROM Events a CROSS JOIN Events b ORDER BY b.id DESC, a.id")
+            .expect("other table's column");
+        assert_eq!(other.hidden_sort_columns, 1);
+        assert_eq!(other.order_by[0].index, 1);
+        assert_eq!(other.order_by[1].index, 0);
         // A derived table exposes only the visible columns: the hidden sort
         // column is trimmed after ordering and never reaches the outer query.
         let derived = bind("SELECT d.label FROM (SELECT Name AS label FROM Events ORDER BY id) d")
