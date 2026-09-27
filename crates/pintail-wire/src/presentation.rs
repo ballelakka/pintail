@@ -1218,6 +1218,22 @@ mod tests {
         assert!(fields[2].colflags.contains(ColumnFlags::NOT_NULL_FLAG));
         assert!(!fields[2].colflags.contains(ColumnFlags::UNSIGNED_FLAG));
     }
+    /// `MySQL` prints `PI()` as 3.141593: its column carries six decimals. An
+    /// expression over it is a plain double again.
+    #[test]
+    fn pi_is_declared_with_six_decimals() {
+        let catalog = CatalogSnapshot::new([]).unwrap();
+        let statement = pintail_sql::parse_statement("SELECT PI(), DEGREES(PI())").unwrap();
+        let query = pintail_sql::Binder::new(&catalog, None)
+            .bind(&statement)
+            .unwrap();
+        let fields = columns(&query, &catalog, &SourceFacts::default());
+        assert_eq!(
+            (fields[0].coltype, fields[0].decimals),
+            (ColumnType::MysqlTypeDouble, 6)
+        );
+        assert_eq!(fields[1].decimals, 31);
+    }
     /// An integer expression grouped on is materialized in the `MySQL` grouping
     /// temporary table as INT, and keeps that type when an outer query reads
     /// it back through a derived table or groups on it there (measured

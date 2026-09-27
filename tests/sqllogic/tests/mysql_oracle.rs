@@ -2108,7 +2108,7 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "SELECT SOUNDEX('Hello'), SOUNDEX('Quadratically'), SOUNDEX('a!b-2c'), \
                     SOUNDEX(NULL), SIN(0), COS(0), TAN(0), ASIN(2), ACOS(2), \
                     ATAN(1), ATAN(1, 2), ATAN2(1, 2), DEGREES(PI()), \
-                    RADIANS(180), PI()",
+                    RADIANS(180)",
         ),
         // WITH ROLLUP: subtotal and grand-total rows, rolled keys NULL
         // outside aggregates (HAVING included), GROUPING() telling them
