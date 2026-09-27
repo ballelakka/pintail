@@ -4075,12 +4075,12 @@ fn bind_unary(
         });
     }
     // Negation is arithmetic, so its operand is read as a number: a truth
-    // value and an unsigned integer negate as BIGINT, an unintroduced hex
-    // literal as the integer its bytes spell, and other text as a double.
+    // value and an unsigned integer negate as BIGINT; text, and an unintroduced hex
+    // literal read as the integer its bytes spell, negate as a double.
     let (expr, negated_type) = match expr.data_type {
         _ if operator != UnaryOperator::Minus => (expr, None),
         Some(DataType::Binary) if unintroduced_bit_literal(written) => {
-            (numeric_bit_input(expr, written)?, Some(DataType::Int64))
+            (numeric_bit_input(expr, written)?, Some(DataType::Float64))
         }
         Some(DataType::Utf8 | DataType::Binary) => (expr, Some(DataType::Float64)),
         Some(DataType::Boolean | DataType::UInt64) => (expr, Some(DataType::Int64)),

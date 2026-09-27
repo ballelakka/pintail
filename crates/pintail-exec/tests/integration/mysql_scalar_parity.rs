@@ -2187,7 +2187,7 @@ fn negation_reads_its_operand_as_a_number() {
         ("-CONCAT('3', id)", "float -31"),
         ("-TRUE", "-1"),
         ("- -TRUE", "1"),
-        ("-0xf", "-15"),
+        ("-0xf", "float -15"),
         ("-CAST(id AS UNSIGNED)", "-1"),
     ]);
 }
