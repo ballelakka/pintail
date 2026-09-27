@@ -21,6 +21,7 @@ mod filter_kernels;
 mod filter_once_cost;
 mod general_ci_parity;
 mod group_by_functional_dependency;
+mod group_by_rollup;
 mod grouped_fold;
 mod grouped_fold_spans;
 mod integer_cast_saturation;

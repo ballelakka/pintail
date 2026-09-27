@@ -1,6 +1,7 @@
 mod dependency;
 mod function;
 mod outer_aggregate;
+mod rollup;
 
 use function::{
     bind_between, bind_case, bind_cast, bind_convert, bind_in_list, bind_interval_arithmetic,
@@ -167,6 +168,28 @@ impl<'catalog> Binder<'catalog> {
             || !query.pipe_operators.is_empty()
         {
             return Err(BindError::UnsupportedQueryClause(query.to_string()));
+        }
+        if let Some(rollup) = rollup::rewrite(query)? {
+            let mut bound = self.bind_query(&rollup.query, outer_ctes)?;
+            // The hidden key columns have to be the last ones, with nothing
+            // after them: an ORDER BY that needed a hidden column of its own
+            // would have added it to the first branch alone.
+            let hidden = rollup::hidden_names(rollup.hidden / 2).collect::<Vec<_>>();
+            let in_place = bound
+                .projection
+                .len()
+                .checked_sub(rollup.hidden)
+                .is_some_and(|start| {
+                    bound.projection[start..]
+                        .iter()
+                        .map(|item| item.name.as_str())
+                        .eq(hidden.iter().map(String::as_str))
+                });
+            if !in_place || bound.hidden_sort_columns != 0 {
+                return Err(BindError::InvalidOrderBy(query.to_string()));
+            }
+            bound.hidden_sort_columns = rollup.hidden;
+            return Ok(bound);
         }
 
         let mut ctes = outer_ctes.to_vec();

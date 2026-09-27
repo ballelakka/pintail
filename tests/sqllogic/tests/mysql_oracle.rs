@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1910;
+const EXPECTED_CASES: usize = 1916;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2109,6 +2109,37 @@ fn hand_written_cases() -> Vec<OracleCase> {
                     SOUNDEX(NULL), SIN(0), COS(0), TAN(0), ASIN(2), ACOS(2), \
                     ATAN(1), ATAN(1, 2), ATAN2(1, 2), DEGREES(PI()), \
                     RADIANS(180), PI()",
+        ),
+        // WITH ROLLUP: subtotal and grand-total rows, rolled keys NULL
+        // outside aggregates (HAVING included), GROUPING() telling them
+        // from stored NULLs, no rows over an empty input.
+        ordered(
+            "group by with rollup",
+            "SELECT active, COUNT(*), SUM(score) FROM events \
+             GROUP BY active WITH ROLLUP ORDER BY active",
+        ),
+        unordered(
+            "group by with rollup",
+            "SELECT active, note, COUNT(*), GROUPING(active, note), GROUPING(note) \
+             FROM events GROUP BY active, note WITH ROLLUP",
+        ),
+        ordered(
+            "group by with rollup",
+            "SELECT tag, COUNT(*) AS c FROM events GROUP BY tag WITH ROLLUP \
+             HAVING c > 1 ORDER BY c DESC, tag",
+        ),
+        unordered(
+            "group by with rollup",
+            "SELECT status, COUNT(*), SUM(total) FROM orders GROUP BY status WITH ROLLUP",
+        ),
+        ordered(
+            "group by with rollup",
+            "SELECT active, MAX(score) FROM events GROUP BY active WITH ROLLUP \
+             ORDER BY active DESC LIMIT 2",
+        ),
+        unordered(
+            "group by with rollup",
+            "SELECT active, COUNT(*) FROM events WHERE score < 0 GROUP BY active WITH ROLLUP",
         ),
         // Composite EXTRACT units: concatenated decimal per MySQL.
         ordered(

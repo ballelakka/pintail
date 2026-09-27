@@ -167,7 +167,7 @@ read as far worse than the engine is.
 
 **Functions:** 393 MySQL functions — Pintail 163, ClickHouse 161.
 
-**Keywords:** 734 MySQL keywords — Pintail 95 supported and 123 out of scope, ClickHouse 225.
+**Keywords:** 734 MySQL keywords — Pintail 96 supported and 123 out of scope, ClickHouse 225.
 
 ### Functions
 
@@ -1091,7 +1091,7 @@ read as far worse than the engine is.
 | `RLIKE` | ✅ | ✅ | ❌ |
 | `ROLE` |  | ➖ | ✅ |
 | `ROLLBACK` |  | ➖ | ✅ |
-| `ROLLUP` |  | ❌ | ✅ |
+| `ROLLUP` |  | ✅ | ✅ |
 | `ROTATE` |  | ❌ | ❌ |
 | `ROUTINE` |  | ➖ | ❌ |
 | `ROW` | ✅ | ✅ | ✅ |

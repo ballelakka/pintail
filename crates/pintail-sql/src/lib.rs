@@ -625,6 +625,11 @@ impl Dialect for PintailDialect {
     fn ignores_wildcard_escapes(&self) -> bool {
         self.0.ignores_wildcard_escapes()
     }
+    // `GROUP BY ... WITH ROLLUP`; the binder refuses the other modifiers.
+    fn supports_group_by_with_modifier(&self) -> bool {
+        true
+    }
+
     fn supports_numeric_prefix(&self) -> bool {
         self.0.supports_numeric_prefix()
     }
