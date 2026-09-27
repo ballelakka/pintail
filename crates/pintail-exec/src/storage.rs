@@ -2566,7 +2566,11 @@ mod tests {
         }
         let directory = tempfile::tempdir().expect("temporary table");
         let schema = schema();
-        let mut wide = TableStore::open(directory.path().join("wide"), schema.clone(), StoreOptions::default())
+        let mut wide = TableStore::open(
+            directory.path().join("wide"),
+            schema.clone(),
+            StoreOptions::default(),
+        )
         .expect("open table");
         wide.ingest(
             (1..=3000_u64)
@@ -2574,9 +2578,12 @@ mod tests {
                 .collect(),
         )
         .expect("ingest");
-        let mut small =
-            TableStore::open(directory.path().join("small"), schema.clone(), StoreOptions::default())
-            .expect("open table");
+        let mut small = TableStore::open(
+            directory.path().join("small"),
+            schema.clone(),
+            StoreOptions::default(),
+        )
+        .expect("open table");
         small
             .ingest((1..=20_u64).map(|id| row(id, "tag")).collect())
             .expect("ingest");
@@ -2593,8 +2600,13 @@ mod tests {
                 TableStatistics::with_row_count(3000),
             )
             .expect("table entry"),
-            TableEntry::new(small_id, "tags", schema, TableStatistics::with_row_count(20))
-                .expect("table entry"),
+            TableEntry::new(
+                small_id,
+                "tags",
+                schema,
+                TableStatistics::with_row_count(20),
+            )
+            .expect("table entry"),
         ];
         let database = DatabaseEntry::new(database_id, "app", entries).expect("database entry");
         let catalog = CatalogSnapshot::new([database]).expect("catalog");
