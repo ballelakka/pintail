@@ -49,6 +49,7 @@ mod partition_rewrites;
 mod point_scan_memo;
 mod prefiltered_scan;
 mod profile;
+mod range_join;
 mod range_prune_bench;
 mod row_constructors;
 mod runtime_join_filter;

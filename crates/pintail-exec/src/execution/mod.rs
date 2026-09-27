@@ -370,6 +370,11 @@ pub enum PhysicalPlan {
         /// then right. The right input is bucketed by them so a left row
         /// meets only the rows its keys reach; empty tests every pair.
         keys: Vec<(BoundExpr, BoundExpr)>,
+        /// Inequalities every accepted pair satisfies, each `left op right`
+        /// over one comparable domain. With no keys, the right input is
+        /// sorted by the first one's right side, so a left row meets only the
+        /// rows its bounds reach; the whole condition still decides each pair.
+        ranges: Vec<join::RangeKey>,
         /// Complete ON predicate.
         condition: BoundExpr,
     },
@@ -696,6 +701,7 @@ impl PhysicalPlanner {
                         right: Box::new(Self::plan(*right, collation)?),
                         kind,
                         keys,
+                        ranges: Vec::new(),
                         condition,
                     });
                 }
@@ -770,13 +776,93 @@ fn plan_theta_join(
     condition: BoundExpr,
     collation: Collation,
 ) -> Result<PhysicalPlan, ExecError> {
+    let ranges = range_join_keys(&condition, &left, &right);
     Ok(PhysicalPlan::NestedLoopJoin {
         left: Box::new(PhysicalPlanner::plan(*left, collation)?),
         right: Box::new(PhysicalPlanner::plan(*right, collation)?),
         kind,
         keys: Vec::new(),
+        ranges,
         condition,
     })
+}
+
+/// The ON conjuncts that order one input's expression against the other's
+/// (`<`, `<=`, `>`, `>=`), oriented left then right, whose two sides share a
+/// domain the join can sort by (see [`join::RangeDomain`]). Each is one
+/// conjunct of an AND, so a pair outside its bounds could never match.
+fn range_join_keys(
+    condition: &BoundExpr,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+) -> Vec<join::RangeKey> {
+    let left_tables = logical_tables(left);
+    let right_tables = logical_tables(right);
+    let mut conjuncts = Vec::new();
+    and_conjuncts(condition, &mut conjuncts);
+    // `v BETWEEN lo AND hi` holds only where `v >= lo` and `v <= hi` do.
+    let comparison = |op, left: &BoundExpr, right: &BoundExpr| BoundExpr {
+        data_type: Some(DataType::Boolean),
+        nullable: true,
+        kind: BoundExprKind::Binary {
+            op,
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+        },
+    };
+    let conjuncts = conjuncts
+        .into_iter()
+        .flat_map(|conjunct| match &conjunct.kind {
+            BoundExprKind::Scalar {
+                function: ScalarFunction::Between { negated: false },
+                args,
+            } if args.len() == 3 => vec![
+                comparison(BinaryOp::GreaterOrEqual, &args[0], &args[1]),
+                comparison(BinaryOp::LessOrEqual, &args[0], &args[2]),
+            ],
+            _ => vec![conjunct],
+        })
+        .collect::<Vec<_>>();
+    conjuncts
+        .iter()
+        .filter_map(|conjunct| {
+            let BoundExprKind::Binary {
+                op,
+                left: first,
+                right: second,
+            } = &conjunct.kind
+            else {
+                return None;
+            };
+            let flipped = match op {
+                BinaryOp::Less => BinaryOp::Greater,
+                BinaryOp::LessOrEqual => BinaryOp::GreaterOrEqual,
+                BinaryOp::Greater => BinaryOp::Less,
+                BinaryOp::GreaterOrEqual => BinaryOp::LessOrEqual,
+                _ => return None,
+            };
+            join::RangeDomain::of(first.data_type, second.data_type)?;
+            if expression_belongs_to(first, &left_tables)
+                && expression_belongs_to(second, &right_tables)
+            {
+                Some(join::RangeKey {
+                    left: first.as_ref().clone(),
+                    op: *op,
+                    right: second.as_ref().clone(),
+                })
+            } else if expression_belongs_to(first, &right_tables)
+                && expression_belongs_to(second, &left_tables)
+            {
+                Some(join::RangeKey {
+                    left: second.as_ref().clone(),
+                    op: flipped,
+                    right: first.as_ref().clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// The equalities a dependent join's candidate pairs must satisfy: the ON
@@ -4852,6 +4938,7 @@ fn build_operator_inner(
             right,
             kind,
             keys,
+            ranges,
             condition,
         } => {
             let (mut left, left_columns) = build_operator(*left, provider, memory, collation)?;
@@ -4871,6 +4958,7 @@ fn build_operator_inner(
                 &right_columns,
                 kind,
                 &keys,
+                &ranges,
                 &condition,
                 provider,
                 memory,

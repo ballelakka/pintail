@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1935;
+const EXPECTED_CASES: usize = 1937;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2164,6 +2164,16 @@ fn hand_written_cases() -> Vec<OracleCase> {
         ordered(
             "hex literals as numbers",
             "SELECT 0x61 = 'a', HEX(0x61), 0x61 < 'b'",
+        ),
+        ordered(
+            "inequality joins",
+            "SELECT o.id, p.id FROM orders AS o JOIN orders AS p ON p.placed_at > o.placed_at \
+             AND p.user_id < o.user_id ORDER BY o.id, p.id",
+        ),
+        ordered(
+            "inequality joins",
+            "SELECT u.id, o.id FROM users AS u LEFT JOIN orders AS o \
+             ON o.id BETWEEN u.id AND u.id + 1 ORDER BY u.id, o.id",
         ),
         ordered(
             "correlated subqueries over joins",
