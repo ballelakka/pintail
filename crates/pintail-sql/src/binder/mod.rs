@@ -548,6 +548,17 @@ impl<'catalog> Binder<'catalog> {
         let mut residual_filter: Option<BoundExpr> = None;
         if let Some(selection) = &select.selection {
             for conjunct in split_and_conjuncts(selection) {
+                // A row's membership in a subquery is an EXISTS here, which
+                // may decorrelate like any other.
+                let membership = match conjunct {
+                    Expr::InSubquery {
+                        expr,
+                        subquery,
+                        negated,
+                    } => row::in_subquery(expr, subquery, *negated, true)?,
+                    _ => None,
+                };
+                let conjunct = membership.as_ref().unwrap_or(conjunct);
                 let bound = if let Expr::Exists { subquery, negated } = conjunct
                     && self.bind_query(subquery, ctes).is_err()
                 {
@@ -3634,9 +3645,14 @@ fn bind_expr_inner(
             expr,
             subquery,
             negated,
-        } => bind_in_subquery(
-            expr, subquery, *negated, tables, aggregates, windows, subqueries,
-        ),
+        } => match row::in_subquery(expr, subquery, *negated, false)? {
+            Some(membership) => {
+                bind_expr_inner(&membership, tables, aggregates, windows, subqueries)
+            }
+            None => bind_in_subquery(
+                expr, subquery, *negated, tables, aggregates, windows, subqueries,
+            ),
+        },
         _ => Err(BindError::UnsupportedExpression(expr.to_string())),
     }
 }

@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1925;
+const EXPECTED_CASES: usize = 1928;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2185,6 +2185,22 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "row constructor comparisons",
             "SELECT id, (note, id) <> ('Alpha', 1) FROM events \
              WHERE (id, score) <= (4, 40) ORDER BY id",
+        ),
+        ordered(
+            "row constructor comparisons",
+            "SELECT id, name FROM users WHERE (id, name) IN \
+             (SELECT user_id, 'Ada' FROM orders UNION SELECT 3, name FROM users) ORDER BY id",
+        ),
+        ordered(
+            "row constructor comparisons",
+            "SELECT id, (user_id, status) IN (SELECT id, 'shipped' FROM users WHERE id < 3), \
+                    (user_id, status) NOT IN (SELECT user_id, status FROM orders WHERE id < 3) \
+             FROM orders ORDER BY id",
+        ),
+        ordered(
+            "row constructor comparisons",
+            "SELECT u.id FROM users AS u WHERE (u.id, 'shipped') IN \
+             (SELECT o.user_id, o.status FROM orders AS o WHERE o.user_id = u.id) ORDER BY u.id",
         ),
         // Composite EXTRACT units: concatenated decimal per MySQL.
         ordered(

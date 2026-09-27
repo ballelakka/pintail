@@ -173,3 +173,27 @@ fn rows_of_different_widths_are_refused() {
         assert!(bind(sql).is_err(), "{sql} must be refused");
     }
 }
+
+#[test]
+fn rows_in_subqueries() {
+    // Members (1, 1), (2, 1), (1, 2), (1, NULL): row 4's (NULL, 1) is
+    // undecided against each, so it is NULL rather than true.
+    assert_eq!(ids("(a, b) IN (SELECT b, a FROM pairs)"), ["1", "2", "3"]);
+    assert_eq!(ids("(a, b) IN (SELECT 1, 2 UNION SELECT 2, 1)"), ["2", "3"]);
+    assert_eq!(
+        ids("(a, b) NOT IN (SELECT b, a FROM pairs WHERE id IN (1, 2))"),
+        ["2"]
+    );
+    assert_eq!(
+        run(
+            "SELECT id, (a, b) IN (SELECT b, a FROM pairs WHERE id IN (1, 2)), \
+             (a, b) NOT IN (SELECT b, a FROM pairs WHERE id IN (1, 2)) FROM pairs ORDER BY id"
+        ),
+        ["1,1,0", "2,0,1", "3,1,0", "4,NULL,NULL"]
+    );
+    assert_eq!(
+        ids("(a, b) IN (SELECT p.b, p.a FROM pairs AS p WHERE p.id = pairs.id)"),
+        ["1"]
+    );
+    assert!(bind("SELECT id FROM pairs WHERE (a, b) IN (SELECT id FROM pairs)").is_err());
+}

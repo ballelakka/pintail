@@ -13,12 +13,17 @@
 //!   `(a1, a2) < (b1, b2)` is `a1 < b1 OR (a1 = b1 AND a2 < b2)`, which is
 //!   NULL exactly where `MySQL` answers NULL - an undecided pair whose
 //!   successors cannot settle the comparison.
-//! - `IN` is equality with any listed row, and `NOT IN` its negation.
+//! - `IN` is equality with any listed row, and `NOT IN` its negation. Against
+//!   a subquery, `IN` asks whether some member row equals, through EXISTS
+//!   over the subquery with its columns renamed.
 //!
 //! Rows nest: a column that is itself a row compares by the same rules when
 //! the rewritten pair is bound.
 
-use sqlparser::ast::{BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+use sqlparser::ast::{
+    BinaryOperator, CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Query,
+    Select, SelectItem, SetExpr, TableFactor, helpers::attached_token::AttachedToken,
+};
 
 use super::BindError;
 
@@ -186,5 +191,148 @@ pub(super) fn in_list(
         }
     } else {
         any
+    }))
+}
+
+/// The name the rewrite gives a subquery's `index`th column.
+fn member_column(index: usize) -> Ident {
+    Ident::with_quote('`', format!("<row-member-{index}>"))
+}
+
+const MEMBERS: &str = "<row-members>";
+
+/// `EXISTS (SELECT 1 FROM (members) AS <row-members> WHERE condition)`.
+fn exists_member(members: &Query, condition: Expr) -> Result<Expr, BindError> {
+    let template = crate::parse_expression(&format!(
+        "EXISTS (SELECT 1 FROM (SELECT 1) AS `{MEMBERS}` WHERE TRUE)"
+    ))
+    .map_err(|error| BindError::UnsupportedSubquery(error.to_string()))?;
+    let Expr::Exists {
+        mut subquery,
+        negated,
+    } = template
+    else {
+        unreachable!("the template parses as EXISTS");
+    };
+    let SetExpr::Select(select) = subquery.body.as_mut() else {
+        unreachable!("the template's body is a SELECT");
+    };
+    select.selection = Some(condition);
+    let TableFactor::Derived { subquery: from, .. } = &mut select.from[0].relation else {
+        unreachable!("the template reads a derived table");
+    };
+    **from = members.clone();
+    Ok(Expr::Exists { subquery, negated })
+}
+
+/// The leftmost SELECT of a query body: the one that names a set
+/// operation's columns.
+fn naming_select(body: &mut SetExpr) -> Option<&mut Select> {
+    match body {
+        SetExpr::Select(select) => Some(select),
+        SetExpr::Query(query) => naming_select(query.body.as_mut()),
+        SetExpr::SetOperation { left, .. } => naming_select(left),
+        _ => None,
+    }
+}
+
+/// `subquery` with its columns renamed for the rewrite, checked against the
+/// row's width.
+fn members(subquery: &Query, width: usize) -> Result<Query, BindError> {
+    let mut members = subquery.clone();
+    let select = naming_select(members.body.as_mut())
+        .ok_or_else(|| BindError::UnsupportedSubquery(subquery.to_string()))?;
+    let mut renamed = Vec::with_capacity(select.projection.len());
+    for (index, item) in select.projection.iter().enumerate() {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
+            // A star's width is the table's, which is not known here.
+            _ => return Err(BindError::UnsupportedSubquery(subquery.to_string())),
+        };
+        renamed.push(SelectItem::ExprWithAlias {
+            expr,
+            alias: member_column(index),
+        });
+    }
+    if renamed.len() != width {
+        return Err(arity_error(width));
+    }
+    select.projection = renamed;
+    Ok(members)
+}
+
+/// Every column of `row` equal to the member's column in its place.
+fn equal_to_member(row: &[Expr]) -> Expr {
+    let pairs = row
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            (
+                column.clone(),
+                Expr::CompoundIdentifier(vec![
+                    Ident::with_quote('`', MEMBERS),
+                    member_column(index),
+                ]),
+            )
+        })
+        .collect();
+    all(pairs, &BinaryOperator::Eq)
+}
+
+/// `row [NOT] IN (subquery)`, rewritten into membership tests over the
+/// subquery's rows; `None` when `expr` is not a row constructor.
+///
+/// Membership is three-valued, as for a single column: true when some row
+/// equals, else NULL when some row's equality is undecided, else false.
+/// `filter` is set where the test is a WHERE conjunct as written - there a
+/// NULL answer rejects the row just as false does, so the undecided case
+/// needs no test of its own and the whole membership is one EXISTS.
+///
+/// # Errors
+///
+/// A subquery of another width than the row.
+pub(super) fn in_subquery(
+    expr: &Expr,
+    subquery: &Query,
+    negated: bool,
+    filter: bool,
+) -> Result<Option<Expr>, BindError> {
+    let Some(row) = columns(expr) else {
+        return Ok(None);
+    };
+    let members = members(subquery, row.len())?;
+    let equal = equal_to_member(&row);
+    let found = exists_member(&members, equal.clone())?;
+    if filter && !negated {
+        return Ok(Some(found));
+    }
+    let undecided = exists_member(
+        &members,
+        Expr::IsNull(Box::new(Expr::Nested(Box::new(equal)))),
+    )?;
+    let boolean = |value| Expr::value(sqlparser::ast::Value::Boolean(value));
+    let membership = Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![
+            CaseWhen {
+                condition: found,
+                result: boolean(true),
+            },
+            CaseWhen {
+                condition: undecided,
+                result: Expr::value(sqlparser::ast::Value::Null),
+            },
+        ],
+        else_result: Some(Box::new(boolean(false))),
+    };
+    Ok(Some(if negated {
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Not,
+            expr: Box::new(Expr::Nested(Box::new(membership))),
+        }
+    } else {
+        membership
     }))
 }
