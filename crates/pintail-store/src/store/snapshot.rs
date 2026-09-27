@@ -821,6 +821,7 @@ impl TableSnapshot {
                 parts.push_back(ScanPart::MemtableOnly {
                     lo: cursor.clone(),
                     hi: gap_hi,
+                    rows: None,
                 });
                 needs_visibility_resolution = true;
             }
@@ -845,6 +846,7 @@ impl TableSnapshot {
             if overlay {
                 parts.push_back(ScanPart::Overlay {
                     segment: segments[index].clone(),
+                    rows: None,
                 });
             } else if direct {
                 // Coalesce runs of direct clusters so parallel prefetch keeps
@@ -858,10 +860,22 @@ impl TableSnapshot {
                 }
             } else {
                 needs_visibility_resolution = true;
-                parts.push_back(ScanPart::Merge {
-                    segments: segments[index..next].to_vec(),
-                    lo: std::ops::Bound::Included(part_lo),
-                    hi: std::ops::Bound::Included(part_hi.clone()),
+                let lo = std::ops::Bound::Included(part_lo);
+                let hi = std::ops::Bound::Included(part_hi.clone());
+                let cluster = segments[index..next].to_vec();
+                parts.push_back(match self.layer_cluster(&cluster, &lo, &hi, start, end)? {
+                    Some((bases, rows)) => ScanPart::Layered {
+                        segments: cluster,
+                        lo,
+                        hi,
+                        bases,
+                        rows,
+                    },
+                    None => ScanPart::Merge {
+                        segments: cluster,
+                        lo,
+                        hi,
+                    },
                 });
             }
             cursor = std::ops::Bound::Excluded(part_hi);
@@ -872,6 +886,7 @@ impl TableSnapshot {
             parts.push_back(ScanPart::MemtableOnly {
                 lo: cursor,
                 hi: scan_end,
+                rows: None,
             });
             needs_visibility_resolution = true;
         }
@@ -891,6 +906,7 @@ impl TableSnapshot {
             reported_pruned: false,
             parts,
             memtable_cursor: None,
+            overlay_rows: self.memtable.clone(),
             direct_range: None,
             direct_slice_rows: None,
             slices: std::collections::VecDeque::new(),
@@ -901,13 +917,121 @@ impl TableSnapshot {
         }))
     }
 
+    /// Splits a merge cluster into large base segments and the newer rows
+    /// over them, resolved to one per key, when that is sound and cheap
+    /// (see [`ScanPart::Layered`]); `None` keeps the row-wise merge.
+    ///
+    /// Sound: every base has unique keys, no two bases overlap, each lies
+    /// wholly inside the scanned range, and every newer row - in the small
+    /// segments or the memtable - is at least as new as anything a base
+    /// holds, so the resolved row for a key always wins over the base's.
+    /// Cheap: the newer segments hold at most a quarter of the base rows and
+    /// at most [`MAX_LAYER_ROWS`] rows, which are read once at open.
+    #[allow(clippy::type_complexity)]
+    fn layer_cluster(
+        &self,
+        cluster: &[segment::SegmentMeta],
+        lo: &std::ops::Bound<PrimaryKey>,
+        hi: &std::ops::Bound<PrimaryKey>,
+        start: &PrimaryKey,
+        end: &PrimaryKey,
+    ) -> Result<Option<(Vec<segment::SegmentMeta>, super::scan::LayerRows)>, StoreError> {
+        const MAX_LAYER_ROWS: u64 = 1 << 20;
+        // Bases are the oldest segments, newer ones everything after them in
+        // version order; of the split points that are sound, the one leaving
+        // the most rows in the bases wins.
+        let mut by_age = cluster.iter().collect::<Vec<_>>();
+        by_age.sort_by_key(|meta| (meta.min_version, meta.max_version));
+        let mut best: Option<(usize, u64)> = None;
+        let mut base_version = 0;
+        let mut base_rows = 0u64;
+        for split in 1..by_age.len() {
+            let base = by_age[split - 1];
+            let disjoint = by_age[..split - 1]
+                .iter()
+                .all(|other| base.max_key < other.min_key || base.min_key > other.max_key);
+            if !base.unique_keys || !disjoint || *start > base.min_key || base.max_key > *end {
+                break;
+            }
+            base_version = base_version.max(base.max_version);
+            base_rows += base.row_count;
+            let newer = &by_age[split..];
+            let newer_rows = newer.iter().map(|meta| meta.row_count).sum::<u64>();
+            let sound = newer.iter().all(|meta| meta.min_version >= base_version);
+            if sound
+                && newer_rows <= MAX_LAYER_ROWS
+                && newer_rows.saturating_mul(4) <= base_rows
+                && best.is_none_or(|(_, rows)| base_rows > rows)
+            {
+                best = Some((split, base_rows));
+            }
+        }
+        let Some((split, _)) = best else {
+            return Ok(None);
+        };
+        let mut bases = by_age[..split]
+            .iter()
+            .map(|meta| (*meta).clone())
+            .collect::<Vec<_>>();
+        let newer = &by_age[split..];
+        let base_version = bases.iter().map(|base| base.max_version).max().unwrap_or(0);
+        let mut rows: BTreeMap<PrimaryKey, StoredRow> = BTreeMap::new();
+        let mut keep = |row: StoredRow| match rows.entry(row.key().clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(row);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if row.version() > entry.get().version() {
+                    entry.insert(row);
+                }
+            }
+        };
+        let within = |key: &PrimaryKey| {
+            let above = match lo {
+                std::ops::Bound::Included(bound) => key >= bound,
+                std::ops::Bound::Excluded(bound) => key > bound,
+                std::ops::Bound::Unbounded => true,
+            };
+            let below = match hi {
+                std::ops::Bound::Included(bound) => key <= bound,
+                std::ops::Bound::Excluded(bound) => key < bound,
+                std::ops::Bound::Unbounded => true,
+            };
+            above && below
+        };
+        for meta in newer {
+            let mut stream = segment::SegmentRowStream::open(&self.directory, meta, &self.schema)?;
+            if let std::ops::Bound::Included(key) | std::ops::Bound::Excluded(key) = lo {
+                stream.skip_to_key(meta, key)?;
+            }
+            while let Some(row) = stream.next_row()? {
+                if within(row.key()) {
+                    keep(row);
+                } else if matches!(hi, std::ops::Bound::Included(bound) | std::ops::Bound::Excluded(bound) if row.key() > bound)
+                {
+                    break;
+                }
+            }
+        }
+        if bound_range_is_searchable(lo, hi) {
+            for (_, row) in self.memtable.range((lo.clone(), hi.clone())) {
+                if row.version() < base_version {
+                    return Ok(None);
+                }
+                keep(row.clone());
+            }
+        }
+        bases.sort_by(|left, right| left.min_key.cmp(&right.min_key));
+        Ok(Some((bases, Arc::new(rows))))
+    }
+
     /// Granule-level refinement of merge clusters (docs/decisions.md,
     /// "Merge-on-read uses granule-level sweep-line classification"): a
     /// base+tail cluster whose dominant segment has unique keys splits into
     /// direct row-ranges of the base outside the overlap span plus one merge
     /// bounded to the actual overlap, located through the base's footer
     /// sparse index. Best effort: any obstacle keeps the coarse part.
-    fn refine_merge_parts(
+    pub(super) fn refine_merge_parts(
         &self,
         start: &PrimaryKey,
         end: &PrimaryKey,

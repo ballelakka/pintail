@@ -186,12 +186,35 @@ pub(super) enum ScanPart {
     /// part falls back to a merge over the segment.
     Overlay {
         segment: segment::SegmentMeta,
+        /// The rows that overlay the segment: the memtable's when `None`,
+        /// else a layered cluster's resolved newer rows.
+        rows: Option<LayerRows>,
     },
     MemtableOnly {
         lo: std::ops::Bound<PrimaryKey>,
         hi: std::ops::Bound<PrimaryKey>,
+        /// As for [`ScanPart::Overlay`]: the memtable's rows when `None`.
+        rows: Option<LayerRows>,
+    },
+    /// A merge cluster of large base segments, pairwise disjoint and each
+    /// with unique keys, under newer rows few enough to hold resolved: the
+    /// small segments written after the bases and the memtable, merged into
+    /// one row per key (a tombstone kept, since it masks). Served as an
+    /// overlay of each base plus those rows in the gaps between bases, so the
+    /// bases decode column by column instead of through the row-wise merge.
+    /// Without an overlay key to mask by, it is the merge it replaces.
+    Layered {
+        segments: Vec<segment::SegmentMeta>,
+        lo: std::ops::Bound<PrimaryKey>,
+        hi: std::ops::Bound<PrimaryKey>,
+        /// The base segments, in key order.
+        bases: Vec<segment::SegmentMeta>,
+        rows: LayerRows,
     },
 }
+
+/// Rows resolved to one per key, newest winning, in key order.
+pub(super) type LayerRows = Arc<BTreeMap<PrimaryKey, StoredRow>>;
 
 /// The overlay part in progress: the segment's block boundaries, so a slice
 /// knows the key span it covers and which memtable rows belong to it.
@@ -662,6 +685,9 @@ pub struct ProjectedScanStream {
     pub(super) reported_pruned: bool,
     pub(super) parts: std::collections::VecDeque<ScanPart>,
     pub(super) memtable_cursor: Option<(std::ops::Bound<PrimaryKey>, std::ops::Bound<PrimaryKey>)>,
+    /// The rows the current overlay or memtable-only part reads: the
+    /// memtable's, or a layered cluster's resolved rows.
+    pub(super) overlay_rows: LayerRows,
     pub(super) direct_range: Option<(segment::SegmentMeta, u64, u64)>,
     /// Rows per slice that last fit the budget for the pending direct range.
     pub(super) direct_slice_rows: Option<u64>,
@@ -1490,6 +1516,7 @@ impl ProjectedScanStream {
     }
 
     /// Activates the next classified scan part, returning `false` at the end.
+    #[allow(clippy::too_many_lines)]
     fn advance_part(&mut self) -> Result<bool, StoreError> {
         let Some(part) = self.parts.pop_front() else {
             return Ok(false);
@@ -1505,13 +1532,34 @@ impl ProjectedScanStream {
                 self.segments = segments;
                 self.next_segment = 0;
             }
-            ScanPart::Overlay { segment } => {
+            ScanPart::Layered {
+                segments,
+                lo,
+                hi,
+                bases,
+                rows,
+            } => {
+                let expanded = self.expand_layered(segments, lo, hi, bases, rows);
+                for part in expanded.into_iter().rev() {
+                    self.parts.push_front(part);
+                }
+                return self.advance_part();
+            }
+            ScanPart::Overlay { segment, rows } => {
                 let sparse = if self.overlay_key.is_some() {
                     segment::read_sparse_index(&self.snapshot.directory, &segment).ok()
                 } else {
                     None
                 };
                 let Some(sparse) = sparse else {
+                    if rows.is_some() {
+                        // A layered cluster checked every base's index
+                        // before it expanded; a merge over this base alone
+                        // would miss the rows layered over it.
+                        return Err(StoreError::FormatLimit(
+                            "a layered base segment lost its sparse index".into(),
+                        ));
+                    }
                     // No key column named, or no index to place slices by:
                     // the merge answers for the whole segment as before.
                     self.parts.push_front(ScanPart::Merge {
@@ -1521,6 +1569,7 @@ impl ProjectedScanStream {
                     });
                     return self.advance_part();
                 };
+                self.overlay_rows = rows.unwrap_or_else(|| self.snapshot.memtable.clone());
                 self.segments = vec![segment];
                 self.next_segment = 0;
                 self.overlay = Some(OverlayState { sparse });
@@ -1576,13 +1625,72 @@ impl ProjectedScanStream {
                     hi,
                 });
             }
-            ScanPart::MemtableOnly { lo, hi } => {
+            ScanPart::MemtableOnly { lo, hi, rows } => {
+                self.overlay_rows = rows.unwrap_or_else(|| self.snapshot.memtable.clone());
                 self.segments = Vec::new();
                 self.next_segment = 0;
                 self.memtable_cursor = Some((lo, hi));
             }
         }
         Ok(true)
+    }
+
+    /// The parts a layered cluster is served as: an overlay of each base and
+    /// the resolved rows of the gaps around them, in key order. Without an
+    /// overlay key, or a base without a sparse index to place slices by, it
+    /// is the merge it stands for.
+    fn expand_layered(
+        &self,
+        segments: Vec<segment::SegmentMeta>,
+        lo: std::ops::Bound<PrimaryKey>,
+        hi: std::ops::Bound<PrimaryKey>,
+        bases: Vec<segment::SegmentMeta>,
+        rows: LayerRows,
+    ) -> Vec<ScanPart> {
+        let layerable = self.overlay_key.is_some()
+            && bases.iter().all(|base| {
+                segment::read_sparse_index(&self.snapshot.directory, base)
+                    .is_ok_and(|sparse| !sparse.is_empty())
+            });
+        if !layerable {
+            return self
+                .snapshot
+                .refine_merge_parts(
+                    &self.start,
+                    &self.end,
+                    VecDeque::from([ScanPart::Merge { segments, lo, hi }]),
+                )
+                .into();
+        }
+        let has_rows = |lo: &std::ops::Bound<PrimaryKey>, hi: &std::ops::Bound<PrimaryKey>| {
+            bound_range_is_searchable(lo, hi)
+                && rows.range((lo.clone(), hi.clone())).next().is_some()
+        };
+        let mut expanded = Vec::with_capacity(bases.len() * 2 + 1);
+        let mut cursor = lo;
+        for base in bases {
+            let gap_hi = std::ops::Bound::Excluded(base.min_key.clone());
+            if has_rows(&cursor, &gap_hi) {
+                expanded.push(ScanPart::MemtableOnly {
+                    lo: cursor,
+                    hi: gap_hi,
+                    rows: Some(rows.clone()),
+                });
+            }
+            cursor = std::ops::Bound::Excluded(base.max_key.clone());
+            expanded.push(ScanPart::Overlay {
+                segment: base,
+                rows: Some(rows.clone()),
+            });
+        }
+        if has_rows(&cursor, &hi) {
+            expanded.push(ScanPart::MemtableOnly {
+                lo: cursor,
+                hi,
+                rows: Some(rows),
+            });
+        }
+        expanded
     }
 
     /// Produces the next chunk of memtable-resident rows for a gap part.
@@ -1631,7 +1739,7 @@ impl ProjectedScanStream {
             .collect::<Vec<Vec<pintail_types::Value>>>();
         let mut row_count = 0usize;
         let mut last_key = None;
-        for (key, row) in self.snapshot.memtable.range((lo, hi.clone())) {
+        for (key, row) in self.overlay_rows.range((lo, hi.clone())) {
             last_key = Some(key.clone());
             if row.is_deleted() {
                 continue;
@@ -2070,7 +2178,7 @@ impl ProjectedScanStream {
         let span = self.overlay_slice_span(slice);
         let mut rows = Vec::new();
         if bound_range_is_searchable(&span.0, &span.1) {
-            for (key, row) in self.snapshot.memtable.range(span) {
+            for (key, row) in self.overlay_rows.range(span) {
                 if key.parts().len() != key_parts {
                     return Err(StoreError::FormatLimit(
                         "the memtable overlay's key has a different number of parts".into(),

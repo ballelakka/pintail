@@ -322,6 +322,7 @@ fn a_memtable_overlap_is_masked_from_a_direct_decode() {
                 super::scan::ScanPart::Direct { .. }
                 | super::scan::ScanPart::DirectRange { .. } => "direct",
                 super::scan::ScanPart::MemtableOnly { .. } => "memtable",
+                super::scan::ScanPart::Layered { .. } => "layered",
             })
             .collect::<Vec<_>>()
     };
@@ -856,4 +857,183 @@ fn value_pruning_never_surfaces_an_older_memtable_version() {
         bounded.is_empty(),
         "the bounded scan surfaced a stale version: {bounded:?}"
     );
+}
+
+/// Two disjoint base segments under a flushed segment of scattered updates,
+/// deletes and inserts, plus newer memtable rows, decode as layered bases:
+/// each base column by column with the newer keys masked and their live rows
+/// placed, the rows between bases served on their own. The answer is the
+/// merge's, with the overlay key named or not, and a newer segment older than
+/// a base keeps the merge.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn scattered_updates_layer_over_their_bases() {
+    let directory = tempfile::tempdir().unwrap();
+    let schema = TableSchema::new(
+        1,
+        vec![
+            Column::new(1, "id", DataType::UInt64, false),
+            Column::new(2, "amount", DataType::Int64, true),
+        ],
+    )
+    .unwrap();
+    let options = StoreOptions {
+        background_compaction: false,
+        block_rows: 1_000,
+        ..StoreOptions::default()
+    };
+    let mut table = TableStore::open(directory.path(), schema, options).unwrap();
+    let key = |id: u64| PrimaryKey::new(vec![KeyPart::UInt64(id)]).unwrap();
+    let row = |id: u64, amount: i64, version: u64, deleted: bool| {
+        StoredRow::new(
+            key(id),
+            vec![
+                pintail_types::Value::UInt64(id),
+                pintail_types::Value::Int64(amount),
+            ],
+            version,
+            deleted,
+        )
+    };
+    let mut model: std::collections::BTreeMap<u64, Option<i64>> = std::collections::BTreeMap::new();
+    // Bases: keys 2..=70000 and 70002..=140000, step 2.
+    for (first, last, version) in [(1_u64, 35_000_u64, 1_u64), (35_001, 70_000, 2)] {
+        table
+            .ingest(
+                (first..=last)
+                    .map(|n| row(n * 2, i64::try_from(n).unwrap(), version, false))
+                    .collect(),
+            )
+            .unwrap();
+        table.flush().unwrap();
+        for n in first..=last {
+            model.insert(n * 2, Some(i64::try_from(n).unwrap()));
+        }
+    }
+    // Every 97th key updated, every 1001st deleted, and rows inserted before
+    // the first base, between the bases and after the last.
+    let mut newer = Vec::new();
+    for n in (1..=70_000_u64).step_by(97) {
+        newer.push((n * 2, -i64::try_from(n).unwrap(), false));
+    }
+    for n in (5..=70_000_u64).step_by(1001) {
+        newer.push((n * 2, 0, true));
+    }
+    newer.extend([(1, -1, false), (70_001, -2, false), (150_000, -3, false)]);
+    newer.sort_by_key(|(id, _, _)| *id);
+    newer.dedup_by_key(|(id, _, _)| *id);
+    table
+        .ingest(
+            newer
+                .iter()
+                .map(|(id, amount, deleted)| row(*id, *amount, 3, *deleted))
+                .collect(),
+        )
+        .unwrap();
+    table.flush().unwrap();
+    for (id, amount, deleted) in &newer {
+        model.insert(*id, if *deleted { None } else { Some(*amount) });
+    }
+    assert_eq!(table.manifest.segments.len(), 3);
+    // Newer still, in the memtable: one update over a flushed update, one
+    // delete of a base row, one insert.
+    let latest = [
+        (2_u64, -100_i64, false),
+        (4, 0, true),
+        (70_003, -101, false),
+    ];
+    table
+        .ingest(
+            latest
+                .iter()
+                .map(|(id, amount, deleted)| row(*id, *amount, 4, *deleted))
+                .collect(),
+        )
+        .unwrap();
+    for (id, amount, deleted) in latest {
+        model.insert(id, if deleted { None } else { Some(amount) });
+    }
+    let expected = model
+        .iter()
+        .filter_map(|(id, amount)| amount.map(|amount| (*id, amount)))
+        .collect::<Vec<_>>();
+
+    let drain = |mut stream: ProjectedScanStream| {
+        let mut rows = Vec::new();
+        loop {
+            let chunks = stream.next_column_chunks(3, usize::MAX).unwrap();
+            if chunks.is_empty() {
+                break;
+            }
+            for chunk in chunks {
+                let mut columns = chunk
+                    .into_decoded_columns()
+                    .into_iter()
+                    .map(DecodedColumn::into_values);
+                let ids = columns.next().unwrap();
+                let amounts = columns.next().unwrap();
+                for (id, amount) in ids.into_iter().zip(amounts) {
+                    match (id, amount) {
+                        (pintail_types::Value::UInt64(id), pintail_types::Value::Int64(amount)) => {
+                            rows.push((id, amount));
+                        }
+                        other => panic!("unexpected row {other:?}"),
+                    }
+                }
+            }
+        }
+        assert!(
+            rows.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "the stream stays in key order"
+        );
+        rows
+    };
+    let layered = |stream: &ProjectedScanStream| {
+        stream
+            .parts
+            .iter()
+            .any(|part| matches!(part, super::scan::ScanPart::Layered { .. }))
+    };
+
+    let snapshot = table.snapshot();
+    let mut stream = snapshot
+        .scan_projected_range_stream(&key(0), &key(400_000), &[1, 2])
+        .unwrap()
+        .expect("streaming scan");
+    stream.enable_memtable_overlay(&[1]);
+    assert!(layered(&stream));
+    assert_eq!(drain(stream), expected);
+
+    // Unnamed key: the cluster merges and answers the same.
+    let fallback = snapshot
+        .scan_projected_range_stream(&key(0), &key(400_000), &[1, 2])
+        .unwrap()
+        .expect("streaming scan");
+    assert_eq!(drain(fallback), expected);
+
+    // A range inside the first base does not layer that base (it is not
+    // wholly scanned) and still answers exactly.
+    let mut partial = snapshot
+        .scan_projected_range_stream(&key(1_000), &key(90_000), &[1, 2])
+        .unwrap()
+        .expect("streaming scan");
+    partial.enable_memtable_overlay(&[1]);
+    let within = expected
+        .iter()
+        .copied()
+        .filter(|(id, _)| (1_000..=90_000).contains(id))
+        .collect::<Vec<_>>();
+    assert_eq!(drain(partial), within);
+
+    // A replayed row older than the bases cannot win over them unseen: the
+    // cluster merges, and the base's newer version stands.
+    table.ingest(vec![row(8_000, -99, 0, false)]).unwrap();
+    let snapshot = table.snapshot();
+    let mut stale = snapshot
+        .scan_projected_range_stream(&key(0), &key(400_000), &[1, 2])
+        .unwrap()
+        .expect("streaming scan");
+    stale.enable_memtable_overlay(&[1]);
+    assert!(!layered(&stale));
+    assert_eq!(drain(stale), expected);
 }
