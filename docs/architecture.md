@@ -161,6 +161,16 @@ objects across incremental generations, and publish the portable manifest
 last. Restore verifies SHA-256 checksums and creates a new detached database;
 it never overwrites the source replica.
 
+The control-plane metadata file is checked on purpose rather than when a
+read trips over damage: a full SQLite integrity and foreign-key check at
+startup, a quick check every hour. Damage is logged at error level (so it
+reaches Sentry), published as a `metadata.damaged` event and shown on the
+dashboard. While checks are clean, a consistent compacted copy is written to
+`<data-dir>/meta-backups/` every `PINTAIL_META_BACKUP_HOURS` (default 6) and
+the newest `PINTAIL_META_BACKUP_KEEP` (default 8) are kept; zero for either
+turns copies off. Run history is pruned on the same pass: successful
+replication cycles after a day, everything else finished after thirty days.
+
 MySQL parity is tabulated in [`parity.md`](../parity.md); compatibility
 boundaries that remain by design are listed in
 [`limitations.md`](limitations.md).

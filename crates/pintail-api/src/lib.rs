@@ -12,6 +12,7 @@ mod error;
 mod events;
 mod invites;
 mod keys;
+mod metadata_health;
 mod metrics;
 mod oauth;
 mod vitals;

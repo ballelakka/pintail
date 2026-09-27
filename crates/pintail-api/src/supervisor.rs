@@ -37,6 +37,13 @@ pub fn spawn(
     state: ApiState,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
+    // Metadata upkeep runs beside the supervisor, not inside its cadence: a
+    // full integrity check of a large file takes seconds, and the five-second
+    // replication cycle must not wait on it.
+    tokio::spawn(crate::metadata_health::run(
+        state.clone(),
+        shutdown.resubscribe(),
+    ));
     tokio::spawn(async move {
         // No job survives a restart, so any table still marked
         // 'snapshotting' holds a PARTIAL copy from a process that died

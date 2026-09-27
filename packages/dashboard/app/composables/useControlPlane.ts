@@ -30,6 +30,16 @@ export type NodeStorage = {
    *  read as a full disk. */
   data: StorageVolume | null
   system: StorageVolume | null
+  /** The control-plane metadata file's last integrity check and copy. */
+  metadata?: MetadataHealth
+}
+
+export type MetadataHealth = {
+  state: 'unchecked' | 'ok' | 'damaged'
+  checked_at: string | null
+  problems: string[]
+  last_backup_at: string | null
+  backup_error: string | null
 }
 
 export type NodeStatus = {

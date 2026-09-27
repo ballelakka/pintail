@@ -26,6 +26,11 @@ const memoryCaption = computed(() => {
 // is a different store. Leading with the system volume instead would have
 // called a 91%-full macOS disk 3% used, because the sealed system volume
 // counts only itself.
+// Damage to the metadata file is surfaced the moment a check finds it, not
+// when a read of the damaged page fails somewhere else; a copy that stopped
+// being written is worth saying too, since it is the way back.
+const metadataHealth = computed(() => nodeStorage.value?.metadata ?? null)
+
 const storageVolume = computed(() => nodeStorage.value?.data ?? nodeStorage.value?.system ?? null)
 
 /// Used share of the leading volume, as `df` computes its Capacity column:
@@ -76,6 +81,21 @@ const storageDetail = computed(() => {
       </div>
       <Button variant="outline" @click="loadControlPlane"><RefreshCw /> Refresh</Button>
     </header>
+
+    <Alert v-if="metadataHealth?.state === 'damaged'" variant="destructive" class="mb-4" data-testid="metadata-damaged">
+      <AlertTriangle />
+      <AlertDescription>
+        <span>
+          The control-plane metadata file failed its integrity check{{ metadataHealth.checked_at ? ` at ${formatDate(metadataHealth.checked_at)}` : '' }}:
+          {{ metadataHealth.problems[0] }}.
+          Copies taken before the damage are in the data directory's <code>meta-backups/</code>{{ metadataHealth.last_backup_at ? `, newest ${formatDate(metadataHealth.last_backup_at)}` : '' }}.
+        </span>
+      </AlertDescription>
+    </Alert>
+    <Alert v-else-if="metadataHealth?.backup_error" class="mb-4" data-testid="metadata-backup-failed">
+      <AlertTriangle />
+      <AlertDescription>Metadata backups are failing: {{ metadataHealth.backup_error }}</AlertDescription>
+    </Alert>
 
     <Alert v-if="alertCount" variant="destructive" class="mb-4">
       <AlertTriangle />

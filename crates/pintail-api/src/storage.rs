@@ -50,6 +50,9 @@ pub(crate) struct StorageResponse {
     data: Option<Volume>,
     /// The volume holding the root of the filesystem.
     system: Option<Volume>,
+    /// Whether the control-plane metadata file passed its last integrity
+    /// check, and when it was last copied aside.
+    metadata: crate::metadata_health::MetadataHealth,
 }
 
 /// `GET /api/storage`.
@@ -96,6 +99,7 @@ fn report(data_dir: &Path) -> StorageResponse {
         },
         data,
         system,
+        metadata: crate::metadata_health::current(),
     }
 }
 
