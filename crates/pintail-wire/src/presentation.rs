@@ -549,6 +549,12 @@ fn expression(
                         column = first.clone();
                     }
                 }
+                // MySQL declares PI() with six decimals and prints it that
+                // way; arithmetic over it keeps the full double.
+                ScalarFunction::Pi => {
+                    column.decimals = 6;
+                    column.column_length = 8;
+                }
                 ScalarFunction::Soundex => {
                     column.column_length = first.map_or(16, |input| input.column_length.max(16));
                 }
