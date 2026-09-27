@@ -565,6 +565,16 @@ impl<'catalog> Binder<'catalog> {
                     if self
                         .decorrelate_exists(subquery, *negated, &mut from, &mut tables, ctes)
                         .is_ok()
+                        || self
+                            .decorrelate_through_derived(
+                                subquery,
+                                None,
+                                *negated,
+                                &mut from,
+                                &mut tables,
+                                ctes,
+                            )
+                            .is_ok()
                     {
                         continue;
                     }
@@ -579,6 +589,16 @@ impl<'catalog> Binder<'catalog> {
                     if self
                         .decorrelate_in(expr, subquery, *negated, &mut from, &mut tables, ctes)
                         .is_ok()
+                        || self
+                            .decorrelate_through_derived(
+                                subquery,
+                                Some(expr),
+                                *negated,
+                                &mut from,
+                                &mut tables,
+                                ctes,
+                            )
+                            .is_ok()
                     {
                         continue;
                     }
@@ -1192,6 +1212,216 @@ impl<'catalog> Binder<'catalog> {
             },
             table: inner_table,
             condition: Some(condition),
+        });
+        shadow_joined_table(tables);
+        Ok(())
+    }
+
+    /// Rewrites a correlated `[NOT] EXISTS`, or a non-negated `IN`, whose
+    /// subquery the single-table forms above cannot take - joins in its
+    /// `FROM`, a `GROUP BY` under `EXISTS` - into a semi or anti join
+    /// against a derived table.
+    ///
+    /// The subquery's `WHERE` splits into conjuncts that read only its own
+    /// relations, which stay inside the derived table, and comparisons
+    /// between one of its expressions and an expression of the outer query,
+    /// which become the join condition over the derived table's projected
+    /// inner sides. `IN` adds `operand = projected`. Under `EXISTS` a
+    /// `GROUP BY` without `HAVING` leaves a row wherever an input row exists,
+    /// so it is dropped; an ungrouped aggregate always yields a row, so it
+    /// is refused, as is anything else this reading does not cover.
+    #[allow(clippy::too_many_lines)] // one shape check and one rewrite, read top to bottom
+    fn decorrelate_through_derived(
+        &self,
+        subquery: &Query,
+        operand: Option<&Expr>,
+        negated: bool,
+        from: &mut [BoundFrom],
+        tables: &mut Vec<BoundTable>,
+        ctes: &[BoundCte],
+    ) -> Result<(), BindError> {
+        let unsupported = || BindError::UnsupportedSubquery(subquery.to_string());
+        let SetExpr::Select(inner) = subquery.body.as_ref() else {
+            return Err(unsupported());
+        };
+        let grouped =
+            !matches!(inner.group_by, GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
+        let aggregated = inner.projection.iter().any(select_item_has_aggregate);
+        if inner.from.is_empty()
+            || inner.having.is_some()
+            || subquery.limit_clause.is_some()
+            || !inner.named_window.is_empty()
+            || (operand.is_some() && (negated || grouped || aggregated))
+            || (operand.is_none() && aggregated && !grouped)
+        {
+            return Err(unsupported());
+        }
+        let projected = match operand {
+            None => None,
+            Some(_) => match inner.projection.as_slice() {
+                [SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }] => {
+                    Some(expr)
+                }
+                _ => return Err(unsupported()),
+            },
+        };
+        // Whether an expression reads only the subquery's own relations:
+        // it binds as the projection of a query over its FROM alone.
+        let reads_inner = |exprs: Vec<Expr>, filter: Option<Expr>| {
+            let mut probe = subquery.clone();
+            probe.order_by = None;
+            let SetExpr::Select(select) = probe.body.as_mut() else {
+                return false;
+            };
+            select.projection = exprs.into_iter().map(SelectItem::UnnamedExpr).collect();
+            select.selection = filter;
+            select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
+            select.distinct = None;
+            self.bind_query(&probe, ctes).is_ok()
+        };
+        let one = || Expr::Value(SqlValue::Number("1".into(), false).into());
+        if !reads_inner(vec![one()], None) {
+            return Err(unsupported());
+        }
+        let mut inner_only: Vec<Expr> = Vec::new();
+        // (inner side, operator, outer side, inner side written first)
+        let mut correlated: Vec<(Expr, BinaryOperator, Expr, bool)> = Vec::new();
+        if let Some(selection) = &inner.selection {
+            for conjunct in split_and_conjuncts(selection) {
+                if reads_inner(vec![one()], Some(conjunct.clone())) {
+                    inner_only.push(conjunct.clone());
+                    continue;
+                }
+                let Expr::BinaryOp { left, op, right } = conjunct else {
+                    return Err(unsupported());
+                };
+                if !matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::Spaceship
+                ) {
+                    return Err(unsupported());
+                }
+                let outer_reads = |side: &Expr| bind_expr(side, tables, None).is_ok();
+                let (inner_side, outer_side, inner_first) =
+                    if reads_inner(vec![(**left).clone()], None) && outer_reads(right) {
+                        (left, right, true)
+                    } else if reads_inner(vec![(**right).clone()], None) && outer_reads(left) {
+                        (right, left, false)
+                    } else {
+                        return Err(unsupported());
+                    };
+                // A side that also reads as inner belongs to the subquery
+                // (its names resolve there first), so it cannot be outer.
+                if reads_inner(vec![(**outer_side).clone()], None) {
+                    return Err(unsupported());
+                }
+                correlated.push((
+                    (**inner_side).clone(),
+                    op.clone(),
+                    (**outer_side).clone(),
+                    inner_first,
+                ));
+            }
+        }
+        if correlated.is_empty() {
+            return Err(unsupported());
+        }
+        if let Some(operand) = operand
+            && (bind_expr(operand, tables, None).is_err()
+                || reads_inner(vec![operand.clone()], None))
+        {
+            return Err(unsupported());
+        }
+        let alias = (1..=tables.len() + 1)
+            .map(|n| format!("<semi-join-{n}>"))
+            .find(|candidate| {
+                tables
+                    .iter()
+                    .all(|existing| !existing.relation_name.eq_ignore_ascii_case(candidate))
+            })
+            .expect("more names than relations, so one is free");
+        let key = |index: usize| {
+            Expr::CompoundIdentifier(vec![
+                Ident::with_quote('`', alias.clone()),
+                Ident::with_quote('`', format!("k{index}")),
+            ])
+        };
+        let mut derived = subquery.clone();
+        derived.order_by = None;
+        let SetExpr::Select(select) = derived.body.as_mut() else {
+            return Err(unsupported());
+        };
+        select.projection = correlated
+            .iter()
+            .map(|(inner_side, ..)| inner_side.clone())
+            .chain(projected.cloned())
+            .enumerate()
+            .map(|(index, expr)| SelectItem::ExprWithAlias {
+                expr,
+                alias: Ident::new(format!("k{index}")),
+            })
+            .collect();
+        select.selection = inner_only.into_iter().reduce(|left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        });
+        select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
+        select.distinct = None;
+        let input = self.bind_query(&derived, ctes).map_err(|_| unsupported())?;
+        let derived_table = self.bind_derived_table(alias.clone(), alias.clone(), &[], input);
+        let mut conditions = correlated
+            .iter()
+            .enumerate()
+            .map(|(index, (_, op, outer_side, inner_first))| {
+                let (left, right) = if *inner_first {
+                    (key(index), outer_side.clone())
+                } else {
+                    (outer_side.clone(), key(index))
+                };
+                Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: op.clone(),
+                    right: Box::new(right),
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(operand) = operand {
+            conditions.push(Expr::BinaryOp {
+                left: Box::new(operand.clone()),
+                op: BinaryOperator::Eq,
+                right: Box::new(key(correlated.len())),
+            });
+        }
+        let mut scope = tables.clone();
+        scope.push(derived_table.clone());
+        let mut condition: Option<BoundExpr> = None;
+        for conjunct in &conditions {
+            let bound = bind_expr(conjunct, &scope, None).map_err(|_| unsupported())?;
+            condition = Some(match condition {
+                None => bound,
+                Some(existing) => and_bound(existing, bound),
+            });
+        }
+        let Some(last) = from.last_mut() else {
+            return Err(unsupported());
+        };
+        tables.push(derived_table.clone());
+        last.joins.push(BoundJoin {
+            scalar_aggregate: false,
+            kind: if negated {
+                BoundJoinKind::Anti
+            } else {
+                BoundJoinKind::Semi
+            },
+            table: derived_table,
+            condition,
         });
         shadow_joined_table(tables);
         Ok(())

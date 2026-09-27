@@ -54,6 +54,7 @@ mod row_constructors;
 mod runtime_join_filter;
 mod scalar_fallback_cost;
 mod segment_subcube;
+mod semi_join_through_derived;
 mod session_timestamp_prune;
 mod set_ordinal;
 mod settled_delta_memo;

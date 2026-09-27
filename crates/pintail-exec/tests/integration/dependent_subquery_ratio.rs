@@ -197,7 +197,7 @@ const SHAPES: [(&str, &str); 3] = [
     (
         "in",
         "SELECT o.id FROM outer_t o WHERE o.k IN (SELECT i.k FROM inner_t i JOIN inner_t j ON \
-         j.id = i.id WHERE i.k = o.k AND j.x > 5)",
+         j.id = i.id AND i.k = o.k WHERE j.x > 5)",
     ),
 ];
 

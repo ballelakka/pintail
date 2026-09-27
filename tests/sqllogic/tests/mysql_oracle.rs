@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1931;
+const EXPECTED_CASES: usize = 1935;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2164,6 +2164,26 @@ fn hand_written_cases() -> Vec<OracleCase> {
         ordered(
             "hex literals as numbers",
             "SELECT 0x61 = 'a', HEX(0x61), 0x61 < 'b'",
+        ),
+        ordered(
+            "correlated subqueries over joins",
+            "SELECT u.id FROM users AS u WHERE EXISTS (SELECT 1 FROM orders AS o JOIN users AS v \
+             ON v.id = o.user_id WHERE o.user_id = u.id AND o.status = 'shipped') ORDER BY u.id",
+        ),
+        ordered(
+            "correlated subqueries over joins",
+            "SELECT u.id FROM users AS u WHERE NOT EXISTS (SELECT 1 FROM orders AS o JOIN users AS v \
+             ON v.id = o.user_id WHERE o.user_id = u.id AND o.status = 'shipped') ORDER BY u.id",
+        ),
+        ordered(
+            "correlated subqueries over joins",
+            "SELECT u.id FROM users AS u WHERE u.id IN (SELECT o.user_id FROM orders AS o \
+             JOIN orders AS p ON p.user_id = o.user_id WHERE p.id <> o.id AND o.id > u.id) ORDER BY u.id",
+        ),
+        ordered(
+            "correlated subqueries over joins",
+            "SELECT u.id FROM users AS u WHERE EXISTS (SELECT o.status FROM orders AS o \
+             WHERE o.user_id = u.id GROUP BY o.status) ORDER BY u.id",
         ),
         ordered(
             "week and quarter intervals",
