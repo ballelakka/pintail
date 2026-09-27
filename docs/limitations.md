@@ -491,11 +491,9 @@ stays readable as a list of things to fix.
 
 ## MySQL wire protocol
 
-- User variables are assigned only by `SET @name = expr`. An assignment inside
-  a query - `SELECT @n := @n + 1`, `SELECT ... INTO @n` - is refused, and a
-  variable holds the literal its expression answered, so one assigned from a
-  DATE or DATETIME reads back as that text rather than as a temporal value.
-  The HTTP query API has no session and does not keep them.
+- A user variable holds the literal its expression answered, so one assigned
+  from a DATE or DATETIME reads back as that text rather than as a temporal
+  value. The HTTP query API has no session and does not keep them.
 
 - `caching_sha2_password` serves both the fast-auth exchange and the
   full-authentication fallback (RSA key exchange toward a per-process
