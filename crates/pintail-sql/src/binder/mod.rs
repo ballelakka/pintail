@@ -599,6 +599,10 @@ impl<'catalog> Binder<'catalog> {
                                 ctes,
                             )
                             .is_ok()
+                        || (*negated
+                            && self
+                                .decorrelate_not_in(expr, subquery, &mut from, &mut tables, ctes)
+                                .is_ok())
                     {
                         continue;
                     }
@@ -1217,6 +1221,100 @@ impl<'catalog> Binder<'catalog> {
         Ok(())
     }
 
+    /// Rewrites a correlated `x NOT IN (SELECT y FROM ... WHERE w)` conjunct
+    /// of a `WHERE` - where a NULL answer rejects the row as false does -
+    /// into anti joins. `MySQL`'s `NOT IN` is true exactly when no member
+    /// equals `x`, no member is NULL, and `x` is not NULL unless there are
+    /// no members at all; each clause is one `NOT EXISTS` over the same
+    /// rows:
+    ///
+    /// - `NOT EXISTS (... WHERE w AND y = x)`
+    /// - `NOT EXISTS (... WHERE w AND y IS NULL)`
+    /// - `NOT EXISTS (... WHERE w AND x IS NULL)`, left out when `x` cannot
+    ///   be NULL.
+    ///
+    /// All of them decorrelate or none is taken.
+    fn decorrelate_not_in(
+        &self,
+        operand: &Expr,
+        subquery: &Query,
+        from: &mut [BoundFrom],
+        tables: &mut Vec<BoundTable>,
+        ctes: &[BoundCte],
+    ) -> Result<(), BindError> {
+        let unsupported = || BindError::UnsupportedSubquery(subquery.to_string());
+        let SetExpr::Select(inner) = subquery.body.as_ref() else {
+            return Err(unsupported());
+        };
+        let [SelectItem::UnnamedExpr(member) | SelectItem::ExprWithAlias { expr: member, .. }] =
+            inner.projection.as_slice()
+        else {
+            return Err(unsupported());
+        };
+        let grouped =
+            !matches!(inner.group_by, GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty());
+        if row::columns(operand).is_some()
+            || grouped
+            || inner.having.is_some()
+            || subquery.limit_clause.is_some()
+            || inner.projection.iter().any(select_item_has_aggregate)
+        {
+            return Err(unsupported());
+        }
+        let operand_nullable = bind_expr(operand, tables, None)
+            .map_err(|_| unsupported())?
+            .nullable;
+        let nested = |expr: &Expr| Expr::Nested(Box::new(expr.clone()));
+        let mut clauses = vec![
+            Expr::BinaryOp {
+                left: Box::new(nested(member)),
+                op: BinaryOperator::Eq,
+                right: Box::new(nested(operand)),
+            },
+            Expr::IsNull(Box::new(nested(member))),
+        ];
+        if operand_nullable {
+            clauses.push(Expr::IsNull(Box::new(nested(operand))));
+        }
+        let mut trial_from = from.to_vec();
+        let mut trial_tables = tables.clone();
+        for clause in clauses {
+            let mut exists = subquery.clone();
+            exists.order_by = None;
+            let SetExpr::Select(select) = exists.body.as_mut() else {
+                return Err(unsupported());
+            };
+            select.projection = vec![SelectItem::UnnamedExpr(Expr::Value(
+                SqlValue::Number("1".into(), false).into(),
+            ))];
+            select.distinct = None;
+            select.selection = Some(match select.selection.take() {
+                Some(existing) => Expr::BinaryOp {
+                    left: Box::new(nested(&existing)),
+                    op: BinaryOperator::And,
+                    right: Box::new(clause),
+                },
+                None => clause,
+            });
+            if self
+                .decorrelate_exists(&exists, true, &mut trial_from, &mut trial_tables, ctes)
+                .is_err()
+            {
+                self.decorrelate_through_derived(
+                    &exists,
+                    None,
+                    true,
+                    &mut trial_from,
+                    &mut trial_tables,
+                    ctes,
+                )?;
+            }
+        }
+        from.clone_from_slice(&trial_from);
+        *tables = trial_tables;
+        Ok(())
+    }
+
     /// Rewrites a correlated `[NOT] EXISTS`, or a non-negated `IN`, whose
     /// subquery the single-table forms above cannot take - joins in its
     /// `FROM`, a `GROUP BY` under `EXISTS` - into a semi or anti join
@@ -1284,12 +1382,31 @@ impl<'catalog> Binder<'catalog> {
             return Err(unsupported());
         }
         let mut inner_only: Vec<Expr> = Vec::new();
+        // Conjuncts over the outer query alone decide whether an outer row
+        // can match at all; they join the condition.
+        let mut outer_only: Vec<Expr> = Vec::new();
         // (inner side, operator, outer side, inner side written first)
         let mut correlated: Vec<(Expr, BinaryOperator, Expr, bool)> = Vec::new();
         if let Some(selection) = &inner.selection {
             for conjunct in split_and_conjuncts(selection) {
                 if reads_inner(vec![one()], Some(conjunct.clone())) {
                     inner_only.push(conjunct.clone());
+                    continue;
+                }
+                // A name the subquery can resolve is the subquery's, even
+                // when an outer relation carries the same one.
+                let mut shadowed = false;
+                let _ = sqlparser::ast::visit_expressions(conjunct, |node| {
+                    if matches!(node, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                        && reads_inner(vec![node.clone()], None)
+                    {
+                        shadowed = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    std::ops::ControlFlow::Continue(())
+                });
+                if !shadowed && bind_expr(conjunct, tables, None).is_ok() {
+                    outer_only.push(conjunct.clone());
                     continue;
                 }
                 let Expr::BinaryOp { left, op, right } = conjunct else {
@@ -1399,6 +1516,7 @@ impl<'catalog> Binder<'catalog> {
                 right: Box::new(key(correlated.len())),
             });
         }
+        conditions.extend(outer_only);
         let mut scope = tables.clone();
         scope.push(derived_table.clone());
         let mut condition: Option<BoundExpr> = None;

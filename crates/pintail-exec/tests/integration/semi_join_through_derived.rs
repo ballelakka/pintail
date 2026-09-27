@@ -1,6 +1,7 @@
 //! Correlated `EXISTS`, `NOT EXISTS` and `IN` whose subquery joins tables or
-//! groups (under `EXISTS`) run as a semi or anti join against a derived
-//! table instead of once per outer row, with the same answers.
+//! groups (under `EXISTS`), and correlated `NOT IN` over nullable columns, run
+//! as semi or anti joins against a derived table instead of once per outer
+//! row, with the same answers.
 
 use pintail_catalog::{
     CatalogSnapshot, DatabaseEntry, DatabaseId, TableEntry, TableId, TableStatistics,
@@ -173,4 +174,25 @@ fn shapes_the_rewrite_cannot_read_keep_their_answers() {
                      WHERE p.a = o.b + 10)";
     assert!(!joins_through_derived(aggregate));
     assert_eq!(ids(aggregate), ["1", "2", "3", "4"]);
+}
+
+#[test]
+fn not_in_over_nullable_columns_is_three_anti_joins() {
+    let decorrelated = |predicate: &str| {
+        let bound = bind(&format!("SELECT id FROM pairs AS o WHERE {predicate}"))
+            .unwrap_or_else(|error| panic!("bind {predicate}: {error}"));
+        !format!("{bound:?}").contains("Subquery")
+    };
+    // A NULL operand is excluded unless the members are empty; a NULL
+    // member excludes every operand it does not equal.
+    let nullable_operand = "o.a NOT IN (SELECT p.b FROM pairs AS p WHERE p.id > o.id)";
+    assert!(decorrelated(nullable_operand));
+    assert_eq!(ids(nullable_operand), ["3", "4"]);
+    let nullable_member = "o.b NOT IN (SELECT p.a FROM pairs AS p WHERE p.id > o.id)";
+    assert!(decorrelated(nullable_member));
+    assert_eq!(ids(nullable_member), ["4"]);
+    let over_a_join = "o.a NOT IN (SELECT p.b FROM pairs AS p JOIN pairs AS q ON q.id = p.id \
+                       WHERE p.id > o.id)";
+    assert!(decorrelated(over_a_join));
+    assert_eq!(ids(over_a_join), ["3", "4"]);
 }

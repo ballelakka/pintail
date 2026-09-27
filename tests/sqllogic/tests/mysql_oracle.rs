@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1937;
+const EXPECTED_CASES: usize = 1939;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2194,6 +2194,16 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "correlated subqueries over joins",
             "SELECT u.id FROM users AS u WHERE EXISTS (SELECT o.status FROM orders AS o \
              WHERE o.user_id = u.id GROUP BY o.status) ORDER BY u.id",
+        ),
+        ordered(
+            "correlated NOT IN over nullable columns",
+            "SELECT e.id FROM events AS e WHERE e.note NOT IN (SELECT f.note FROM events AS f \
+             WHERE f.id > e.id) ORDER BY e.id",
+        ),
+        ordered(
+            "correlated NOT IN over nullable columns",
+            "SELECT u.id FROM users AS u WHERE u.name NOT IN (SELECT e.note FROM events AS e \
+             WHERE e.score > u.id) ORDER BY u.id",
         ),
         ordered(
             "week and quarter intervals",
