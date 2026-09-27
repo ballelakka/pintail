@@ -691,13 +691,50 @@ impl TableSnapshot {
     ///
     /// Returns an error for a reversed range, duplicate or unknown columns,
     /// or a corrupt point-lookup bloom filter.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Returns `None` for a small range whose memtable rows need row-wise
+    /// visibility resolution: materializing it is cheaper than merging.
     pub fn scan_projected_range_stream_pruned(
         &self,
         start: &PrimaryKey,
         end: &PrimaryKey,
         column_ids: &[u32],
         bounds: &[crate::segment::ColumnBounds],
+    ) -> Result<Option<ProjectedScanStream>, StoreError> {
+        self.projected_range_stream(start, end, column_ids, bounds, true)
+    }
+
+    /// [`Self::scan_projected_range_stream_pruned`] that streams a small
+    /// range too, for a caller whose budget cannot hold it materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a reversed range, duplicate or unknown columns,
+    /// or a corrupt point-lookup bloom filter.
+    ///
+    /// # Panics
+    ///
+    /// Never: only the small-range shortcut declines to stream.
+    pub fn scan_projected_range_stream_unbuffered(
+        &self,
+        start: &PrimaryKey,
+        end: &PrimaryKey,
+        column_ids: &[u32],
+        bounds: &[crate::segment::ColumnBounds],
+    ) -> Result<ProjectedScanStream, StoreError> {
+        Ok(self
+            .projected_range_stream(start, end, column_ids, bounds, false)?
+            .expect("a scan that may not materialize always streams"))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn projected_range_stream(
+        &self,
+        start: &PrimaryKey,
+        end: &PrimaryKey,
+        column_ids: &[u32],
+        bounds: &[crate::segment::ColumnBounds],
+        materialize_small: bool,
     ) -> Result<Option<ProjectedScanStream>, StoreError> {
         if start > end {
             return Err(StoreError::FormatLimit(
@@ -838,7 +875,7 @@ impl TableSnapshot {
             });
             needs_visibility_resolution = true;
         }
-        if needs_visibility_resolution && candidate_rows < 64 * 1024 {
+        if materialize_small && needs_visibility_resolution && candidate_rows < 64 * 1024 {
             return Ok(None);
         }
         let parts = self.refine_merge_parts(start, end, parts);

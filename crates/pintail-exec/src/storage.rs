@@ -504,8 +504,8 @@ impl ScanProvider for SnapshotScanProvider<'_> {
             }
         }
         let value_bounds = sma_column_bounds(&scan.predicates);
-        if unique_keys.is_none()
-            && let Some(mut stream) = snapshot
+        let mut streamed = if unique_keys.is_none() {
+            snapshot
                 .scan_projected_range_stream_pruned(
                     &start,
                     &end,
@@ -513,7 +513,58 @@ impl ScanProvider for SnapshotScanProvider<'_> {
                     &value_bounds,
                 )
                 .map_err(|error| ExecError::Source(error.to_string()))?
-        {
+        } else {
+            None
+        };
+        let mut projected = None;
+        if streamed.is_none() {
+            // A small range the store would rather materialize holds its
+            // rows until the scan ends, so it may take only part of the
+            // budget: a scan that took all of it left nothing for the scan
+            // beside it or for the operator above, and a sort that spills
+            // still needs room for the row it is placing. Past that share
+            // the range streams, as a large one always does. Unique-key
+            // visibility needs every row at once, so it keeps the whole.
+            let budget = memory_limit - stream_overhead;
+            let share = if unique_keys.is_none() {
+                budget / 2
+            } else {
+                budget
+            };
+            match snapshot.scan_projected_range_bounded_pruned(
+                &start,
+                &end,
+                &physical_column_ids,
+                share,
+                &value_bounds,
+            ) {
+                Ok(rows) => projected = Some(rows),
+                Err(StoreError::MemoryLimitExceeded { .. }) if unique_keys.is_none() => {
+                    streamed = Some(
+                        snapshot
+                            .scan_projected_range_stream_unbuffered(
+                                &start,
+                                &end,
+                                &physical_column_ids,
+                                &value_bounds,
+                            )
+                            .map_err(|error| ExecError::Source(error.to_string()))?,
+                    );
+                }
+                Err(StoreError::MemoryLimitExceeded {
+                    used, requested, ..
+                }) => {
+                    return Err(ExecError::MemoryLimitExceeded {
+                        used: used.saturating_add(stream_overhead),
+                        requested,
+                        limit: memory_limit,
+                        scope: MemoryScope::Query,
+                    });
+                }
+                Err(other) => return Err(ExecError::Source(other.to_string())),
+            }
+        }
+        if let Some(mut stream) = streamed {
             self.record_stats(
                 key,
                 PhysicalScanStats {
@@ -571,27 +622,11 @@ impl ScanProvider for SnapshotScanProvider<'_> {
                 grouped,
             }));
         }
-        let projected = snapshot
-            .scan_projected_range_bounded_pruned(
-                &start,
-                &end,
-                &physical_column_ids,
-                memory_limit - stream_overhead,
-                &value_bounds,
-            )
-            .map_err(|error| match error {
-                StoreError::MemoryLimitExceeded {
-                    used,
-                    requested,
-                    limit: _,
-                } => ExecError::MemoryLimitExceeded {
-                    used: used.saturating_add(stream_overhead),
-                    requested,
-                    limit: memory_limit,
-                    scope: MemoryScope::Query,
-                },
-                other => ExecError::Source(other.to_string()),
-            })?;
+        let Some(projected) = projected else {
+            return Err(ExecError::InvalidPhysicalPlan(
+                "scan opened neither a stream nor a row set",
+            ));
+        };
         self.record_stats(key, projected.stats().into());
         let mut rows = projected.into_rows();
         if let Some(unique_keys) = unique_keys {
@@ -2503,6 +2538,98 @@ mod tests {
             ),
             [Value::UInt64(4000)]
         );
+    }
+
+    /// A small table whose rows are still in the memtable is materialized
+    /// when its scan opens, and that row set used to take whatever budget the
+    /// query had left. Under a tight ceiling it took nearly all of it: the
+    /// scan beside it could not reserve its own few bytes, and a sort above
+    /// a cross join failed before it could spill. Past half the budget the
+    /// range streams instead.
+    #[test]
+    fn a_materialized_memtable_scan_leaves_the_query_room_to_spill() {
+        fn wide_scan(plan: &crate::LogicalPlan) -> Option<crate::Scan> {
+            match plan {
+                crate::LogicalPlan::Scan(scan) if scan.table.table_name == "events" => {
+                    Some(scan.clone())
+                }
+                crate::LogicalPlan::Project { input, .. }
+                | crate::LogicalPlan::Filter { input, .. }
+                | crate::LogicalPlan::Derived { input, .. }
+                | crate::LogicalPlan::Sort { input, .. } => wide_scan(input),
+                crate::LogicalPlan::Join { left, right, .. } => {
+                    wide_scan(left).or_else(|| wide_scan(right))
+                }
+                crate::LogicalPlan::CrossJoin { inputs } => inputs.iter().find_map(wide_scan),
+                _ => None,
+            }
+        }
+        let directory = tempfile::tempdir().expect("temporary table");
+        let schema = schema();
+        let mut wide = TableStore::open(directory.path().join("wide"), schema.clone(), StoreOptions::default())
+        .expect("open table");
+        wide.ingest(
+            (1..=3000_u64)
+                .map(|id| row(id, &format!("a memtable row long enough to matter {id}")))
+                .collect(),
+        )
+        .expect("ingest");
+        let mut small =
+            TableStore::open(directory.path().join("small"), schema.clone(), StoreOptions::default())
+            .expect("open table");
+        small
+            .ingest((1..=20_u64).map(|id| row(id, "tag")).collect())
+            .expect("ingest");
+        let wide_snapshot = wide.snapshot();
+        let small_snapshot = small.snapshot();
+
+        let database_id = DatabaseId::new(19);
+        let (wide_id, small_id) = (TableId::new(21), TableId::new(23));
+        let entries = [
+            TableEntry::new(
+                wide_id,
+                "events",
+                schema.clone(),
+                TableStatistics::with_row_count(3000),
+            )
+            .expect("table entry"),
+            TableEntry::new(small_id, "tags", schema, TableStatistics::with_row_count(20))
+                .expect("table entry"),
+        ];
+        let database = DatabaseEntry::new(database_id, "app", entries).expect("database entry");
+        let catalog = CatalogSnapshot::new([database]).expect("catalog");
+        let provider = SnapshotScanProvider::new([
+            (database_id, wide_id, &wide_snapshot),
+            (database_id, small_id, &small_snapshot),
+        ])
+        .expect("provider");
+
+        let sql = "SELECT e.id, t.id FROM events e CROSS JOIN tags t ORDER BY t.id DESC, e.id";
+        let bound = Binder::new(&catalog, Some("app"))
+            .bind(&parse_statement(sql).expect("parse query"))
+            .expect("bind query");
+        let plan = Optimizer::optimize(LogicalPlanner::plan(bound));
+        let scan = wide_scan(&plan).expect("the plan scans the wide table");
+        // What the wide scan holds once open with room to spare.
+        let held = provider
+            .open_scan(&scan, usize::MAX)
+            .expect("open scan")
+            .retained_bytes();
+        // A budget that admits that row set and nothing opened after it:
+        // the scan streams instead and leaves the rest of the query at
+        // least half.
+        let tight = held + 16;
+        let opened = provider.open_scan(&scan, tight).expect("open scan");
+        assert!(
+            opened.retained_bytes() <= tight / 2,
+            "a scan opened under {tight} bytes holds {}",
+            opened.retained_bytes()
+        );
+        // The streamed range still answers the query, spilling the sort.
+        let values = execute_values_with_limit(sql, &catalog, &provider, held * 2);
+        assert_eq!(values.len(), 60_000);
+        assert_eq!(values[0], Value::UInt64(1));
+        assert_eq!(values[59_999], Value::UInt64(3000));
     }
 
     /// The streaming path learns its block counters only as chunks are pulled,
