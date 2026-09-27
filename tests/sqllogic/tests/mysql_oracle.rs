@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1941;
+const EXPECTED_CASES: usize = 1947;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2216,6 +2216,41 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "regex position and occurrence",
             "SELECT REGEXP_REPLACE('aaa', 'a*', 'X'), REGEXP_INSTR('abcabc', 'bc', 1, 2, 1), \
                     REGEXP_SUBSTR('abc', '^b', 2), REGEXP_SUBSTR('a\\nb', '^b', 2, 1, 'm')",
+        ),
+        ordered(
+            "compound interval expressions and microseconds",
+            "SELECT id, DATE_ADD(placed_at, INTERVAL CONCAT(id, ':30') HOUR_MINUTE), \
+                    DATE_SUB(placed_at, INTERVAL '1 2:3:4.5' DAY_MICROSECOND), \
+                    DATE_ADD('2024-01-01 00:00:00', INTERVAL '1.000005' SECOND_MICROSECOND), \
+                    DATE_ADD('2024-01-01 00:00:00', INTERVAL '1.0' SECOND_MICROSECOND) \
+             FROM orders ORDER BY id",
+        ),
+        ordered(
+            "time as a duration",
+            "SELECT GROUP_CONCAT(t ORDER BY t), MIN(t), MAX(t), \
+                    SUM(t > CAST('20:00:00' AS TIME)), ADDTIME('01:00:00', '00:30:00') * 2 \
+             FROM (SELECT CAST(CONCAT(score * 3 - 100, ':15:00') AS TIME) t FROM events) x",
+        ),
+        ordered(
+            "recursive cte with two members",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 \
+             UNION ALL SELECT n + 10 FROM r WHERE n < 3) SELECT n FROM r ORDER BY n",
+        ),
+        ordered(
+            "recursive cte stopped by limit",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r LIMIT 7) \
+             SELECT SUM(n), COUNT(*) FROM r",
+        ),
+        ordered(
+            "json against text and json extremes",
+            "SELECT id, JSON_EXTRACT(meta, '$.tags[0]') = 'premium', \
+                    JSON_EXTRACT(meta, '$.tags[0]') IN ('gift', 'bulk') \
+             FROM orders ORDER BY id",
+        ),
+        ordered(
+            "json extremes and ordered concatenation",
+            "SELECT MIN(JSON_EXTRACT(meta, '$.score')), MAX(JSON_EXTRACT(meta, '$.score')), \
+                    GROUP_CONCAT(id ORDER BY JSON_EXTRACT(meta, '$.score'), id) FROM orders",
         ),
         ordered(
             "week and quarter intervals",
