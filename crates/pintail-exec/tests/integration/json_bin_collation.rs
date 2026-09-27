@@ -698,3 +698,19 @@ fn json_distinct_survives_a_cte_boundary() {
         vec![vec!["PREMIUM".to_owned()], vec!["premium".to_owned()]]
     );
 }
+
+#[test]
+fn window_keys_over_a_json_column_partition_by_the_ladder() {
+    let rows = run(
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY JSON_EXTRACT(meta,'$.tags[0]') \
+                    ORDER BY id) FROM orders ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        [["1", "1"], ["2", "1"], ["3", "2"], ["4", "1"], ["5", "2"]]
+            .map(|row| row.map(str::to_owned).to_vec())
+            .to_vec()
+    );
+    let rows = run("SELECT id, RANK() OVER (ORDER BY meta) FROM orders ORDER BY id");
+    assert_eq!(rows.len(), 5);
+}

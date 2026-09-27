@@ -40,7 +40,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1947;
+const EXPECTED_CASES: usize = 1948;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -2246,6 +2246,10 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "SELECT id, JSON_EXTRACT(meta, '$.tags[0]') = 'premium', \
                     JSON_EXTRACT(meta, '$.tags[0]') IN ('gift', 'bulk') \
              FROM orders ORDER BY id",
+        ),
+        ordered(
+            "json against text over a column",
+            "SELECT id FROM orders WHERE meta = 'premium' ORDER BY id",
         ),
         ordered(
             "json extremes and ordered concatenation",
@@ -4980,9 +4984,11 @@ fn documented_rejects_stay_explicit() {
 fn reject_cases() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         (
-            "reject json window key",
+            // A JSON window key partitions by the JSON ladder; text that is
+            // not JSON fails as it does in MySQL.
+            "reject json window key over text that is not json",
             "SELECT ROW_NUMBER() OVER (PARTITION BY JSON_EXTRACT(note, '$.a')) FROM events",
-            "json|grouping|partition",
+            "json|invalid",
         ),
         (
             "reject json table",
@@ -4993,11 +4999,6 @@ fn reject_cases() -> Vec<(&'static str, &'static str, &'static str)> {
             "reject recursive with aggregate",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT SUM(n) FROM t) SELECT * FROM t",
             "recursive|unsupported|unknown|aggregate",
-        ),
-        (
-            "reject json mixed compare",
-            "SELECT id FROM orders WHERE meta = 'premium'",
-            "json|=|binary|invalid",
         ),
         (
             "reject json arithmetic",
