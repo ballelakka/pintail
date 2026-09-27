@@ -103,6 +103,28 @@ fn literal_text(value: &Value) -> Option<&str> {
     }
 }
 
+/// The fractional digits of a text literal that spells a TIME rather than a
+/// date or datetime, or None when the argument is anything else.
+pub(super) fn time_literal_precision(argument: &BoundExpr) -> Option<u8> {
+    let value = crate::text_charset::literal_value(argument)?;
+    let text = literal_text(value.as_ref())?.trim();
+    if super::TemporalLiteral::parse(text).is_some()
+        || pintail_types::parse_time_micros(text).is_none()
+    {
+        return None;
+    }
+    Some(text.rsplit_once('.').map_or(0, |(_, fraction)| {
+        u8::try_from(
+            fraction
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count()
+                .min(6),
+        )
+        .unwrap_or(6)
+    }))
+}
+
 // Strip the offset only for result precision inference. Value conversion
 // still resolves it against the connection zone in the execution plan.
 fn literal_datetime_without_offset(text: &str) -> &str {
@@ -701,6 +723,14 @@ pub(super) fn bind_scalar_function(
         "DATEDIFF" if args.len() == 2 => ScalarFunction::DateDiff,
         "UNIX_TIMESTAMP" if args.len() <= 1 => ScalarFunction::UnixTimestamp,
         "FROM_UNIXTIME" if args.len() == 1 => ScalarFunction::FromUnixTime,
+        // The quantity of a compound interval written as an expression; the
+        // parser wraps it (see `interval`).
+        name if args.len() == 1 && crate::CompoundUnit::from_function_name(name).is_some() => {
+            ScalarFunction::IntervalQuantity(
+                crate::CompoundUnit::from_function_name(name)
+                    .ok_or_else(|| BindError::UnsupportedExpression(function.to_string()))?,
+            )
+        }
         _ => return Err(BindError::UnsupportedExpression(function.to_string())),
     };
     if scalar == ScalarFunction::BitCount
@@ -2155,8 +2185,14 @@ pub(super) fn bind_scalar(
         // JSON_VALID answers 0/1 for any input, so it is the one predicate
         // here that never yields NULL for a non-NULL argument. MySQL declares
         // JSON_LENGTH a signed integer, so COALESCE with a negative default
-        // stays an integer.
-        ScalarFunction::JsonValid | ScalarFunction::JsonLength => (Some(DataType::Int64), true),
+        // stays an integer. A compound interval's quantity is NULL when its
+        // text has more fields than the qualifier.
+        ScalarFunction::IntervalQuantity(unit) if unit.counts_microseconds() => {
+            (Some(DataType::Utf8), true)
+        }
+        ScalarFunction::JsonValid
+        | ScalarFunction::JsonLength
+        | ScalarFunction::IntervalQuantity(_) => (Some(DataType::Int64), true),
         ScalarFunction::JsonContains | ScalarFunction::JsonContainsPath => {
             (Some(DataType::Int64), true)
         }

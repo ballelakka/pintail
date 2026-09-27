@@ -275,24 +275,72 @@ impl<'catalog> Binder<'catalog> {
     ) -> Result<BoundQuery, BindError> {
         let unsupported = || BindError::UnsupportedQueryClause(cte.to_string());
         let query = &cte.query;
-        if query.order_by.is_some()
-            || query.limit_clause.is_some()
-            || query.with.is_some()
-            || query.fetch.is_some()
+        if query.order_by.is_some() || query.with.is_some() || query.fetch.is_some() {
+            return Err(unsupported());
+        }
+        // The UNION chain splits into anchors, which do not read the CTE and
+        // come first, and recursive members, which do; every link in it must
+        // agree on ALL or DISTINCT.
+        let mut operands = Vec::new();
+        let mut quantifiers = Vec::new();
+        flatten_union(query.body.as_ref(), &mut operands, &mut quantifiers);
+        let distinct = match quantifiers.as_slice() {
+            [] => return Err(unsupported()),
+            [first, rest @ ..] => {
+                let all = matches!(first, SetQuantifier::All);
+                if rest
+                    .iter()
+                    .any(|quantifier| matches!(quantifier, SetQuantifier::All) != all)
+                {
+                    return Err(unsupported());
+                }
+                !all
+            }
+        };
+        let name = &cte.alias.name.value;
+        let anchors = operands
+            .iter()
+            .take_while(|operand| !set_expr_reads_relation(operand, name))
+            .count();
+        if anchors == 0
+            || anchors == operands.len()
+            || operands[anchors..]
+                .iter()
+                .any(|operand| !set_expr_reads_relation(operand, name))
         {
             return Err(unsupported());
         }
-        let SetExpr::SetOperation {
-            op: SetOperator::Union,
-            set_quantifier:
-                quantifier @ (SetQuantifier::All | SetQuantifier::Distinct | SetQuantifier::None),
-            left,
-            right,
-        } = query.body.as_ref()
-        else {
+        let chain = |operands: &[&SetExpr]| {
+            operands
+                .iter()
+                .map(|operand| (*operand).clone())
+                .reduce(|left, right| SetExpr::SetOperation {
+                    op: SetOperator::Union,
+                    set_quantifier: if distinct {
+                        SetQuantifier::Distinct
+                    } else {
+                        SetQuantifier::All
+                    },
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+        };
+        let (Some(left), Some(right)) = (chain(&operands[..anchors]), {
+            // Members run as one UNION ALL over the delta; a DISTINCT CTE
+            // deduplicates what they produce against every row so far.
+            operands[anchors..]
+                .iter()
+                .map(|operand| (*operand).clone())
+                .reduce(|left, right| SetExpr::SetOperation {
+                    op: SetOperator::Union,
+                    set_quantifier: SetQuantifier::All,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+        }) else {
             return Err(unsupported());
         };
-        let mut anchor = self.bind_set_expr(left, ctes)?;
+        let mut anchor = self.bind_set_expr(&left, ctes)?;
         if !cte.alias.columns.is_empty() && cte.alias.columns.len() != anchor.projection.len() {
             return Err(unsupported());
         }
@@ -355,52 +403,60 @@ impl<'catalog> Binder<'catalog> {
             working: Some(working.clone()),
         });
 
-        let member = self.bind_set_expr(right, &scope)?;
-        let canonical = member.recursive.is_none()
-            && member.union_all.is_empty()
-            && member.set_ops.is_empty()
-            && !member.union_distinct
-            && member.aggregates.is_empty()
-            && member.windows.is_empty()
-            && !member.distinct
-            && member.group_by.is_empty()
-            && member.having.is_none()
-            && member.order_by.is_empty()
-            && member.limit.is_none()
-            && member.projection.len() == anchor.projection.len();
-        if !canonical {
-            return Err(unsupported());
-        }
-        let references = member
-            .tables
-            .iter()
-            .filter(|table| table.table_id == table_id && table.database_id == database_id)
-            .count();
-        if references != 1 {
-            return Err(unsupported());
-        }
-        // Iteration deltas append to batches typed by the anchor layout, so
-        // member columns must already execute as the same storage type.
-        for (anchor_item, member_item) in anchor.projection.iter().zip(&member.projection) {
-            let compatible = match (anchor_item.expr.data_type, member_item.expr.data_type) {
-                (Some(anchor_type), Some(member_type)) => {
-                    anchor_type.storage_type() == member_type.storage_type()
-                }
-                (Some(_) | None, None) => true,
-                (None, Some(_)) => false,
-            };
-            if !compatible {
+        let member = self.bind_set_expr(&right, &scope)?;
+        let branches = std::iter::once(&member)
+            .chain(&member.union_all)
+            .collect::<Vec<_>>();
+        for branch in &branches {
+            let canonical = branch.recursive.is_none()
+                && branch.set_ops.is_empty()
+                && !branch.union_distinct
+                && branch.aggregates.is_empty()
+                && branch.windows.is_empty()
+                && !branch.distinct
+                && branch.group_by.is_empty()
+                && branch.having.is_none()
+                && branch.order_by.is_empty()
+                && branch.limit.is_none()
+                && branch.projection.len() == anchor.projection.len();
+            if !canonical {
                 return Err(unsupported());
             }
+            // Each member reads the working table exactly once, as MySQL
+            // requires of every recursive query block.
+            let references = branch
+                .tables
+                .iter()
+                .filter(|table| table.table_id == table_id && table.database_id == database_id)
+                .count();
+            if references != 1 {
+                return Err(unsupported());
+            }
+            // Iteration deltas append to batches typed by the anchor layout,
+            // so member columns must already execute as the same storage type.
+            for (anchor_item, member_item) in anchor.projection.iter().zip(&branch.projection) {
+                let compatible = match (anchor_item.expr.data_type, member_item.expr.data_type) {
+                    (Some(anchor_type), Some(member_type)) => {
+                        anchor_type.storage_type() == member_type.storage_type()
+                    }
+                    (Some(_) | None, None) => true,
+                    (None, Some(_)) => false,
+                };
+                if !compatible {
+                    return Err(unsupported());
+                }
+            }
         }
-        if !matches!(quantifier, SetQuantifier::All) && has_json_projection(&anchor) {
+        if distinct && has_json_projection(&anchor) {
             return Err(unsupported());
         }
+        let limit = query.limit_clause.as_ref().map(bind_limit).transpose()?;
         anchor.recursive = Some(Box::new(BoundRecursive {
             database_id,
             table_id,
             member,
-            distinct: !matches!(quantifier, SetQuantifier::All),
+            distinct,
+            limit,
         }));
         Ok(anchor)
     }
@@ -7109,6 +7165,19 @@ fn temporal_as_number(expr: BoundExpr) -> BoundExpr {
     {
         return time_as_number(cast_to(expr, DataType::Time64 { fsp: 0 }));
     }
+    // From TIME text their result is a TIME too, so `ADDTIME('01:00:00',
+    // '00:30:00') * 2` counts 13000 twice rather than the text's leading 1.
+    if let BoundExprKind::Scalar { function, args } = &expr.kind
+        && matches!(function, ScalarFunction::AddTime | ScalarFunction::SubTime)
+        && expr.data_type == Some(DataType::Utf8)
+        && let Some(fsp) = args
+            .iter()
+            .map(function::time_literal_precision)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|precisions| precisions.into_iter().max())
+    {
+        return time_as_number(cast_to(expr, DataType::Time64 { fsp }));
+    }
     match expr.data_type {
         Some(DataType::Date32 | DataType::DateTime64 { fsp: 0 }) => cast_to(expr, DataType::Int64),
         Some(DataType::DateTime64 { fsp }) => cast_to(
@@ -10621,4 +10690,48 @@ fn resolve_query_collation(collations: &[String]) -> Result<&'static str, BindEr
         .iter()
         .find_map(|collation| crate::bound::comparison_collation(collation))
         .unwrap_or_else(crate::bound::session_default_collation))
+}
+
+/// The operands of a left-associative `UNION` chain, in source order, and
+/// the quantifier of each link.
+fn flatten_union<'a>(
+    expression: &'a SetExpr,
+    operands: &mut Vec<&'a SetExpr>,
+    quantifiers: &mut Vec<SetQuantifier>,
+) {
+    match expression {
+        SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            flatten_union(left, operands, quantifiers);
+            quantifiers.push(*set_quantifier);
+            operands.push(right);
+        }
+        other => operands.push(other),
+    }
+}
+
+/// Whether a `SELECT` names `relation` in its `FROM`, joins included - how a
+/// recursive CTE's member is told from its anchor.
+fn set_expr_reads_relation(expression: &SetExpr, relation: &str) -> bool {
+    let names = |factor: &sqlparser::ast::TableFactor| {
+        matches!(factor, sqlparser::ast::TableFactor::Table { name, .. }
+            if name.0.len() == 1
+                && name.0[0]
+                    .as_ident()
+                    .is_some_and(|ident| ident.value.eq_ignore_ascii_case(relation)))
+    };
+    match expression {
+        SetExpr::Select(select) => select.from.iter().any(|source| {
+            names(&source.relation) || source.joins.iter().any(|join| names(&join.relation))
+        }),
+        SetExpr::Query(query) => set_expr_reads_relation(&query.body, relation),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_reads_relation(left, relation) || set_expr_reads_relation(right, relation)
+        }
+        _ => false,
+    }
 }

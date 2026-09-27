@@ -52,8 +52,8 @@ pub(super) struct CompiledAggregate {
     pub(super) data_type: Option<DataType>,
     /// `GROUP_CONCAT` separator (`MySQL` defaults to a comma).
     pub(super) separator: String,
-    /// `GROUP_CONCAT ... ORDER BY` keys as `(expr, ascending, decimal)`.
-    pub(super) order_within: Vec<(CompiledExpr, bool, bool)>,
+    /// `GROUP_CONCAT ... ORDER BY` keys as `(expr, ascending, value kind)`.
+    pub(super) order_within: Vec<(CompiledExpr, bool, pintail_sql::OrderValueKind)>,
     /// The collation this plan compares text with, resolved once at bind
     /// time. Carried on the compiled aggregate because every operator that
     /// touches a text value already holds one, which keeps it from having to
@@ -114,7 +114,7 @@ impl CompiledAggregate {
                     Ok::<_, ExecError>((
                         CompiledExpr::compile(expression, columns, collation)?,
                         *ascending,
-                        matches!(expression.data_type, Some(DataType::Decimal { .. })),
+                        pintail_sql::OrderValueKind::from_type(expression.data_type),
                     ))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -728,8 +728,8 @@ enum AggregateValue {
         items: Vec<(Vec<Value>, String, Value)>,
         /// Join separator resolved at state creation.
         separator: String,
-        /// Per-key `(ascending, decimal)` sort spec.
-        order: Vec<(bool, bool)>,
+        /// Per-key `(ascending, value kind)` sort spec.
+        order: Vec<(bool, pintail_sql::OrderValueKind)>,
     },
     JsonArrayAgg {
         /// Pre-rendered JSON fragments in input order (NULLs included).
@@ -758,7 +758,7 @@ impl AggregateState {
                 order: aggregate
                     .order_within
                     .iter()
-                    .map(|(_, ascending, decimal)| (*ascending, *decimal))
+                    .map(|(_, ascending, kind)| (*ascending, *kind))
                     .collect(),
             },
             AggregateFunction::JsonArrayAgg => AggregateValue::JsonArrayAgg { items: Vec::new() },
@@ -1686,16 +1686,12 @@ impl AggregateState {
                     // item first, independently of ascending/descending keys.
                     items.reverse();
                     items.sort_by(|left, right| {
-                        for (position, (ascending, decimal)) in order.iter().enumerate() {
+                        for (position, (ascending, kind)) in order.iter().enumerate() {
                             let ordering = compare_sort_values(
                                 left.0.get(position).unwrap_or(&Value::Null),
                                 right.0.get(position).unwrap_or(&Value::Null),
                                 BoundOrderKey {
-                                    value_kind: if *decimal {
-                                        pintail_sql::OrderValueKind::Decimal
-                                    } else {
-                                        pintail_sql::OrderValueKind::Ordinary
-                                    },
+                                    value_kind: *kind,
                                     index: 0,
                                     ascending: *ascending,
                                     // MySQL sorts NULL keys first ascending.
@@ -6178,6 +6174,16 @@ pub(super) fn compare_aggregate_values(
             return Err(ExecError::InvalidExpressionType);
         };
         return compare_decimal_text(left, right);
+    }
+    // TIME is a signed duration: '100:00:00' is past '11:11:11' and
+    // '-11:11:11' before '-1:00:00', which text order has backwards.
+    if matches!(data_type, Some(DataType::Time64 { .. }))
+        && let (Some(left), Some(right)) = (
+            left.text().and_then(pintail_types::parse_time_micros),
+            right.text().and_then(pintail_types::parse_time_micros),
+        )
+    {
+        return Ok(left.cmp(&right));
     }
     compare_mysql(left, right, collation)
 }

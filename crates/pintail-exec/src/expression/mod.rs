@@ -1621,6 +1621,7 @@ impl CompiledExpr {
                     | ScalarFunction::Char
                     | ScalarFunction::Rand
                     | ScalarFunction::Pi
+                    | ScalarFunction::IntervalQuantity(_)
                     | ScalarFunction::RandSeeded
                     // CONV and MAKETIME render short fixed-width strings,
                     // as do BIN (64 digits at most), OCT and the INET forms.
@@ -1858,6 +1859,7 @@ impl CompiledExpr {
                     | ScalarFunction::Char
                     | ScalarFunction::Rand
                     | ScalarFunction::Pi
+                    | ScalarFunction::IntervalQuantity(_)
                     | ScalarFunction::RandSeeded
                     // CONV and MAKETIME render short fixed-width strings,
                     // as do BIN (64 digits at most), OCT and the INET forms.
@@ -3688,9 +3690,12 @@ fn evaluate_eager_scalar_inner(
                 return Ok(Value::Utf8(value.format("%Y-%m-%d").to_string()));
             }
             // The result keeps the input's fractional seconds, at the
-            // precision the binder declared for it.
+            // precision the binder declared for it. A text result has no
+            // declared precision: it shows six digits when the instant has a
+            // fraction and none otherwise.
             let fsp = match data_type {
                 Some(DataType::DateTime64 { fsp }) => fsp,
+                _ if value.nanosecond() != 0 => 6,
                 _ => 0,
             };
             Ok(Value::Utf8(format_with_fraction(
@@ -3969,6 +3974,17 @@ fn evaluate_eager_scalar_inner(
         }
         ScalarFunction::Rand => Ok(Value::float64(rand::random::<f64>())),
         ScalarFunction::Pi => Ok(Value::float64(std::f64::consts::PI)),
+        // A microsecond qualifier's quantity is seconds with a fraction,
+        // which only text carries exactly.
+        ScalarFunction::IntervalQuantity(unit) => Ok(unit
+            .quantity(&scalar_string(&values[0])?)
+            .map_or(Value::Null, |quantity| {
+                if unit.counts_microseconds() {
+                    Value::Utf8(unit.render(quantity))
+                } else {
+                    Value::Int64(quantity)
+                }
+            })),
         ScalarFunction::RandSeeded => {
             // MySQL's generator (sql/item_func.cc): two 30-bit seeds derived
             // from the argument, stepped once. A statement calling RAND(seed)

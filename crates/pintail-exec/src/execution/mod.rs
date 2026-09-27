@@ -309,6 +309,8 @@ pub enum PhysicalPlan {
         working: (DatabaseId, TableId),
         /// `UNION [DISTINCT]` recursion deduplicates accumulated rows.
         distinct: bool,
+        /// The CTE's own `LIMIT`, which stops the recursion.
+        limit: Option<pintail_sql::BoundLimit>,
         /// Anchor plan; also fixes the output layout.
         anchor: Box<Self>,
         /// Recursive member template, rebuilt per iteration over the delta.
@@ -631,11 +633,13 @@ impl PhysicalPlanner {
                 working_database,
                 working_table,
                 distinct,
+                limit,
                 anchor,
                 member,
             } => Ok(PhysicalPlan::Recursive {
                 working: (working_database, working_table),
                 distinct,
+                limit,
                 anchor: Box::new(Self::plan(*anchor, collation)?),
                 member: Box::new(Self::plan(*member, collation)?),
             }),
@@ -5270,6 +5274,7 @@ fn build_operator_inner(
         PhysicalPlan::Recursive {
             working,
             distinct,
+            limit,
             anchor,
             member,
         } => {
@@ -5291,9 +5296,14 @@ fn build_operator_inner(
                 memory,
                 collation,
             )?;
+            // The CTE's own LIMIT ends the recursion once enough rows exist,
+            // so a member with no terminating condition still finishes.
+            let wanted = limit.map(|limit| {
+                usize::try_from(limit.offset.saturating_add(limit.count)).unwrap_or(usize::MAX)
+            });
             let recursion_limit = SESSION_CTE_MAX_RECURSION_DEPTH.get();
             let mut iterations: u64 = 0;
-            while !delta.is_empty() {
+            while !delta.is_empty() && wanted.is_none_or(|wanted| rows.len() < wanted) {
                 iterations += 1;
                 if iterations > recursion_limit {
                     return Err(ExecError::RecursionDepthExceeded {
@@ -5316,6 +5326,14 @@ fn build_operator_inner(
                     memory,
                     collation,
                 )?;
+            }
+            if let (Some(limit), Some(wanted)) = (limit, wanted) {
+                rows.truncate(wanted);
+                rows.drain(
+                    ..usize::try_from(limit.offset)
+                        .unwrap_or(usize::MAX)
+                        .min(rows.len()),
+                );
             }
             Ok((
                 PullOperator::Rows {

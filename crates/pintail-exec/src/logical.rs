@@ -81,6 +81,9 @@ pub enum LogicalPlan {
         working_table: pintail_catalog::TableId,
         /// `UNION [DISTINCT]` recursion deduplicates accumulated rows.
         distinct: bool,
+        /// The CTE's own `LIMIT`: recursion stops once it has produced
+        /// `offset + count` rows.
+        limit: Option<pintail_sql::BoundLimit>,
         /// Anchor producing the initial rows and the output layout.
         anchor: Box<LogicalPlan>,
         /// Recursive member; its working-table scans read the delta.
@@ -485,6 +488,7 @@ impl LogicalPlanner {
                 working_database: recursive.database_id,
                 working_table: recursive.table_id,
                 distinct: recursive.distinct,
+                limit: recursive.limit,
                 anchor: Box::new(plan),
                 member: Box::new(Self::plan(recursive.member)),
             };

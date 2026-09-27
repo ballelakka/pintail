@@ -2267,3 +2267,105 @@ fn regex_functions_take_position_occurrence_and_match_type() {
         assert!(scalar(refused).starts_with("error"), "{refused}");
     }
 }
+
+#[test]
+fn time_values_order_and_compute_as_durations() {
+    let times = "(SELECT CAST('11:11:11' AS TIME) t UNION ALL SELECT CAST('-11:11:11' AS TIME) \
+                 UNION ALL SELECT CAST('100:00:00' AS TIME) UNION ALL SELECT CAST('9:00:00' AS TIME) \
+                 UNION ALL SELECT CAST('-100:00:00' AS TIME)) x";
+    assert_answers(&[
+        (
+            &format!("(SELECT GROUP_CONCAT(t ORDER BY t) FROM {times})"),
+            "-100:00:00,-11:11:11,09:00:00,11:11:11,100:00:00",
+        ),
+        (&format!("(SELECT MAX(t) FROM {times})"), "100:00:00"),
+        (&format!("(SELECT MIN(t) FROM {times})"), "-100:00:00"),
+        (
+            &format!("(SELECT COUNT(*) FROM {times} WHERE t > CAST('20:00:00' AS TIME))"),
+            "1",
+        ),
+        (
+            "CAST('100:00:00' AS TIME) > CAST('20:00:00' AS TIME)",
+            "Boolean(true)",
+        ),
+        (
+            "CAST('-1:00:00' AS TIME) < CAST('0:00:00' AS TIME)",
+            "Boolean(true)",
+        ),
+        ("SEC_TO_TIME(9001) + 0", "23001"),
+        ("TIMEDIFF('10:00:00','09:00:00') + 0", "10000"),
+        ("ADDTIME('01:00:00','00:30:00') * 2", "26000"),
+    ]);
+    assert_eq!(
+        evaluate_rows("GROUP_CONCAT(clock ORDER BY clock)", 3),
+        "-11:11:11,11:11:11"
+    );
+}
+
+#[test]
+fn compound_intervals_take_expressions_and_microseconds() {
+    assert_answers(&[
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL CONCAT('1', ':', '30') HOUR_MINUTE)",
+            "2024-01-01 01:30:00",
+        ),
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL CONCAT(2, ' ', 3) DAY_HOUR)",
+            "2024-01-03 03:00:00",
+        ),
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL '1.5' SECOND_MICROSECOND)",
+            "2024-01-01 00:00:01.500000",
+        ),
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL '1.000005' SECOND_MICROSECOND)",
+            "2024-01-01 00:00:01.000005",
+        ),
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL '1:2.3' MINUTE_MICROSECOND)",
+            "2024-01-01 00:01:02.300000",
+        ),
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL '1:2:3.4' HOUR_MICROSECOND)",
+            "2024-01-01 01:02:03.400000",
+        ),
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL '1 2:3:4.5' DAY_MICROSECOND)",
+            "2024-01-02 02:03:04.500000",
+        ),
+        (
+            "DATE_SUB('2024-01-01', INTERVAL '1 2:3:4.000001' DAY_MICROSECOND)",
+            "2023-12-30 21:56:55.999999",
+        ),
+        (
+            "DATE_ADD('2024-01-01 00:00:00', INTERVAL NULL DAY_HOUR)",
+            "NULL",
+        ),
+    ]);
+}
+
+#[test]
+fn recursive_ctes_take_several_members_and_a_limit() {
+    assert_answers(&[
+        (
+            "(WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 3 \
+             UNION ALL SELECT n+10 FROM t WHERE n < 2) SELECT GROUP_CONCAT(n ORDER BY n) FROM t)",
+            "1,2,3,11",
+        ),
+        (
+            "(WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t LIMIT 5) \
+             SELECT GROUP_CONCAT(n ORDER BY n) FROM t)",
+            "1,2,3,4,5",
+        ),
+        (
+            "(WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 10 LIMIT 2, 3) \
+             SELECT GROUP_CONCAT(n ORDER BY n) FROM t)",
+            "3,4,5",
+        ),
+        (
+            "(WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT 2 UNION SELECT n+2 FROM t WHERE n < 4 \
+             UNION SELECT n+1 FROM t WHERE n < 4) SELECT GROUP_CONCAT(n ORDER BY n) FROM t)",
+            "1,2,3,4,5",
+        ),
+    ]);
+}

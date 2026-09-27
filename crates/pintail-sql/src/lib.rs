@@ -9,6 +9,7 @@ pub use text_charset::{
     set_session_binary_literals, set_session_character_set, set_session_client_character_set,
 };
 mod interval;
+pub use interval::CompoundUnit;
 mod metadata;
 mod mode;
 pub use mode::{DEFAULT_SQL_MODE, ParseMode, session_parse_mode, with_parse_mode};

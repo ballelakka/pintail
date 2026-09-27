@@ -1316,6 +1316,10 @@ pub enum ScalarFunction {
     Rand,
     /// `PI()`.
     Pi,
+    /// The quantity of a compound interval written as an expression, in
+    /// the single unit its qualifier counts in; NULL when it has more fields
+    /// than the qualifier.
+    IntervalQuantity(crate::CompoundUnit),
     /// `RAND(seed)`: the first value of `MySQL`'s seeded generator.
     RandSeeded,
     /// `expr REGEXP pattern` / `REGEXP_LIKE`, case-insensitive by default
@@ -2164,4 +2168,7 @@ pub struct BoundRecursive {
     pub member: BoundQuery,
     /// `UNION [DISTINCT]` recursion deduplicates against all produced rows.
     pub distinct: bool,
+    /// The CTE's own `LIMIT`: recursion stops once it has produced
+    /// `offset + count` rows, as `MySQL` stops it.
+    pub limit: Option<BoundLimit>,
 }
