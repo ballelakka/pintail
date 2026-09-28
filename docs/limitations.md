@@ -103,11 +103,13 @@ stays readable as a list of things to fix.
   DISTINCT/set duplicate handling follow MySQL's JSON type-precedence ladder
   (numbers compare numerically across integer/double spellings; objects are
   equal regardless of member order), and so do text compared with JSON (as a
-  JSON string), `MIN`/`MAX`, window keys and `GROUP_CONCAT ... ORDER BY`.
-  Residuals that still reject explicitly: comparing JSON against a date,
-  time or binary scalar (MySQL gives those their own JSON types), JSON
-  arithmetic, and the recursive-CTE `UNION DISTINCT` fixpoint over JSON
-  rows. The relative
+  JSON string), `MIN`/`MAX` and window `PARTITION BY`. Residuals that still
+  reject explicitly: comparing JSON against a date, time or binary scalar
+  (MySQL gives those their own JSON types), JSON arithmetic, window
+  `ORDER BY` and `GROUP_CONCAT ... ORDER BY` over JSON (MySQL sorts there by
+  a key that puts every integer before any other number, which the ladder
+  does not reproduce), and the recursive-CTE `UNION DISTINCT` fixpoint over
+  JSON rows. The relative
   order of unequal objects is deterministic but unspecified, as in MySQL (#8).
 - JSON paths support member steps, numeric and `last`-relative indexes,
   ranges (`[M to N]`), wildcards (`.*`, `[*]`) and recursive descent (`**`)

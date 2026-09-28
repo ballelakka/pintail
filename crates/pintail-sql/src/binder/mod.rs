@@ -5686,13 +5686,15 @@ fn bind_aggregate(
                         &key.expr
                     };
                     let bound = bind_expr(expression, tables, subqueries)?;
-                    // A JSON key orders by the JSON ladder, which its sort
-                    // key's bytes preserve.
-                    let bound = if bound.data_type == Some(DataType::Json) {
-                        json_sort_key_expr(bound)
-                    } else {
-                        bound
-                    };
+                    // MySQL sorts JSON here by a key of its own that is not
+                    // the comparison ladder (integers before any other
+                    // number, whatever their values); refusing beats
+                    // answering in a different order.
+                    if bound.data_type == Some(DataType::Json) {
+                        return Err(BindError::UnsupportedAggregate(format!(
+                            "{function}: ORDER BY over JSON is not supported"
+                        )));
+                    }
                     ensure_supported_text_collation(&[&bound])?;
                     order_within.push((bound, key.options.asc.unwrap_or(true)));
                 }
@@ -7209,7 +7211,12 @@ fn temporal_as_number(expr: BoundExpr) -> BoundExpr {
             .collect::<Option<Vec<_>>>()
             .and_then(|precisions| precisions.into_iter().max())
     {
-        return time_as_number(cast_to(expr, DataType::Time64 { fsp }));
+        // The result is still text to MySQL, so the number it reads from
+        // it is a double.
+        return cast_to(
+            time_as_number(cast_to(expr, DataType::Time64 { fsp })),
+            DataType::Float64,
+        );
     }
     match expr.data_type {
         Some(DataType::Date32 | DataType::DateTime64 { fsp: 0 }) => cast_to(expr, DataType::Int64),
@@ -9981,18 +9988,30 @@ mod tests {
         // A JSON comparison binds as a byte comparison of ladder keys.
         let bound = bind(&format!("SELECT {json} = {json} FROM Events")).expect("json equality");
         assert_eq!(bound.projection[0].expr.data_type, Some(DataType::Boolean));
-        // Text against JSON, MIN/MAX, window keys and GROUP_CONCAT's own
-        // ordering all ride the ladder too.
+        // Text against JSON, MIN/MAX and window partitions ride the ladder
+        // too.
         for sql in [
             format!("SELECT {json} = 'a' FROM Events"),
             format!("SELECT {json} IN ('a', 'b') FROM Events"),
             format!("SELECT MIN({json}), MAX({json}) FROM Events"),
             format!("SELECT ROW_NUMBER() OVER (PARTITION BY {json}) FROM Events"),
-            format!("SELECT ROW_NUMBER() OVER (ORDER BY {json}) FROM Events"),
-            format!("SELECT GROUP_CONCAT(Name ORDER BY {json}) FROM Events"),
         ] {
             bind(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
+        // Sorting by JSON inside a window or GROUP_CONCAT follows a MySQL
+        // key that is not the ladder, so those still refuse.
+        assert!(
+            bind(&format!(
+                "SELECT ROW_NUMBER() OVER (ORDER BY {json}) FROM Events"
+            ))
+            .is_err()
+        );
+        assert!(
+            bind(&format!(
+                "SELECT GROUP_CONCAT(Name ORDER BY {json}) FROM Events"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

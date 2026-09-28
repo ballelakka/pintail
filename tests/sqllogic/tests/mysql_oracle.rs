@@ -2252,9 +2252,9 @@ fn hand_written_cases() -> Vec<OracleCase> {
             "SELECT id FROM orders WHERE meta = 'premium' ORDER BY id",
         ),
         ordered(
-            "json extremes and ordered concatenation",
-            "SELECT MIN(JSON_EXTRACT(meta, '$.score')), MAX(JSON_EXTRACT(meta, '$.score')), \
-                    GROUP_CONCAT(id ORDER BY JSON_EXTRACT(meta, '$.score'), id) FROM orders",
+            "json extremes",
+            "SELECT MIN(JSON_EXTRACT(meta, '$.score')), MAX(JSON_EXTRACT(meta, '$.score')) \
+             FROM orders",
         ),
         ordered(
             "week and quarter intervals",

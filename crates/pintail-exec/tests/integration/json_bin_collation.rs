@@ -711,6 +711,4 @@ fn window_keys_over_a_json_column_partition_by_the_ladder() {
             .map(|row| row.map(str::to_owned).to_vec())
             .to_vec()
     );
-    let rows = run("SELECT id, RANK() OVER (ORDER BY meta) FROM orders ORDER BY id");
-    assert_eq!(rows.len(), 5);
 }
