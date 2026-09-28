@@ -1981,7 +1981,7 @@ pub(super) fn bind_scalar(
                 .saturating_sub(scale)
                 .saturating_add(result_scale)
                 .saturating_add(1)
-                .min(38);
+                .min(MAX_DECIMAL_PRECISION);
             (
                 Some(DataType::Decimal {
                     precision: result_precision.max(result_scale.saturating_add(1)),
@@ -1990,7 +1990,23 @@ pub(super) fn bind_scalar(
                 args.iter().any(|argument| argument.nullable),
             )
         }
-        // MySQL's CEIL/FLOOR of an exact numeric is an exact integer value.
+        // MySQL's CEIL/FLOOR of an exact numeric is an exact integer value:
+        // a BIGINT while the integer part fits one, a scale-zero DECIMAL
+        // one digit wider (for the carry) past that.
+        ScalarFunction::Ceil { decimal: true } | ScalarFunction::Floor { decimal: true }
+            if matches!(args[0].data_type, Some(DataType::Decimal { precision, scale }) if precision - scale > 18) =>
+        {
+            let Some(DataType::Decimal { precision, scale }) = args[0].data_type else {
+                unreachable!("guard matched a decimal argument");
+            };
+            (
+                Some(DataType::Decimal {
+                    precision: (precision - scale).saturating_add(1).min(MAX_DECIMAL_PRECISION),
+                    scale: 0,
+                }),
+                args[0].nullable,
+            )
+        }
         ScalarFunction::Ceil { decimal: true }
         | ScalarFunction::Floor { decimal: true }
         | ScalarFunction::Sign
@@ -2007,7 +2023,7 @@ pub(super) fn bind_scalar(
                         .saturating_sub(scale)
                         .saturating_add(result_scale)
                         .max(result_scale.saturating_add(1))
-                        .min(38),
+                        .min(MAX_DECIMAL_PRECISION),
                     scale: result_scale,
                 }),
                 args[0].nullable,

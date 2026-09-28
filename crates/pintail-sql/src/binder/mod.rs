@@ -2930,7 +2930,7 @@ fn unify_union_types(left: Option<DataType>, right: Option<DataType>) -> Option<
             precision: (precision - scale)
                 .max(digits)
                 .saturating_add(scale)
-                .min(38),
+                .min(MAX_DECIMAL_PRECISION),
             scale,
         }));
     }

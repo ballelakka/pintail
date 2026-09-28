@@ -87,7 +87,7 @@ impl DataType {
     pub const fn is_valid(self) -> bool {
         match self {
             Self::Decimal { precision, scale } => {
-                precision > 0 && precision <= 38 && scale <= precision
+                precision > 0 && precision <= 65 && scale <= 30 && scale <= precision
             }
             Self::DateTime64 { fsp } | Self::Time64 { fsp } => fsp <= 6,
             _ => true,

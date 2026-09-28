@@ -175,8 +175,9 @@ stays readable as a list of things to fix.
   values and over literals they follow MySQL.
 - Pintail maps an empty scalar-subquery result to `NULL`. During oracle development, MySQL 8.4's constant `SELECT` with `LIMIT 0` produced a special-case result that did not follow this behavior; that MySQL-only corner is excluded from the common-workload corpus.
 
-- Source `DECIMAL` columns above precision 38 are replicated as text with a
-  probe warning and deliberately decline exact-numeric expression semantics.
+- A replica created while source `DECIMAL` columns above precision 38 mapped
+  to text keeps them as text, without exact-numeric semantics, until that
+  table is re-snapshotted.
 
 - `UUID_SHORT` identifiers are not coordinated across servers or restarts within the same second.
 - `REPEAT`, `SPACE`, `LPAD`, and `RPAD` cap their result at 4096 bytes and error beyond it; MySQL's ceiling is `max_allowed_packet`. `FORMAT` uses en_US grouping only (no locale argument).
@@ -277,8 +278,7 @@ stays readable as a list of things to fix.
 - PTSEG v1 uses existing physical carriers: narrow integers use 64-bit values,
   `Float32` uses the 64-bit float carrier, and decimal/temporal/JSON values use
   canonical UTF-8.
-- `DECIMAL` precision above 38 maps to text with a probe warning. ENUM and SET
-  snapshot values are textual. Virtual generated columns replicate from
+- ENUM and SET snapshot values are textual. Virtual generated columns replicate from
   `MySQL` (5.7 and 8), which writes them into every row image. `MariaDB`
   leaves their value out of UPDATE after-images, so there they are skipped
   with a probe warning; the wider images it does write decode by source

@@ -1315,18 +1315,9 @@ fn map_mysql_type(column: &RawColumn) -> Result<TypeMapping, ProbeError> {
                 ))
             })?;
             let scale = column.numeric_scale.unwrap_or(0);
-            if precision <= 38 {
-                TypeMapping {
-                    data_type: DataType::Decimal { precision, scale },
-                    warning: None,
-                }
-            } else {
-                TypeMapping {
-                    data_type: DataType::Utf8,
-                    warning: Some(format!(
-                        "DECIMAL({precision},{scale}) exceeds precision 38 and is stored as text"
-                    )),
-                }
+            TypeMapping {
+                data_type: DataType::Decimal { precision, scale },
+                warning: None,
             }
         }
         "float" => TypeMapping {

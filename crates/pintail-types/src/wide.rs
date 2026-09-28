@@ -255,6 +255,14 @@ impl WideInt {
         Some(Self::new(self.negative != divisor.negative, quotient))
     }
 
+    /// `self / divisor` cut toward zero, the way `TRUNCATE` drops digits;
+    /// `None` for a zero divisor.
+    #[must_use]
+    pub fn div_truncate(self, divisor: Self) -> Option<Self> {
+        let (quotient, _) = divide(&self.magnitude, &divisor.magnitude)?;
+        Some(Self::new(self.negative != divisor.negative, quotient))
+    }
+
     /// The remainder of `self / divisor`, carrying the dividend's sign as
     /// `MOD` does; `None` for a zero divisor.
     #[must_use]

@@ -1450,10 +1450,14 @@ impl CompiledExpr {
             } => *scale,
             _ => return Ok(None),
         };
-        match self.evaluate_decimal_chain(batch, row)? {
-            Some(DecimalChainValue::Null) => Ok(Some(Value::Null)),
-            Some(DecimalChainValue::Exact(exact)) => exact.exact_value(declared).map(Some),
-            None => Ok(None),
+        match self.evaluate_decimal_chain(batch, row) {
+            Ok(Some(DecimalChainValue::Null)) => Ok(Some(Value::Null)),
+            Ok(Some(DecimalChainValue::Exact(exact))) => match exact.exact_value(declared) {
+                Err(ExecError::NumericOverflow) => Ok(None),
+                result => result.map(Some),
+            },
+            Ok(None) | Err(ExecError::NumericOverflow) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -1953,9 +1957,12 @@ fn decimal_chain_boundary(value: &Value) -> Result<DecimalChainValue, ExecError>
     if matches!(value, Value::Null) {
         return Ok(DecimalChainValue::Null);
     }
+    // A value past what the chain's i128 fractions hold is an overflow of
+    // the chain, not of the expression: the caller then evaluates operator
+    // by operator, widening as each step needs.
     DecimalRational::from_value(value)?
         .map(DecimalChainValue::Exact)
-        .ok_or(ExecError::InvalidExpressionType)
+        .ok_or(ExecError::NumericOverflow)
 }
 
 fn scalar_string_upper_bound(value: &Value) -> usize {
@@ -2953,6 +2960,9 @@ fn evaluate_eager_scalar_inner(
                 let declared_cap = declared_render_cap(argument_types, input_scale);
                 let render_scale = u8::try_from(digits.clamp(0, declared_cap))
                     .map_err(|_| ExecError::NumericOverflow)?;
+                if let Some(wide) = wide_decimal_scale(text, input_scale)? {
+                    return round_decimal_wide(text, wide, digits, render_scale, false, data_type);
+                }
                 let units = pintail_types::parse_decimal_rounded(
                     text,
                     u8::try_from(input_scale).unwrap_or(30),
@@ -3448,6 +3458,9 @@ fn evaluate_eager_scalar_inner(
                 let declared_cap = declared_render_cap(argument_types, input_scale);
                 let render_scale = u8::try_from(digits.clamp(0, declared_cap))
                     .map_err(|_| ExecError::NumericOverflow)?;
+                if let Some(wide) = wide_decimal_scale(text, input_scale)? {
+                    return round_decimal_wide(text, wide, digits, render_scale, true, data_type);
+                }
                 let units = if digits < 0 {
                     let zeroed = u32::try_from(digits.saturating_neg().min(38)).unwrap_or(38);
                     let input_scale =
@@ -3511,7 +3524,7 @@ fn evaluate_eager_scalar_inner(
                 return Ok(values[0].clone());
             }
             if decimal && let Value::Utf8(text) = &values[0] {
-                return decimal_integer_bound(text, true);
+                return decimal_integer_bound(text, true, data_type);
             }
             let value = mysql_f64(&values[0])?.ceil();
             if value.is_finite() {
@@ -3525,7 +3538,7 @@ fn evaluate_eager_scalar_inner(
                 return Ok(values[0].clone());
             }
             if decimal && let Value::Utf8(text) = &values[0] {
-                return decimal_integer_bound(text, false);
+                return decimal_integer_bound(text, false, data_type);
             }
             let value = mysql_f64(&values[0])?.floor();
             if value.is_finite() {
@@ -5783,6 +5796,61 @@ fn rendered_decimal(
     )
 }
 
+/// The scale of decimal text whose units at that scale overflow `i128`, and
+/// so need the wide path; `None` when the narrow path holds it.
+fn wide_decimal_scale(text: &str, input_scale: i64) -> Result<Option<u8>, ExecError> {
+    let scale = u8::try_from(input_scale).map_err(|_| ExecError::NumericOverflow)?;
+    Ok(pintail_types::parse_decimal_scaled(text, scale)
+        .is_none()
+        .then_some(scale))
+}
+
+/// `ROUND` (half away from zero) or `TRUNCATE` (toward zero) of decimal text
+/// past `i128` units, exact to `MySQL`'s 65 digits.
+///
+/// Non-negative `digits` keep `render_scale` fraction digits; negative ones
+/// zero that many whole-number digits and render at scale zero, as the
+/// narrow path does.
+fn round_decimal_wide(
+    text: &str,
+    input_scale: u8,
+    digits: i64,
+    render_scale: u8,
+    round: bool,
+    data_type: Option<DataType>,
+) -> Result<Value, ExecError> {
+    let units =
+        pintail_types::parse_decimal_wide(text, input_scale).ok_or(ExecError::NumericOverflow)?;
+    let zeroed = if digits < 0 {
+        u32::try_from(digits.unsigned_abs()).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let drop = u32::from(input_scale.saturating_sub(render_scale)).saturating_add(zeroed);
+    // A quantum past any representable magnitude leaves nothing.
+    let kept = match WideInt::pow10(drop) {
+        Some(factor) if round => units.div_round_half_up(factor),
+        Some(factor) => units.div_truncate(factor),
+        None => Some(WideInt::from_i128(0)),
+    }
+    .ok_or(ExecError::NumericOverflow)?;
+    let result = if zeroed == 0 || kept.is_zero() {
+        kept
+    } else {
+        kept.checked_mul(WideInt::pow10(zeroed).ok_or(ExecError::NumericOverflow)?)
+            .ok_or(ExecError::NumericOverflow)?
+    };
+    let result = if result.is_zero() {
+        WideInt::from_i128(0)
+    } else {
+        result
+    };
+    cast_scalar(
+        &Value::Utf8(pintail_types::format_decimal_wide(&result, render_scale)),
+        data_type,
+    )
+}
+
 fn cast_decimal(value: &Value, precision: u8, scale: u8) -> Result<Value, ExecError> {
     let text = |text: &str| {
         pintail_types::parse_decimal_rounded(text, scale)
@@ -6498,9 +6566,31 @@ fn compiled_regex(pattern: &str) -> Result<Arc<sql_regex::Program>, ExecError> {
 
 /// Exact CEIL/FLOOR of canonical decimal text: the integer part, adjusted
 /// by one when a fractional remainder exists in the rounding direction.
-fn decimal_integer_bound(text: &str, ceiling: bool) -> Result<Value, ExecError> {
+fn decimal_integer_bound(
+    text: &str,
+    ceiling: bool,
+    data_type: Option<DataType>,
+) -> Result<Value, ExecError> {
     let (whole, fraction) = text.rsplit_once('.').unwrap_or((text, ""));
     let has_fraction = fraction.bytes().any(|byte| byte != b'0');
+    // An integer part past BIGINT is typed a scale-zero DECIMAL and
+    // answered exactly, one unit toward the bound when a fraction remains.
+    if matches!(data_type, Some(DataType::Decimal { .. })) {
+        let mut integer =
+            pintail_types::parse_decimal_wide(whole, 0).ok_or(ExecError::NumericOverflow)?;
+        let negative = text.starts_with('-');
+        if has_fraction && ceiling != negative {
+            let step = WideInt::from_i128(if ceiling { 1 } else { -1 });
+            integer = integer
+                .checked_add(step)
+                .ok_or(ExecError::NumericOverflow)?;
+        }
+        if integer.is_zero() {
+            // CEIL(-0.5) is 0, not a signed zero.
+            integer = WideInt::from_i128(0);
+        }
+        return Ok(Value::Utf8(pintail_types::format_decimal_wide(&integer, 0)));
+    }
     let mut integer: i64 = whole.parse().map_err(|_| ExecError::NumericOverflow)?;
     if has_fraction {
         let negative = text.starts_with('-');

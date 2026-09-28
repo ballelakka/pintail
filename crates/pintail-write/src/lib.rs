@@ -894,14 +894,14 @@ fn typed_value(text: &str, column: &SourceColumn) -> Result<Value, WriteError> {
         // DECIMAL(5,2) is 1.01, and a leading zero or a longer fraction never
         // reaches the store, where comparisons read the text.
         DataType::Decimal { precision, scale } => {
-            let exact = pintail_types::parse_decimal_rounded(text.trim(), scale)
+            let exact = pintail_types::parse_decimal_wide_rounded(text.trim(), scale)
                 .or_else(|| {
                     // Exponent form is exact in MySQL up to the declared
                     // precision. Rewriting the digits keeps it exact here
                     // too; the double below cannot, and quietly rounded
                     // values a DECIMAL is wide enough to hold.
                     let expanded = expand_exponent(text.trim())?;
-                    pintail_types::parse_decimal_rounded(&expanded, scale)
+                    pintail_types::parse_decimal_wide_rounded(&expanded, scale)
                 })
                 .or_else(|| {
                     let number = text
@@ -909,20 +909,24 @@ fn typed_value(text: &str, column: &SourceColumn) -> Result<Value, WriteError> {
                         .parse::<f64>()
                         .ok()
                         .filter(|number| number.is_finite())?;
-                    pintail_types::parse_decimal_rounded(
+                    pintail_types::parse_decimal_wide_rounded(
                         &format!("{number:.*}", usize::from(scale)),
                         scale,
                     )
                 });
             let units = exact.ok_or_else(|| wrong("expected a decimal number"))?;
-            let limit = 10_i128
-                .checked_pow(u32::from(precision))
-                .ok_or_else(|| wrong("Out of range value"))?;
-            if units.abs() >= limit {
+            // Units at the declared scale hold at most `precision` digits;
+            // MySQL's widest DECIMAL runs to 65, past what i128 carries.
+            if !units.is_zero() && units.digits() > usize::from(precision) {
                 return Err(wrong("Out of range value"));
             }
-            return Ok(Value::Utf8(pintail_types::format_decimal_scaled(
-                units, scale,
+            let units = if units.is_zero() {
+                pintail_types::WideInt::from_i128(0)
+            } else {
+                units
+            };
+            return Ok(Value::Utf8(pintail_types::format_decimal_wide(
+                &units, scale,
             )));
         }
         // A JSON column stores the document as MySQL prints it back: keys in

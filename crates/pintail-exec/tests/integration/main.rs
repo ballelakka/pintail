@@ -74,4 +74,5 @@ mod timestamp_session_zone;
 mod top_k_sort;
 mod wide_integer_comparison_typing;
 mod window_frame_scaling;
+mod wide_decimal_parity;
 mod window_hidden_order;
