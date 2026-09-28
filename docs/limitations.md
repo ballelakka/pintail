@@ -163,9 +163,11 @@ stays readable as a list of things to fix.
 - Unix timestamp conversions round excess fractional digits to microseconds;
   `TIME_TRUNCATE_FRACTIONAL` does not switch them to truncation.
 
-- Impossible calendar dates such as February 31st still normalize to SQL
-  `NULL` during snapshot and CDC ingestion. Changing `sql_mode` cannot
-  restore values ingestion already normalized.
+- A stored date a calendar rejects, such as February 30th from a source
+  running `ALLOW_INVALID_DATES`, groups and takes part in `MIN`/`MAX` as the
+  date it is written as. `MySQL` folds such dates into `0000-00-00` when
+  grouping and answers `NULL` for a `MAX` over them. Rows ingested before
+  these dates were preserved hold `NULL` until they are re-ingested.
 - Replicas created before zero-date preservation keep their previous
   normalized values until the affected rows are re-ingested.
 

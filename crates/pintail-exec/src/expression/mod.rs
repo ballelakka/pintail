@@ -4,8 +4,8 @@ mod temporal;
 mod vector;
 
 use temporal::{
-    TO_DAYS_EPOCH_OFFSET, apply_interval, convert_tz, mysql_date_format, mysql_yearweek,
-    parse_mysql_datetime, timestamp_diff,
+    TO_DAYS_EPOCH_OFFSET, apply_interval, convert_tz, mysql_yearweek, parse_mysql_datetime,
+    timestamp_diff,
 };
 pub(crate) use temporal::{has_timestamp_offset, shift_temporal_value};
 
@@ -3630,9 +3630,18 @@ fn evaluate_eager_scalar_inner(
                         | DataType::UInt64
                 )
             );
+            let part_value = match temporal::date_part_of(&values[0], integer, part) {
+                Err(error) if stored_temporal(argument_types, 0) => {
+                    // A stored February 30th counts as the day it runs into.
+                    let text = scalar_string(&values[0])?;
+                    let rolled = stored_datetime(&text).map_err(|_| error)?;
+                    let rolled = Value::Utf8(rolled.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+                    temporal::date_part_of(&rolled, integer, part)?
+                }
+                other => other?,
+            };
             Ok(Value::Int64(
-                i64::try_from(temporal::date_part_of(&values[0], integer, part)?)
-                    .map_err(|_| ExecError::NumericOverflow)?,
+                i64::try_from(part_value).map_err(|_| ExecError::NumericOverflow)?,
             ))
         }
         ScalarFunction::DateFormat => {
@@ -3642,17 +3651,32 @@ fn evaluate_eager_scalar_inner(
                 DataType::DateTime64 { fsp: 6 },
                 values.get(3),
             );
-            let value = parse_mysql_datetime(&scalar_string(calendar.as_ref().unwrap_or(&values[0]))?)?;
+            let text = scalar_string(calendar.as_ref().unwrap_or(&values[0]))?;
+            let (value, fields) = match parse_mysql_datetime(&text) {
+                Ok(value) => (value, (value.year(), value.month(), value.day())),
+                // A stored date a calendar rejects prints its own parts and
+                // counts weekdays from the day it runs into.
+                Err(error) if stored_temporal(argument_types, 0) => {
+                    let value = stored_datetime(&text).map_err(|_| error)?;
+                    let part = |range: std::ops::Range<usize>| {
+                        text.get(range)
+                            .and_then(|digits| digits.parse::<u32>().ok())
+                            .ok_or(ExecError::InvalidDateTime)
+                    };
+                    let year = i32::try_from(part(0..4)?).map_err(|_| ExecError::InvalidDateTime)?;
+                    (value, (year, part(5..7)?, part(8..10)?))
+                }
+                Err(error) => return Err(error),
+            };
             let format = scalar_string(&values[1])?;
-            Ok(Value::Utf8(if values.len() > 2 {
-                temporal::mysql_date_format_locale(
-                    value,
-                    &format,
-                    expression_calendar_locale(values, 2),
-                )
+            let locale = if values.len() > 2 {
+                expression_calendar_locale(values, 2)
             } else {
-                mysql_date_format(value, &format)
-            }))
+                crate::calendar_locale::locale(0)
+            };
+            Ok(Value::Utf8(temporal::mysql_date_format_fields(
+                value, fields, &format, locale,
+            )))
         }
         ScalarFunction::DateInterval { unit, subtract } => {
             let input = scalar_string(&values[0])?;
@@ -3685,7 +3709,11 @@ fn evaluate_eager_scalar_inner(
                 values.get(2),
             )
             .map_or(Ok(input), |value| scalar_string(&value))?;
-            let value = parse_mysql_datetime(&input)?;
+            let value = if stored_temporal(argument_types, 0) {
+                stored_datetime(&input)?
+            } else {
+                parse_mysql_datetime(&input)?
+            };
             let value = if unit == IntervalUnit::Second {
                 let amount = interval_second_micros(&values[1])?;
                 let signed = if subtract { -amount } else { amount };
@@ -3719,12 +3747,25 @@ fn evaluate_eager_scalar_inner(
         }
         ScalarFunction::DateDiff => {
             let allow_invalid = matches!(values.get(2), Some(Value::Boolean(true)));
-            let left = datediff_date(&scalar_string(&values[0])?, allow_invalid)?;
-            let right = datediff_date(&scalar_string(&values[1])?, allow_invalid)?;
+            // A stored date a calendar rejects counts as the day it runs
+            // into whatever the session allows; a literal follows the session.
+            let left = datediff_date(
+                &scalar_string(&values[0])?,
+                allow_invalid || stored_temporal(argument_types, 0),
+            )?;
+            let right = datediff_date(
+                &scalar_string(&values[1])?,
+                allow_invalid || stored_temporal(argument_types, 1),
+            )?;
             Ok(Value::Int64(left.signed_duration_since(right).num_days()))
         }
         ScalarFunction::DayName => {
-            let value = parse_mysql_datetime(&scalar_string(&values[0])?)?;
+            let text = scalar_string(&values[0])?;
+            let value = if stored_temporal(argument_types, 0) {
+                stored_datetime(&text)?
+            } else {
+                parse_mysql_datetime(&text)?
+            };
             Ok(Value::Utf8(
                 expression_calendar_locale(values, 1).days
                     [temporal::mysql_weekday(value.date()) as usize]
@@ -4557,6 +4598,34 @@ fn datediff_date(text: &str, allow_invalid: bool) -> Result<chrono::NaiveDate, E
                 .ok_or(ExecError::InvalidDateTime)
         }
     }
+}
+
+/// Whether argument `index` is a stored DATE or DATETIME value.
+///
+/// A lenient source can hold dates a calendar rejects, such as February
+/// 30th. `MySQL` computes with such a stored value as the day it runs into -
+/// March 1st - whatever the session's mode, while the same text written as
+/// a literal follows the mode and is usually refused.
+fn stored_temporal(argument_types: &[Option<DataType>], index: usize) -> bool {
+    matches!(
+        argument_types.get(index).copied().flatten(),
+        Some(DataType::Date32 | DataType::DateTime64 { .. })
+    )
+}
+
+/// A stored date or datetime, with a day past its month's end carried into
+/// the months after it, as `MySQL` counts a stored February 30th.
+fn stored_datetime(text: &str) -> Result<NaiveDateTime, ExecError> {
+    if let Ok(value) = parse_mysql_datetime(text) {
+        return Ok(value);
+    }
+    let date = datediff_date(text, true)?;
+    let time = match text.get(11..).filter(|clock| !clock.is_empty()) {
+        Some(clock) => chrono::NaiveTime::parse_from_str(clock, "%H:%M:%S%.f")
+            .map_err(|_| ExecError::InvalidDateTime)?,
+        None => chrono::NaiveTime::MIN,
+    };
+    Ok(date.and_time(time))
 }
 
 fn mysql_month_days(year: u32, month: u32) -> Option<u32> {
@@ -8867,8 +8936,8 @@ mod tests {
     use pintail_sql::{BinaryOp, DatePart, ScalarFunction};
     use pintail_types::{DataType, Value};
 
-    use super::temporal::date_part;
-    use super::{CompiledExpr, compare_mysql, mysql_date_format, parse_mysql_number};
+    use super::temporal::{date_part, mysql_date_format};
+    use super::{CompiledExpr, compare_mysql, parse_mysql_number};
 
     /// The directives that used to be forwarded to chrono, where the same
     /// letters mean something else. Every expectation here is `MySQL` 8.4

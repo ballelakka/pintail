@@ -600,6 +600,24 @@ pub(super) fn mysql_date_format_locale(
     format: &str,
     locale: &crate::calendar_locale::CalendarLocale,
 ) -> String {
+    mysql_date_format_fields(
+        value,
+        (value.year(), value.month(), value.day()),
+        format,
+        locale,
+    )
+}
+
+/// `DATE_FORMAT` with the year, month and day written as `fields` rather
+/// than read from `value`. A stored date a calendar rejects - February
+/// 30th - prints its own parts, while weekday and week directives read
+/// `value`, the day it counts as.
+pub(super) fn mysql_date_format_fields(
+    value: NaiveDateTime,
+    (year, month, day): (i32, u32, u32),
+    format: &str,
+    locale: &crate::calendar_locale::CalendarLocale,
+) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::with_capacity(format.len());
@@ -626,13 +644,13 @@ pub(super) fn mysql_date_format_locale(
                 Ok(())
             }
             'b' => {
-                output.push_str(locale.short_months[value.month0() as usize]);
+                output.push_str(locale.short_months[month.saturating_sub(1) as usize]);
                 Ok(())
             }
-            'c' => write!(output, "{}", value.month()),
-            'D' => write!(output, "{}{}", value.day(), ordinal_suffix(value.day())),
-            'd' => write!(output, "{:02}", value.day()),
-            'e' => write!(output, "{}", value.day()),
+            'c' => write!(output, "{month}"),
+            'D' => write!(output, "{day}{}", ordinal_suffix(day)),
+            'd' => write!(output, "{day:02}"),
+            'e' => write!(output, "{day}"),
             'f' => write!(output, "{:06}", value.and_utc().timestamp_subsec_micros()),
             'H' => write!(output, "{:02}", value.hour()),
             'h' | 'I' => write!(output, "{hour12:02}"),
@@ -641,10 +659,10 @@ pub(super) fn mysql_date_format_locale(
             'k' => write!(output, "{}", value.hour()),
             'l' => write!(output, "{hour12}"),
             'M' => {
-                output.push_str(locale.months[value.month0() as usize]);
+                output.push_str(locale.months[month.saturating_sub(1) as usize]);
                 Ok(())
             }
-            'm' => write!(output, "{:02}", value.month()),
+            'm' => write!(output, "{month:02}"),
             'p' => {
                 output.push_str(meridiem);
                 Ok(())
@@ -674,8 +692,8 @@ pub(super) fn mysql_date_format_locale(
             'w' => write!(output, "{}", (mysql_weekday(value.date()) + 1) % 7),
             'X' => write!(output, "{:04}", mysql_calc_week(value.date(), 2).0),
             'x' => write!(output, "{:04}", mysql_calc_week(value.date(), 3).0),
-            'Y' => write!(output, "{:04}", value.year()),
-            'y' => write!(output, "{:02}", value.year().rem_euclid(100)),
+            'Y' => write!(output, "{year:04}"),
+            'y' => write!(output, "{:02}", year.rem_euclid(100)),
             '%' => {
                 output.push('%');
                 Ok(())

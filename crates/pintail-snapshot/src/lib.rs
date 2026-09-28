@@ -17,7 +17,7 @@ use std::{
     time::Instant,
 };
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::Utc;
 use mysql_async::{
     IsolationLevel, Params, Pool, Row, Transaction, TxOpts, Value as MysqlValue, prelude::Queryable,
 };
@@ -1454,61 +1454,75 @@ fn normalize_date(value: &MysqlValue) -> Option<String> {
         _ => return None,
     };
     // Preserved verbatim: it is a value MySQL round-trips, not a missing
-    // one. A genuinely invalid date such as February 31st still becomes
-    // NULL, because it has no canonical form to round-trip.
+    // one - and so is a date only a lenient source holds, such as
+    // February 30th or a zero month.
     if is_zero_date(year, month, day) {
         return Some(ZERO_DATE.to_owned());
     }
-    NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), u32::from(day))?;
-    Some(format!("{year:04}-{month:02}-{day:02}"))
+    storable_date(year, month, day).then(|| format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// Whether a source can hold these date parts. A strict source rejects
+/// February 30th and zero months or days, but one running with
+/// `ALLOW_INVALID_DATES`, or without `NO_ZERO_IN_DATE`, stores them and hands
+/// them back from every `SELECT`. The part ranges themselves are fixed by
+/// the storage format, so anything outside them never came from a source.
+const fn storable_date(year: u16, month: u8, day: u8) -> bool {
+    year <= 9999 && month <= 12 && day <= 31
+}
+
+const fn storable_time(hour: u8, minute: u8, second: u8, micros: u32) -> bool {
+    hour < 24 && minute < 60 && second < 60 && micros < 1_000_000
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]` (or with a `T`) read part by part, so a
+/// date a calendar would reject still yields its parts.
+fn datetime_parts(text: &str) -> Option<(u16, u8, u8, u8, u8, u8, u32)> {
+    let (date, time) = text.split_once([' ', 'T'])?;
+    let mut date = date.split('-');
+    let (year, month, day) = (
+        date.next()?.parse().ok()?,
+        date.next()?.parse().ok()?,
+        date.next()?.parse().ok()?,
+    );
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let mut clock = clock.split(':');
+    let (hour, minute, second) = (
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+    );
+    if date.next().is_some() || clock.next().is_some() {
+        return None;
+    }
+    if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let digits: String = fraction.chars().chain("000000".chars()).take(6).collect();
+    Some((year, month, day, hour, minute, second, digits.parse().ok()?))
 }
 
 fn normalize_datetime(value: &MysqlValue, fsp: u8) -> Option<String> {
-    match value {
+    let (year, month, day, hour, minute, second, micros) = match value {
         MysqlValue::Date(year, month, day, hour, minute, second, micros) => {
-            // Same reasoning as the zero date: MySQL round-trips this rather
-            // than treating it as absent.
-            if is_zero_date(*year, *month, *day) {
-                return Some(zero_datetime_text(fsp));
-            }
-            let date =
-                NaiveDate::from_ymd_opt(i32::from(*year), u32::from(*month), u32::from(*day))?;
-            date.and_hms_micro_opt(
-                u32::from(*hour),
-                u32::from(*minute),
-                u32::from(*second),
-                *micros,
-            )?;
-            Some(format_mysql_datetime(
-                *year, *month, *day, *hour, *minute, *second, *micros, fsp,
-            ))
+            (*year, *month, *day, *hour, *minute, *second, *micros)
         }
         MysqlValue::Bytes(value) => {
             let value = std::str::from_utf8(value).ok()?;
             if value.starts_with(ZERO_DATE) {
                 return Some(zero_datetime_text(fsp));
             }
-            let formats = [
-                "%Y-%m-%d %H:%M:%S%.f",
-                "%Y-%m-%dT%H:%M:%S%.f",
-                "%Y-%m-%d %H:%M:%S",
-            ];
-            let parsed = formats
-                .iter()
-                .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())?;
-            Some(format_mysql_datetime(
-                u16::try_from(parsed.date().year()).ok()?,
-                u8::try_from(parsed.date().month()).ok()?,
-                u8::try_from(parsed.date().day()).ok()?,
-                u8::try_from(parsed.time().hour()).ok()?,
-                u8::try_from(parsed.time().minute()).ok()?,
-                u8::try_from(parsed.time().second()).ok()?,
-                parsed.time().nanosecond() / 1_000,
-                fsp,
-            ))
+            datetime_parts(value)?
         }
-        _ => None,
+        _ => return None,
+    };
+    // Same reasoning as the zero date: MySQL round-trips this rather than
+    // treating it as absent, and so a lenient source's February 30th.
+    if is_zero_date(year, month, day) {
+        return Some(zero_datetime_text(fsp));
     }
+    (storable_date(year, month, day) && storable_time(hour, minute, second, micros))
+        .then(|| format_mysql_datetime(year, month, day, hour, minute, second, micros, fsp))
 }
 
 fn normalize_time(value: &MysqlValue, fsp: u8) -> Option<String> {
@@ -1820,18 +1834,32 @@ mod tests {
             Some("0000-00-00 00:00:00.000000".to_owned())
         );
 
-        // Genuinely invalid dates still become NULL: unlike the all-zero
-        // date, they have no canonical form MySQL round-trips.
+        // A lenient source holds dates a calendar rejects and returns them
+        // from every SELECT, so they are values too.
         assert_eq!(
             normalize_date(&MysqlValue::Date(2024, 2, 30, 0, 0, 0, 0)),
-            None
+            Some("2024-02-30".to_owned())
         );
         assert_eq!(
             normalize_date(&MysqlValue::Date(2024, 0, 1, 0, 0, 0, 0)),
-            None
+            Some("2024-00-01".to_owned())
         );
         assert_eq!(
             normalize_datetime(&MysqlValue::Date(2024, 2, 30, 12, 0, 0, 0), 0),
+            Some("2024-02-30 12:00:00".to_owned())
+        );
+        assert_eq!(
+            normalize_datetime(&MysqlValue::Bytes(b"2024-04-31 23:59:59.5".to_vec()), 2),
+            Some("2024-04-31 23:59:59.50".to_owned())
+        );
+        // Parts outside what the storage format holds never came from a
+        // source.
+        assert_eq!(
+            normalize_date(&MysqlValue::Date(2024, 13, 1, 0, 0, 0, 0)),
+            None
+        );
+        assert_eq!(
+            normalize_datetime(&MysqlValue::Date(2024, 2, 1, 24, 0, 0, 0), 0),
             None
         );
 
