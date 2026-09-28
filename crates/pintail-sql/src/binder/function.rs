@@ -2738,12 +2738,15 @@ pub(super) fn ensure_supported_text_collation(expressions: &[&BoundExpr]) -> Res
         return Ok(());
     }
     // One supported collation for the whole expression is fine; the executor
-    // is told which one and compares accordingly. A MIXTURE is not, even when
-    // both halves are supported - the two disagree about trailing spaces and
-    // about supplementary characters, so the comparison has two defensible
-    // answers. MySQL picks one by coercibility; guessing here would produce a
-    // wrong answer where refusing produces an error.
-    if collations.len() == 1 && crate::bound::comparison_collation(&collations[0]).is_some() {
+    // is told which one and compares accordingly. A MIXTURE resolves only
+    // where MySQL's charset-then-binary rule names a winner; two collations
+    // it leaves tied (`general_ci` against `0900_ai_ci`) are MySQL's own
+    // "illegal mix" error.
+    let resolved = match collations.as_slice() {
+        [only] => Some(only.clone()),
+        _ => crate::bound::aggregate_column_collations(&collations),
+    };
+    if resolved.is_some_and(|collation| crate::bound::comparison_collation(&collation).is_some()) {
         return Ok(());
     }
     let detail = collations.join(", ");

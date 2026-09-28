@@ -73,6 +73,75 @@ pub fn comparison_collation(name: &str) -> Option<&'static str> {
         .find(|supported| *supported == wanted)
 }
 
+/// The one collation several column collations meeting in one operation
+/// resolve to, when `MySQL` resolves them at all.
+///
+/// Columns sit on one coercibility rung, so `MySQL` decides by charset first
+/// and collation second, measured against 8.4:
+///
+/// - Across charsets the wider one wins outright, whatever collation the
+///   narrower side carries: utf8mb4 over utf8mb3, either over a single-byte
+///   charset. Two single-byte charsets have no winner.
+/// - Within one charset a binary-sort collation beats a case-insensitive one;
+///   two different non-binary collations have no winner.
+///
+/// `MySQL` folds an argument list pairwise left to right, so three
+/// collations can resolve in one order and fail in another. This accepts
+/// only mixtures whose answer cannot depend on order: after the charset
+/// step, at most one non-binary collation beside at most one binary one.
+///
+/// Replicated text is stored decoded, so comparing a narrower column's
+/// values under the winner's rules is what `MySQL` does after converting
+/// them.
+#[must_use]
+pub fn aggregate_column_collations(collations: &[String]) -> Option<String> {
+    fn charset(collation: &str) -> (u8, String) {
+        let lower = collation.to_ascii_lowercase();
+        let charset = lower.split('_').next().unwrap_or_default().to_owned();
+        let rank = match charset.as_str() {
+            "utf8mb4" => 3,
+            "utf8mb3" | "utf8" => 2,
+            "ucs2" | "utf16" | "utf16le" | "utf32" => 0,
+            _ => 1,
+        };
+        let charset = if charset == "utf8" {
+            "utf8mb3".to_owned()
+        } else {
+            charset
+        };
+        (rank, charset)
+    }
+    let normalized = |collation: &String| {
+        let lower = collation.to_ascii_lowercase();
+        lower
+            .strip_prefix("utf8_")
+            .map_or_else(|| lower.clone(), |rest| format!("utf8mb3_{rest}"))
+    };
+    let top = collations.iter().map(|c| charset(c).0).max()?;
+    if top == 0 {
+        return None;
+    }
+    let mut winners: Vec<String> = collations
+        .iter()
+        .filter(|collation| charset(collation).0 == top)
+        .map(normalized)
+        .collect();
+    winners.sort_unstable();
+    winners.dedup();
+    let mut charsets: Vec<String> = winners.iter().map(|c| charset(c).1).collect();
+    charsets.dedup();
+    if charsets.len() != 1 {
+        return None;
+    }
+    let (binary, other): (Vec<&String>, Vec<&String>) = winners
+        .iter()
+        .partition(|collation| collation.ends_with("_bin"));
+    match (binary.as_slice(), other.as_slice()) {
+        ([only], [] | [_]) | ([], [only]) => Some((*only).clone()),
+        _ => None,
+    }
+}
+
 /// A table made unambiguous against one catalog snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundTable {
@@ -772,7 +841,10 @@ impl BoundExpr {
             [] if self.reads_json_text() => Some(BIN_TEXT_COLLATION.to_owned()),
             [] => Some(DEFAULT_TEXT_COLLATION.to_owned()),
             [collation] => Some(collation.clone()),
-            _ => Some(format!("{MIXED_COLLATION_PREFIX}{}", collations.join(","))),
+            _ => Some(
+                aggregate_column_collations(&collations)
+                    .unwrap_or_else(|| format!("{MIXED_COLLATION_PREFIX}{}", collations.join(","))),
+            ),
         }
     }
 
@@ -1901,19 +1973,52 @@ impl BoundExpr {
                 _ => {}
             }
         }
+        Self::shared_text_collation(&[self])
+    }
+
+    /// This expression pinned to `collation` at `MySQL`'s explicit rung, the
+    /// way a written `COLLATE` pins it - for a comparison resolved against
+    /// operands the rewritten form no longer carries. An unsupported name
+    /// leaves it as it was.
+    #[must_use]
+    pub fn collated(self, collation: &str) -> Self {
+        let Some(named) = NamedCollation::from_name(collation) else {
+            return self;
+        };
+        Self {
+            data_type: self.data_type,
+            nullable: self.nullable,
+            kind: BoundExprKind::Scalar {
+                function: ScalarFunction::Collate { collation: named },
+                args: vec![self],
+            },
+        }
+    }
+
+    /// The collation several operands compare under together - both keys of
+    /// a join, or an `IN` operand and its subquery's column - resolved as
+    /// one comparison would resolve them.
+    #[must_use]
+    pub fn shared_text_collation(expressions: &[&Self]) -> Option<&'static str> {
         // Coercibility 0: one explicit COLLATE dictates the whole
         // comparison, whatever the columns underneath carry.
         let mut explicit = Vec::new();
-        self.collect_explicit_collations(&mut explicit);
+        for expression in expressions {
+            expression.collect_explicit_collations(&mut explicit);
+        }
         explicit.sort_unstable();
         explicit.dedup();
         if let [only] = explicit.as_slice() {
             return comparison_collation(only);
         }
         let mut collations = Vec::new();
-        self.collect_source_collations(&mut collations);
+        for expression in expressions {
+            expression.collect_source_collations(&mut collations);
+        }
         if collations.is_empty() {
-            self.collect_encoded_collations(&mut collations);
+            for expression in expressions {
+                expression.collect_encoded_collations(&mut collations);
+            }
         }
         collations.sort_unstable();
         collations.dedup();
@@ -1921,9 +2026,14 @@ impl BoundExpr {
             // No column collation in play: JSON-derived text compares under
             // utf8mb4_bin, everything else under the session default - the
             // same ladder result_collation applies.
-            [] if self.reads_json_text() => Some(BIN_TEXT_COLLATION),
+            [] if expressions
+                .iter()
+                .any(|expression| expression.reads_json_text()) =>
+            {
+                Some(BIN_TEXT_COLLATION)
+            }
             [only] => comparison_collation(only),
-            _ => None,
+            _ => comparison_collation(&aggregate_column_collations(&collations)?),
         }
     }
 }
@@ -2049,7 +2159,10 @@ impl BoundQuery {
         match collations.as_slice() {
             [] => Some(DEFAULT_TEXT_COLLATION.to_owned()),
             [collation] => Some(collation.clone()),
-            _ => Some(format!("{MIXED_COLLATION_PREFIX}{}", collations.join(","))),
+            _ => Some(
+                aggregate_column_collations(&collations)
+                    .unwrap_or_else(|| format!("{MIXED_COLLATION_PREFIX}{}", collations.join(","))),
+            ),
         }
     }
 

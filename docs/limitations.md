@@ -142,9 +142,7 @@ stays readable as a list of things to fix.
   to `utf8mb4_unicode_ci` - which is exact
   over ASCII and an approximation outside it; other names reject. Because replicated text is stored transcoded to UTF-8, a supported
   `COLLATE` override is accepted even where MySQL would raise a
-  charset-mismatch error (e.g. over a latin1-sourced column). Cross-profile
-  coercibility is not implemented, so mixed source profiles without an
-  explicit override reject on every collation-sensitive operation (#10).
+  charset-mismatch error (e.g. over a latin1-sourced column).
 - The `information_schema` client-discovery interpreter rejects CTEs, set
   operations, window functions, derived tables, and metadata relations outside
   the ten served relations. `VIEWS`, `ROUTINES`, and `CHECK_CONSTRAINTS` are
@@ -155,9 +153,9 @@ stays readable as a list of things to fix.
   after the column was altered - has no index and stays plain text, so it
   orders lexically against the labelled values rather than being given an
   invented position.
-- Locale-specific collation profiles, full per-expression coercibility, and
-  collation-sensitive execution over mixed source profiles remain unsupported
-  (#10).
+- Locale-specific collation profiles remain unsupported, and so do the `NONE`
+  and `SYSCONST` coercibility rungs: an expression mixing collations carries
+  its resolved one rather than `NONE` (#10).
 - Date parsing is limited to canonical date and date-time forms. The plain
   `MICROSECOND` interval unit is not implemented; the compound
   `*_MICROSECOND` qualifiers are.
@@ -342,17 +340,13 @@ stays readable as a list of things to fix.
   through a derived table's or view's own keys, or through a `UNION` branch is
   not detected: the replica keeps one key per table, and a derived layout
   carries none outward. Such a query is refused where MySQL answers it.
-- A single comparison spanning two collations is refused. `WHERE a = b` where
-  the two columns are `utf8mb4_general_ci` and `utf8mb4_0900_ai_ci` has no
-  defined answer here: the collations disagree about trailing spaces and about
-  every character above the BMP, and MySQL chooses between them by coercibility
-  rules that do not exist here. A query using both collations in SEPARATE
-  comparisons is fine - each resolves its own.
-- Grouping keys must share one collation. `GROUP BY general_ci_col,
-  ai_ci_col` is refused, because grouping folds a whole key tuple into one
-  entry and there is nowhere to record that one column of the tuple compares by
-  different rules than the next. Ordering has no such limit: each `ORDER BY`
-  key sorts under its own collation.
+- An argument list mixing column collations is resolved only where the answer
+  cannot depend on argument order. MySQL folds `IN`, `COALESCE` and similar
+  lists pairwise left to right, so `general_ci_col IN (bin_col, ai_ci_col)`
+  resolves to `utf8mb4_bin` there while the same list in another order is an
+  illegal mix. Pintail refuses any mixture that keeps more than one
+  non-binary collation after the charset step, including the orders MySQL
+  answers.
 - `ALTER TABLE ... CONVERT TO CHARACTER SET` is treated as metadata-only.
   Stored values are decoded characters rather than source bytes, so a
   conversion that preserves them changes only the collation. A conversion

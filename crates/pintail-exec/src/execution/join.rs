@@ -3677,7 +3677,7 @@ impl LoopKeys {
             let Some(mode) = super::hash_join_key_mode(
                 left_key.data_type,
                 right_key.data_type,
-                super::key_collation_of(left_key, collation),
+                super::pair_key_collation(left_key, right_key, collation),
             ) else {
                 return Ok(None);
             };

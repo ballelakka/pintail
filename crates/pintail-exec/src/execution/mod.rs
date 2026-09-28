@@ -1261,6 +1261,37 @@ fn key_collation_of(key: &BoundExpr, fallback: Collation) -> Collation {
         .unwrap_or(fallback)
 }
 
+/// The collation one join key pair compares under: both sides together, as
+/// the equality between them resolves - a `general_ci` column meeting a
+/// `utf8mb4_bin` one compares binary on either side of the join.
+fn pair_key_collation(left: &BoundExpr, right: &BoundExpr, fallback: Collation) -> Collation {
+    if left.data_type == Some(DataType::Json) {
+        return Collation::Json;
+    }
+    BoundExpr::shared_text_collation(&[left, right])
+        .and_then(Collation::from_mysql_name)
+        .unwrap_or(fallback)
+}
+
+/// The outer operand of an `IN (subquery)` rewritten to a literal list.
+///
+/// The members arrive as literals, which carry no collation, so the list
+/// would resolve from the outer operand alone. Where the operand and the
+/// subquery's column resolve to a different collation together, the operand
+/// is pinned to it, keeping the comparison the subquery form asked for.
+fn in_list_operand(expr: &BoundExpr, query: &BoundQuery) -> BoundExpr {
+    let shared = query
+        .projection
+        .first()
+        .and_then(|projection| BoundExpr::shared_text_collation(&[expr, &projection.expr]));
+    match shared {
+        Some(collation) if Some(collation) != expr.text_collation() => {
+            expr.clone().collated(collation)
+        }
+        _ => expr.clone(),
+    }
+}
+
 fn hash_join_key_mode(
     left: Option<DataType>,
     right: Option<DataType>,
@@ -2913,8 +2944,13 @@ fn resolve_expr_subqueries(
                 .projection
                 .first()
                 .and_then(|projection| projection.expr.data_type);
-            let member_collation = expr
-                .text_collation()
+            let member_collation = query
+                .projection
+                .first()
+                .map_or_else(
+                    || expr.text_collation(),
+                    |projection| BoundExpr::shared_text_collation(&[&**expr, &projection.expr]),
+                )
                 .and_then(Collation::from_mysql_name)
                 .unwrap_or(collation);
             // Answered once for the whole query, so a large set is worth
@@ -2960,7 +2996,7 @@ fn resolve_expr_subqueries(
             };
             reserve_subquery_values(&values, memory_limit, retained_bytes)?;
             let mut args = Vec::with_capacity(values.len() + 1);
-            args.push((**expr).clone());
+            args.push(in_list_operand(expr, query));
             args.extend(values.into_iter().map(|value| BoundExpr {
                 data_type: projection_type.or_else(|| value.data_type()),
                 nullable: matches!(value, Value::Null),
@@ -3406,7 +3442,15 @@ pub(super) fn resolve_dependent_expr_subqueries(
                     context.provider,
                     dependent_subquery_memory_limit(context.memory, context.batch)?,
                     context.memory.deadline,
-                    expr.text_collation()
+                    query
+                        .projection
+                        .first()
+                        .map_or_else(
+                            || expr.text_collation(),
+                            |projection| {
+                                BoundExpr::shared_text_collation(&[&**expr, &projection.expr])
+                            },
+                        )
                         .and_then(Collation::from_mysql_name)
                         .unwrap_or(context.collation),
                     context.memory.spill(),
@@ -3437,7 +3481,7 @@ pub(super) fn resolve_dependent_expr_subqueries(
                 }
             };
             let mut args = Vec::with_capacity(values.len().saturating_add(1));
-            args.push((**expr).clone());
+            args.push(in_list_operand(expr, query));
             args.extend(values.into_iter().map(|value| BoundExpr {
                 data_type: projection_type.or_else(|| value.data_type()),
                 nullable: matches!(value, Value::Null),
@@ -4861,10 +4905,10 @@ fn build_operator_inner(
             let (right, right_columns) = build_operator(*right, provider, memory, collation)?;
             // Each join key decides its own collation from the columns it
             // compares, so a plan may join general_ci here and 0900_ai_ci in
-            // the next operator. Both sides of ONE key must agree - that is
-            // the undecidable case, and the binder has already refused it -
-            // so taking the left side's is safe.
-            let key_collation = key_collation_of(&left_key, collation);
+            // the next operator. The two sides of ONE key may
+            // carry different collations; they resolve together, as the
+            // comparison itself would.
+            let key_collation = pair_key_collation(&left_key, &right_key, collation);
             let null_safe_at = |key: usize| null_safe.get(key).copied().unwrap_or(false);
             let key_mode =
                 hash_join_key_mode(left_key.data_type, right_key.data_type, key_collation)
@@ -4882,7 +4926,7 @@ fn build_operator_inner(
                     let mode = hash_join_key_mode(
                         extra_left.data_type,
                         extra_right.data_type,
-                        key_collation_of(&extra_left, collation),
+                        pair_key_collation(&extra_left, &extra_right, collation),
                     )
                     .map(|mode| JoinKeyMode {
                         null_safe: null_safe_at(index + 1),
