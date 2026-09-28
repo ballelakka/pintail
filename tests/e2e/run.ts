@@ -1886,12 +1886,13 @@ async function phaseActivityHistory() {
         "VALUES (?1, ?2, NULL, 'cdc', 'completed', 0, 0, 3, NULL, ?3)",
     )
     const seed = meta.transaction((count: number) => {
-      // Spread across a day so the newest-first order is not insertion order.
+      // Spread across the last day so the newest-first order is not
+      // insertion order. Within a day, because startup prunes successful
+      // cycles older than that - history dated further back is deleted
+      // before the feed is read.
+      const base = Date.now() - 23 * 3_600_000
       for (let index = 0; index < count; index += 1) {
-        const second = index % 86_400
-        const stamp = `2026-08-01T${String(Math.floor(second / 3600)).padStart(2, '0')}:${String(
-          Math.floor(second / 60) % 60,
-        ).padStart(2, '0')}:${String(second % 60).padStart(2, '0')}.${String(index % 1000).padStart(3, '0')}Z`
+        const stamp = new Date(base + (index % 82_800) * 1000 + (index % 1000)).toISOString()
         insert.run(`hist_${index}`, databaseId, stamp)
       }
     })
