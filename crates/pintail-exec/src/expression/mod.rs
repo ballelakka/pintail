@@ -2068,9 +2068,9 @@ fn evaluate_direct_date_part(value: &Value, part: DatePart) -> Option<Result<Val
     let year = i32::try_from(year).ok()?;
     let month = u32::try_from(month).ok()?;
     let day = u32::try_from(day).ok()?;
-    if NaiveDate::from_ymd_opt(year, month, day).is_none() {
-        return Some(Err(ExecError::InvalidDateTime));
-    }
+    // A date the calendar rejects takes the general path, which answers
+    // NULL with MySQL's warning (or rolls a stored one forward).
+    NaiveDate::from_ymd_opt(year, month, day)?;
     let date_value = match part {
         DatePart::Quarter
         | DatePart::DayOfWeek
@@ -2094,7 +2094,7 @@ fn evaluate_direct_date_part(value: &Value, part: DatePart) -> Option<Result<Val
             let minute = ascii_decimal(bytes.get(14..16)?)?;
             let second = ascii_decimal(bytes.get(17..19)?)?;
             if hour > 23 || minute > 59 || second > 59 {
-                return Some(Err(ExecError::InvalidDateTime));
+                return None;
             }
             match part {
                 DatePart::Hour => hour,
@@ -2314,8 +2314,51 @@ fn evaluate_eager_scalar_typed(
         data_type,
         collation,
     ) {
-        Err(ExecError::InvalidDateTime) => Ok(Value::Null),
+        Err(ExecError::InvalidDateTime) => {
+            note_invalid_datetime(function, values);
+            Ok(Value::Null)
+        }
         other => other,
+    }
+}
+
+/// The NULL `STR_TO_DATE` answers for input its format does not read, with
+/// `MySQL`'s warning 1411.
+fn unmatched_str_to_date(text: &str) -> Value {
+    crate::execution::record_statement_warning(crate::ConversionWarning {
+        code: 1411,
+        sql_state: b"HY000",
+        message: format!("Incorrect datetime value: '{text}' for function str_to_date"),
+    });
+    Value::Null
+}
+
+/// The NULL a cast of unreadable text to a date answers, with its warning.
+fn unreadable_datetime(text: &str) -> Value {
+    crate::execution::record_conversion_warning(format!("Incorrect datetime value: '{text}'"));
+    Value::Null
+}
+
+/// Records the warning `MySQL` gives beside the NULL an unreadable date
+/// answers with: 1292 naming the first argument that is not a date, or
+/// 1411 for `STR_TO_DATE` input its format does not match. A failure with no
+/// such argument - a result past year 9999 - records nothing here.
+fn note_invalid_datetime(function: ScalarFunction, values: &[Value]) {
+    if matches!(function, ScalarFunction::StrToDate) {
+        if let Some(text) = values.first().and_then(Value::text) {
+            unmatched_str_to_date(text);
+        }
+        return;
+    }
+    let unreadable = values.iter().find_map(|value| {
+        let text = match value {
+            Value::Utf8(text) => text.as_str(),
+            _ => return None,
+        };
+        temporal::parse_calendar_cast(text).is_err().then_some(text)
+    });
+    if let Some(text) = unreadable {
+        crate::execution::record_conversion_warning(format!("Incorrect datetime value: '{text}'"));
     }
 }
 
@@ -3992,7 +4035,7 @@ fn evaluate_eager_scalar_inner(
             let format = scalar_string(&values[1])?;
             let policy = values.get(2).map(mysql_u64).transpose()?.unwrap_or(0);
             Ok(str_to_date::parse(&text, &format, data_type, policy)
-                .map_or(Value::Null, Value::Utf8))
+                .map_or_else(|| unmatched_str_to_date(&text), Value::Utf8))
         }
         ScalarFunction::ConvertTz => {
             let text = scalar_string(&values[0])?;
@@ -5135,22 +5178,20 @@ fn cast_scalar(value: &Value, data_type: Option<DataType>) -> Result<Value, Exec
             if let Some((date, _)) = canonical_temporal(&text) {
                 return Ok(Value::Utf8(date.to_owned()));
             }
-            return Ok(
-                temporal::parse_calendar_cast(&text).map_or(Value::Null, |parsed| {
-                    Value::Utf8(parsed.date().format("%Y-%m-%d").to_string())
-                }),
-            );
+            return Ok(temporal::parse_calendar_cast(&text).map_or_else(
+                |_| unreadable_datetime(&text),
+                |parsed| Value::Utf8(parsed.date().format("%Y-%m-%d").to_string()),
+            ));
         }
         Some(DataType::DateTime64 { fsp }) => {
             let text = scalar_string(value)?;
             if let Some(widened) = canonical_datetime_at(&text, fsp) {
                 return Ok(Value::Utf8(widened));
             }
-            return Ok(
-                temporal::parse_calendar_cast(&text).map_or(Value::Null, |parsed| {
-                    Value::Utf8(format_with_fraction(parsed, fsp, "%Y-%m-%d %H:%M:%S"))
-                }),
-            );
+            return Ok(temporal::parse_calendar_cast(&text).map_or_else(
+                |_| unreadable_datetime(&text),
+                |parsed| Value::Utf8(format_with_fraction(parsed, fsp, "%Y-%m-%d %H:%M:%S")),
+            ));
         }
         Some(DataType::Time64 { fsp }) => {
             return Ok(
@@ -5933,7 +5974,12 @@ fn cast_decimal(value: &Value, precision: u8, scale: u8) -> Result<Value, ExecEr
             .or_else(|| pintail_types::parse_decimal_wide_rounded(text, scale))
     };
     let units = match value {
-        Value::Utf8(value) | Value::Enum { label: value, .. } => text(value),
+        // Text reads its numeric prefix, as MySQL's does, with a warning
+        // for what it drops: CAST('3.5z' AS DECIMAL(5,2)) is 3.50.
+        Value::Utf8(value) | Value::Enum { label: value, .. } => text(value).or_else(|| {
+            note_numeric_truncation("DECIMAL", value);
+            numeric_prefix(value).map_or(Some(WideInt::from_i128(0)), text)
+        }),
         Value::DecimalAverage(average) => text(&average.label),
         Value::Boolean(flag) => wide_rescale(WideInt::from_i128(i128::from(*flag)), 0, scale),
         Value::Int64(signed) => wide_rescale(WideInt::from_i128(i128::from(*signed)), 0, scale),
@@ -8376,7 +8422,9 @@ pub(crate) fn mysql_truth(value: &Value) -> Result<Option<bool>, ExecError> {
         Value::Int64(value) => Ok(Some(*value != 0)),
         Value::UInt64(value) => Ok(Some(*value != 0)),
         Value::Float64(value) => Ok(Some(value.get() != 0.0)),
-        Value::Utf8(value) | Value::Enum { label: value, .. } => {
+        Value::Enum { label: value, .. } => Ok(Some(parse_mysql_number(value) != 0.0)),
+        Value::Utf8(value) => {
+            note_numeric_truncation("DOUBLE", value);
             Ok(Some(parse_mysql_number(value) != 0.0))
         }
         Value::DecimalAverage(average) => {
@@ -8417,7 +8465,10 @@ pub(crate) fn mysql_f64(value: &Value) -> Result<f64, ExecError> {
         // member mask, as in MySQL: status = 3 and status + 0 read it.
         #[allow(clippy::cast_precision_loss)] // an ENUM index or SET mask is far below 2^52
         Value::Enum { index, .. } => Ok(*index as f64),
-        Value::Utf8(value) => Ok(parse_mysql_number(value)),
+        Value::Utf8(value) => {
+            note_numeric_truncation("DOUBLE", value);
+            Ok(parse_mysql_number(value))
+        }
         Value::DecimalAverage(average) => {
             // Approximate arithmetic reads retained decimal guard digits;
             // only string consumers use the narrower display label.
@@ -8425,6 +8476,7 @@ pub(crate) fn mysql_f64(value: &Value) -> Result<f64, ExecError> {
         }
         Value::Binary(value) => {
             let value = numeric_bytes_text(value);
+            note_numeric_truncation("DOUBLE", value);
             Ok(parse_mysql_number(value))
         }
         Value::Null => Err(ExecError::InvalidExpressionType),
@@ -8473,10 +8525,13 @@ pub(crate) fn mysql_i64(value: &Value) -> Result<i64, ExecError> {
         Value::UInt64(value) => i64::try_from(*value).map_err(|_| ExecError::NumericOverflow),
         Value::Float64(value) => float_to_i64(value.get()),
         Value::Enum { index, .. } => Ok(i64::try_from(*index).unwrap_or(i64::MAX)),
-        Value::Utf8(value) => exact_integer_prefix(value).map_or_else(
-            || float_to_i64(parse_mysql_number(value)),
-            |number| i64::try_from(number).map_err(|_| ExecError::NumericOverflow),
-        ),
+        Value::Utf8(value) => {
+            note_numeric_truncation("INTEGER", value);
+            exact_integer_prefix(value).map_or_else(
+                || float_to_i64(parse_mysql_number(value)),
+                |number| i64::try_from(number).map_err(|_| ExecError::NumericOverflow),
+            )
+        }
         Value::DecimalAverage(average) => {
             let value = &average.label;
             float_to_i64(parse_mysql_number(value))
@@ -8489,6 +8544,7 @@ pub(crate) fn mysql_i64(value: &Value) -> Result<i64, ExecError> {
         // literal is binary, so this was ordinary arithmetic, not a corner.
         Value::Binary(value) => {
             let value = numeric_bytes_text(value);
+            note_numeric_truncation("INTEGER", value);
             exact_integer_prefix(value).map_or_else(
                 || float_to_i64(parse_mysql_number(value)),
                 |number| i64::try_from(number).map_err(|_| ExecError::NumericOverflow),
@@ -8505,9 +8561,12 @@ pub(crate) fn mysql_u64(value: &Value) -> Result<u64, ExecError> {
         Value::UInt64(value) => Ok(*value),
         Value::Float64(value) => float_to_u64(value.get()),
         Value::Enum { index, .. } => Ok(*index),
-        Value::Utf8(value) => exact_integer_prefix(value)
-            .and_then(|number| u64::try_from(number).ok())
-            .map_or_else(|| float_to_u64(parse_mysql_number(value)), Ok),
+        Value::Utf8(value) => {
+            note_numeric_truncation("INTEGER", value);
+            exact_integer_prefix(value)
+                .and_then(|number| u64::try_from(number).ok())
+                .map_or_else(|| float_to_u64(parse_mysql_number(value)), Ok)
+        }
         Value::DecimalAverage(average) => {
             let value = &average.label;
             float_to_u64(parse_mysql_number(value))
@@ -8515,6 +8574,7 @@ pub(crate) fn mysql_u64(value: &Value) -> Result<u64, ExecError> {
         // As above: bytes read exactly before they read approximately.
         Value::Binary(value) => {
             let value = numeric_bytes_text(value);
+            note_numeric_truncation("INTEGER", value);
             exact_integer_prefix(value)
                 .and_then(|number| u64::try_from(number).ok())
                 .map_or_else(|| float_to_u64(parse_mysql_number(value)), Ok)
@@ -8568,7 +8628,10 @@ fn float_to_u64(value: f64) -> Result<u64, ExecError> {
         .map_err(|_| ExecError::NumericOverflow)
 }
 
-fn parse_mysql_number(value: &str) -> f64 {
+/// The number `value` spells from its start, as `MySQL` reads text in a
+/// numeric context: leading whitespace skipped, then the longest prefix that
+/// continues a number. `None` when no digit begins it.
+fn numeric_prefix(value: &str) -> Option<&str> {
     let value = value.trim_start();
     let mut end = 0;
     let mut seen_digit = false;
@@ -8602,12 +8665,29 @@ fn parse_mysql_number(value: &str) -> f64 {
     }
 
     if !seen_digit {
-        return 0.0;
+        return None;
     }
     if exponent_needs_digit && let Some(exponent) = value[..end].rfind(['e', 'E']) {
         end = exponent;
     }
-    value[..end].parse().unwrap_or(0.0)
+    Some(&value[..end])
+}
+
+fn parse_mysql_number(value: &str) -> f64 {
+    numeric_prefix(value).map_or(0.0, |prefix| prefix.parse().unwrap_or(0.0))
+}
+
+/// Records `MySQL`'s warning 1292 when reading `text` as a `kind` number
+/// ("DOUBLE", "INTEGER", "DECIMAL") stops before its end. Trailing
+/// whitespace, and text that is only whitespace, read whole.
+fn note_numeric_truncation(kind: &str, text: &str) {
+    let read = numeric_prefix(text).map_or(0, str::len);
+    let rest = text.trim_start();
+    if !rest[read..].trim_end().is_empty() {
+        crate::execution::record_conversion_warning(format!(
+            "Truncated incorrect {kind} value: '{text}'"
+        ));
+    }
 }
 
 /// `MySQL`'s out-of-range message for an arithmetic node, computed while

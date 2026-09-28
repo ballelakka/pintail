@@ -4,6 +4,12 @@
 //! A `Q:` line is a query; the `R:` lines after it are its rows,
 //! tab-separated, as the command-line client prints them. Every mismatch is
 //! reported at once, so one run shows the whole distance to `MySQL`.
+//!
+//! A fixture that carries `W:` lines - `SHOW WARNINGS` rows, deduplicated
+//! and sorted - has every query's warnings checked too, a query with none
+//! expecting none. They are compared as a set: how often `MySQL` repeats a
+//! warning follows how often it re-evaluates an expression (an `ORDER BY`
+//! doubles some), which is not a contract.
 
 use pintail_catalog::{
     CatalogSnapshot, DatabaseEntry, DatabaseId, TableEntry, TableId, TableStatistics,
@@ -95,20 +101,40 @@ pub fn assert_pairs(
     let provider =
         SnapshotScanProvider::new([(database_id, table_id, &snapshot)]).expect("provider");
 
+    let check_warnings = pairs.lines().any(|line| line.starts_with("W: "));
     let mut failures = Vec::new();
     let mut cases = 0;
     for block in pairs.split("Q: ").filter(|block| !block.trim().is_empty()) {
         let mut lines = block.lines();
         let sql = lines.next().expect("query line").trim_end_matches(';');
+        let lines: Vec<&str> = lines.collect();
         let expected = lines
+            .iter()
             .filter_map(|line| line.strip_prefix("R: "))
             .collect::<Vec<_>>()
             .join("\n");
+        let _ = pintail_exec::take_session_conversion_warnings();
         let actual = run(sql, &catalog, &provider);
+        let mut warnings: Vec<String> = pintail_exec::take_session_conversion_warnings()
+            .0
+            .into_iter()
+            .map(|warning| format!("Warning\t{}\t{}", warning.code, warning.message))
+            .collect();
+        warnings.sort();
+        warnings.dedup();
         cases += 1;
         if actual != expected {
             failures.push(format!(
                 "{sql}\n  pintail: {actual:?}\n  mysql:   {expected:?}"
+            ));
+        }
+        let expected_warnings: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("W: "))
+            .collect();
+        if check_warnings && warnings != expected_warnings {
+            failures.push(format!(
+                "{sql}\n  pintail warnings: {warnings:?}\n  mysql warnings:   {expected_warnings:?}"
             ));
         }
     }

@@ -69,6 +69,7 @@ mod settled_memo_identity;
 mod settled_memo_scale;
 mod sort_determinism;
 mod spatial_parity;
+mod statement_warnings;
 mod subquery_scaling;
 mod temporal_predicate_rewrite;
 mod text_grouping_scale;

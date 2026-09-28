@@ -1,0 +1,83 @@
+Q: SELECT id, s + 1 FROM wn ORDER BY id;
+R: 1	13
+R: 2	8
+R: 3	1
+R: 4	NULL
+W: Warning	1292	Truncated incorrect DOUBLE value: '12abc'
+W: Warning	1292	Truncated incorrect DOUBLE value: 'x'
+Q: SELECT id FROM wn WHERE s > 5 ORDER BY id;
+R: 1
+R: 2
+W: Warning	1292	Truncated incorrect DOUBLE value: '12abc'
+W: Warning	1292	Truncated incorrect DOUBLE value: 'x'
+Q: SELECT id, s FROM wn WHERE s = 0 ORDER BY id;
+R: 3	x
+W: Warning	1292	Truncated incorrect DOUBLE value: '12abc'
+W: Warning	1292	Truncated incorrect DOUBLE value: 'x'
+Q: SELECT id, 'abc' + 1 FROM wn ORDER BY id;
+R: 1	1
+R: 2	1
+R: 3	1
+R: 4	1
+W: Warning	1292	Truncated incorrect DOUBLE value: 'abc'
+Q: SELECT '12abc' + 1, ' 12' + 1, '1e3x' * 2, 1 + '', '3 ' + 1;
+R: 13	13	2000	1	4
+W: Warning	1292	Truncated incorrect DOUBLE value: '12abc'
+W: Warning	1292	Truncated incorrect DOUBLE value: '1e3x'
+Q: SELECT id, CAST(s AS SIGNED), CAST(s AS UNSIGNED) FROM wn ORDER BY id;
+R: 1	12	12
+R: 2	7	7
+R: 3	0	0
+R: 4	NULL	NULL
+W: Warning	1292	Truncated incorrect INTEGER value: '12abc'
+W: Warning	1292	Truncated incorrect INTEGER value: 'x'
+Q: SELECT CAST('3.5z' AS DECIMAL(5,2)), CONVERT('abc', SIGNED);
+R: 3.50	0
+W: Warning	1292	Truncated incorrect DECIMAL value: '3.5z'
+W: Warning	1292	Truncated incorrect INTEGER value: 'abc'
+Q: SELECT SUM(s), MAX(s + 0) FROM wn;
+R: 19	12
+W: Warning	1292	Truncated incorrect DOUBLE value: '12abc'
+W: Warning	1292	Truncated incorrect DOUBLE value: 'x'
+Q: SELECT ABS('2y'), ROUND('3.7q'), FLOOR('9x');
+R: 2	4	9
+W: Warning	1292	Truncated incorrect DOUBLE value: '2y'
+W: Warning	1292	Truncated incorrect DOUBLE value: '3.7q'
+W: Warning	1292	Truncated incorrect DOUBLE value: '9x'
+Q: SELECT id, DATE(d), DAYOFMONTH(d) FROM wn ORDER BY id;
+R: 1	NULL	NULL
+R: 2	2024-01-05	5
+R: 3	NULL	NULL
+R: 4	NULL	NULL
+W: Warning	1292	Incorrect datetime value: '2024-13-01'
+W: Warning	1292	Incorrect datetime value: 'bad'
+Q: SELECT COUNT(*) FROM wn WHERE DATE(d) > '2024-01-01';
+R: 1
+W: Warning	1292	Incorrect datetime value: '2024-13-01'
+W: Warning	1292	Incorrect datetime value: 'bad'
+Q: SELECT DATE_ADD('2024-13-01', INTERVAL 1 DAY), TO_DAYS('bad'), DAYNAME('x'), YEAR('2024-02-30');
+R: NULL	NULL	NULL	NULL
+W: Warning	1292	Incorrect datetime value: '2024-02-30'
+W: Warning	1292	Incorrect datetime value: '2024-13-01'
+W: Warning	1292	Incorrect datetime value: 'bad'
+W: Warning	1292	Incorrect datetime value: 'x'
+Q: SELECT CAST('2024-13-01' AS DATE), CAST('abc' AS DATETIME), TIMESTAMP('x');
+R: NULL	NULL	NULL
+W: Warning	1292	Incorrect datetime value: '2024-13-01'
+W: Warning	1292	Incorrect datetime value: 'abc'
+W: Warning	1292	Incorrect datetime value: 'x'
+Q: SELECT STR_TO_DATE('31/02/2024', '%d/%m/%Y'), STR_TO_DATE('abc', '%Y');
+R: NULL	NULL
+W: Warning	1411	Incorrect datetime value: '31/02/2024' for function str_to_date
+W: Warning	1411	Incorrect datetime value: 'abc' for function str_to_date
+Q: SELECT id, STR_TO_DATE(d, '%Y-%m-%d') FROM wn ORDER BY id;
+R: 1	NULL
+R: 2	2024-01-05
+R: 3	NULL
+R: 4	NULL
+W: Warning	1411	Incorrect datetime value: '2024-13-01' for function str_to_date
+W: Warning	1411	Incorrect datetime value: 'bad' for function str_to_date
+Q: SELECT id, s + 1 FROM wn WHERE id = 2;
+R: 2	8
+Q: SELECT DATE('2024-01-05'), '7' + 1, CAST('12' AS SIGNED);
+R: 2024-01-05	8	12

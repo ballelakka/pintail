@@ -80,8 +80,14 @@ stays readable as a list of things to fix.
   parenthesized join is not a derived table and cannot take an alias). A
   nested group can be a later join's right input; a RIGHT JOIN *inside* a
   parenthesized group still rejects.
-- MySQL warning categories other than `GROUP_CONCAT` truncation are not yet
-  retained in a general diagnostics area.
+- The diagnostics area records `GROUP_CONCAT` truncation (1260), division by
+  zero (1365), text read as a number past its numeric prefix (1292
+  "Truncated incorrect ..."), unreadable dates (1292 "Incorrect datetime
+  value") and `STR_TO_DATE` mismatches (1411). Other warning classes - a date
+  result past year 9999 (1441), JSON and regex notes, optimizer notes - are
+  not recorded. Where a statement repeats a warning, the count follows how
+  often Pintail evaluates the expression, which can differ from `MySQL`'s
+  (an `ORDER BY` over a computed column makes `MySQL` warn twice per row).
 - `JSON_TYPE` matches MySQL for JSON parsed from text — `DOUBLE`, `INTEGER`,
   `STRING`, `BOOLEAN`, `NULL`, `ARRAY`, `OBJECT` all agree, measured. It
   diverges only for a value carrying a SQL type into the document, where MySQL
