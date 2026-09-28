@@ -1519,6 +1519,8 @@ pub enum ScalarFunction {
     UnixTimestamp,
     /// Convert a Unix timestamp to local date/time.
     FromUnixTime,
+    /// A spatial function over `MySQL`'s internal geometry format.
+    Spatial(crate::SpatialFunction),
 }
 
 /// Calendar component extracted from a `MySQL` date/time value.

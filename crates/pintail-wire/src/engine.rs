@@ -218,6 +218,8 @@ pub enum SqlRejection {
     BinaryBitwiseAggregateWidth,
     /// 3854: a required character-set conversion is invalid.
     CharacterConversion,
+    /// A spatial function refused its arguments, by `MySQL`'s class.
+    Spatial(pintail_exec::SpatialError),
 }
 
 /// The metadata files a database's signature was last read against, and
@@ -1571,6 +1573,10 @@ fn query_execution_error(error: ExecError) -> QueryError {
         ExecError::InvalidJsonPath { .. } => QueryError::Rejected {
             rejection: SqlRejection::InvalidJsonPath,
             message: error.to_string(),
+        },
+        ExecError::Spatial { kind, message } => QueryError::Rejected {
+            rejection: SqlRejection::Spatial(kind),
+            message,
         },
         error => QueryError::Internal(error.to_string()),
     }

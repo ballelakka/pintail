@@ -731,6 +731,12 @@ pub(super) fn bind_scalar_function(
         "FROM_UNIXTIME" if args.len() == 1 => ScalarFunction::FromUnixTime,
         // The quantity of a compound interval written as an expression; the
         // parser wraps it (see `interval`).
+        name if crate::SpatialFunction::from_name(name, args.len()).is_some() => {
+            ScalarFunction::Spatial(
+                crate::SpatialFunction::from_name(name, args.len())
+                    .ok_or_else(|| BindError::UnsupportedExpression(function.to_string()))?,
+            )
+        }
         name if args.len() == 1 && crate::CompoundUnit::from_function_name(name).is_some() => {
             ScalarFunction::IntervalQuantity(
                 crate::CompoundUnit::from_function_name(name)
@@ -1872,6 +1878,9 @@ pub(super) fn bind_scalar(
     // operand that merely has a binary type.
     let (data_type, nullable) = match function {
         ScalarFunction::EncodedOrd(_) => (Some(DataType::UInt64), args[0].nullable),
+        // A spatial answer is NULL for a NULL argument, and otherwise only
+        // where the function says so (an index past the end, say).
+        ScalarFunction::Spatial(spatial) => (Some(spatial.result_type()), true),
 
         // A session-zone reading keeps its column's type and nullability.
         ScalarFunction::SessionTimestamp | ScalarFunction::NormalizeTimestampOffset => (

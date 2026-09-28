@@ -10,6 +10,8 @@ pub use text_charset::{
 };
 mod interval;
 pub use interval::CompoundUnit;
+mod spatial;
+pub use spatial::{GeometryKind, SpatialFunction};
 mod metadata;
 mod mode;
 pub use mode::{DEFAULT_SQL_MODE, ParseMode, session_parse_mode, with_parse_mode};

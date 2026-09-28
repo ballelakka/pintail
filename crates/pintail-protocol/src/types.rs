@@ -304,6 +304,20 @@ pub enum ErrorKind {
     ErInvalidBitwiseAggregateOperandsSize = 3514,
     /// 3854: a required character-set conversion is invalid.
     ErCannotConvertString = 3854,
+    /// 1235: the statement asks for something not supported.
+    ErNotSupportedYet = 1235,
+    /// 3033: a binary geometry function got two different SRIDs.
+    ErGisDifferentSrids = 3033,
+    /// 3037: a geometry argument is not valid GIS data.
+    ErGisInvalidData = 3037,
+    /// 3516: a geometry argument has an unexpected type.
+    ErUnexpectedGeometryType = 3516,
+    /// 3616: a longitude is out of range.
+    ErLongitudeOutOfRange = 3616,
+    /// 3617: a latitude is out of range.
+    ErLatitudeOutOfRange = 3617,
+    /// 3726: a function is only defined for geographic SRSs.
+    ErOnlyDefinedForGeographic = 3726,
 }
 
 impl ErrorKind {
@@ -326,7 +340,12 @@ impl ErrorKind {
             | Self::ErWrongFieldWithGroup
             | Self::ErMaxPreparedStmtCountReached
             | Self::ErInvalidJsonPath
+            | Self::ErNotSupportedYet
             | Self::ErTooManyRows => b"42000",
+            Self::ErGisInvalidData => b"22023",
+            Self::ErUnexpectedGeometryType => b"22S01",
+            Self::ErLongitudeOutOfRange | Self::ErLatitudeOutOfRange => b"22S03",
+            Self::ErOnlyDefinedForGeographic => b"22S00",
             Self::ErNoSuchTable => b"42S02",
             Self::ErTableExistsError => b"42S01",
             Self::ErBadFieldError => b"42S22",
@@ -344,6 +363,7 @@ impl ErrorKind {
             | Self::ErInvalidGroupFuncUse
             | Self::ErInvalidBitwiseOperandsSize
             | Self::ErInvalidBitwiseAggregateOperandsSize
+            | Self::ErGisDifferentSrids
             | Self::ErCannotConvertString => b"HY000",
         }
     }

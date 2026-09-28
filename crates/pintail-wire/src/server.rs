@@ -44,7 +44,7 @@ use crate::{
     DEFAULT_QUERY_MEMORY_LIMIT, QueryError, QueryField, QueryOutput, QueryStats, ReplicaEngine,
     SqlRejection,
 };
-use pintail_exec::Cell;
+use pintail_exec::{Cell, SpatialError};
 
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -3949,6 +3949,15 @@ fn error_kind(error: &QueryError) -> ErrorKind {
             SqlRejection::BinaryBitwiseAggregateWidth => {
                 ErrorKind::ErInvalidBitwiseAggregateOperandsSize
             }
+            SqlRejection::Spatial(kind) => match kind {
+                SpatialError::DifferentSrids => ErrorKind::ErGisDifferentSrids,
+                SpatialError::InvalidData => ErrorKind::ErGisInvalidData,
+                SpatialError::UnexpectedType => ErrorKind::ErUnexpectedGeometryType,
+                SpatialError::LatitudeRange => ErrorKind::ErLatitudeOutOfRange,
+                SpatialError::LongitudeRange => ErrorKind::ErLongitudeOutOfRange,
+                SpatialError::NotGeographic => ErrorKind::ErOnlyDefinedForGeographic,
+                SpatialError::Unsupported => ErrorKind::ErNotSupportedYet,
+            },
         },
         QueryError::Interrupted => ErrorKind::ErQueryInterrupted,
         QueryError::Overloaded => ErrorKind::ErConCountError,

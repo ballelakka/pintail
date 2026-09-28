@@ -1025,14 +1025,19 @@ export const differentialQueries: DifferentialQuery[] = [
     tables: ['shipments'],
   },
   {
-    // Spatial functions do not exist in the mirror (docs/limitations.md:
-    // WKB is retained but there is no spatial logical type or function).
-    // The refusal stays visible as a WARN rather than written out.
-    name: 'geometry: spatial functions are a documented gap',
-    sql: 'SELECT id, ST_AsText(route) AS wkt FROM shipments ORDER BY id',
+    name: 'geometry: spatial functions read replicated geometry',
+    sql:
+      'SELECT id, ST_AsText(route) AS wkt, ST_GeometryType(route) AS kind, ' +
+      'ST_SRID(route) AS srid, ST_Length(route) AS length FROM shipments ORDER BY id',
     tables: ['shipments'],
-    documentedGap:
-      'spatial query functions are not implemented; geometry is carried as bytes only',
+  },
+  {
+    name: 'geometry: spatial predicates filter replicated rows',
+    sql:
+      'SELECT id FROM shipments ' +
+      "WHERE ST_Intersects(route, ST_GeomFromText('POLYGON((0 0,3 0,3 3,0 3,0 0))')) " +
+      "OR ST_Distance(route, ST_GeomFromText('POINT(-112 50)')) < 1 ORDER BY id",
+    tables: ['shipments'],
   },
   {
     name: 'set: find_in_set filters by membership',

@@ -1,3 +1,4 @@
+mod spatial;
 mod sql_regex;
 mod str_to_date;
 mod temporal;
@@ -1583,6 +1584,8 @@ impl CompiledExpr {
                     ScalarFunction::JsonDepth
                     | ScalarFunction::JsonOverlaps
                     | ScalarFunction::JsonMemberOf | ScalarFunction::FloatString => 24,
+                    // Geometry text runs to about three characters per stored byte.
+                    ScalarFunction::Spatial(_) => first.saturating_mul(4).saturating_add(64),
                     ScalarFunction::FixedFloatString(_) => 342,
                     ScalarFunction::Lower | ScalarFunction::Upper => first.saturating_mul(12),
                     ScalarFunction::Soundex => first.saturating_add(4),
@@ -1932,6 +1935,8 @@ impl CompiledExpr {
                     | ScalarFunction::JsonDepth
                     | ScalarFunction::JsonOverlaps
                     | ScalarFunction::JsonMemberOf | ScalarFunction::FloatString | ScalarFunction::UuidShort => 24,
+                    // Geometry text runs to about three characters per stored byte.
+                    ScalarFunction::Spatial(_) => first.saturating_mul(4).saturating_add(64),
                     ScalarFunction::FixedFloatString(_) => 342,
                     ScalarFunction::Repeat
                     | ScalarFunction::Insert
@@ -2490,6 +2495,7 @@ fn evaluate_eager_scalar_inner(
         ScalarFunction::ExtractMicros { leading } => {
             temporal::extract_micros(&values[0], leading).map(Value::Int64)
         }
+        ScalarFunction::Spatial(function) => spatial::evaluate(function, values),
         ScalarFunction::Collate { .. } | ScalarFunction::PackedDateParts { .. } => {
             Ok(values[0].clone())
         }

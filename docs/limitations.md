@@ -285,9 +285,22 @@ stays readable as a list of things to fix.
   leaves their value out of UPDATE after-images, so there they are skipped
   with a probe warning; the wider images it does write decode by source
   ordinal around the gap.
-- Spatial columns are retained as binary WKB without MySQL's four-byte SRID
-  prefix, but there is no spatial logical type, index, or query function. They
-  export as bytes and cannot be used for spatial predicates.
+- Spatial columns are retained byte for byte in MySQL's internal format (the
+  four-byte SRID, then WKB) and have no spatial index: a spatial predicate
+  scans. The spatial functions compute on the Cartesian plane (SRID 0) only.
+  Over SRID 4326 only reading, writing, the accessors and
+  `ST_Distance_Sphere` answer; `ST_Distance`, `ST_Length`, `ST_Area`, the
+  relational predicates and `ST_Envelope`/`ST_Centroid` are refused (error
+  1235) rather than computed on the plane, since `MySQL` measures them on the
+  ellipsoid. Every other SRID is refused for every function.
+- `ST_Contains`/`ST_Within` are refused when the container is a line and the
+  contained geometry is a line or a polygon, or when the container mixes
+  points or lines with polygons. The set operations (`ST_Union`,
+  `ST_Intersection`, `ST_Buffer`, ...), `ST_Overlaps`, `ST_Touches`,
+  `ST_Crosses`, `ST_Equals`, `ST_IsValid`, `ST_Simplify` and the geohash and
+  `ST_Transform` functions do not exist.
+- A spatial function's result column reports as a binary string, not
+  `GEOMETRY`, in result-set metadata.
 - Progress row estimates use `information_schema.TABLES.TABLE_ROWS`, which is
   approximate for InnoDB.
 
@@ -589,7 +602,7 @@ stays readable as a list of things to fix.
 
 Pintail v1 is a single-node, read-only analytical replica. It does not provide
 clustered query execution, synchronous high availability, source writes,
-multi-tenant isolation, or spatial querying. Those
+multi-tenant isolation, or spatial indexing. Those
 boundaries are explicit rather than emulated with results that look plausible
 but may be wrong.
 

@@ -8,6 +8,26 @@ use crate::BatchError;
 
 use super::budget::MemoryScope;
 
+/// The spatial error classes, each its own `MySQL` error code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpatialError {
+    /// 3033: two geometries in different spatial reference systems.
+    DifferentSrids,
+    /// 3037: bytes or text that are not a valid geometry.
+    InvalidData,
+    /// 3516: a geometry of a type the function does not take.
+    UnexpectedType,
+    /// 3617: a latitude outside [-90, 90].
+    LatitudeRange,
+    /// 3616: a longitude outside (-180, 180].
+    LongitudeRange,
+    /// 3726: a geographic-only function over a Cartesian geometry.
+    NotGeographic,
+    /// 1235: a spatial reference system or combination Pintail does not
+    /// compute.
+    Unsupported,
+}
+
 /// Physical planning or execution failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecError {
@@ -45,6 +65,13 @@ pub enum ExecError {
     },
     /// A value left its type's range; `MySQL`'s message names the expression.
     OutOfRange(String),
+    /// A spatial function refused its arguments; `MySQL`'s message.
+    Spatial {
+        /// Which of `MySQL`'s spatial error classes this is.
+        kind: SpatialError,
+        /// The message, worded as `MySQL` words it.
+        message: String,
+    },
     /// Numeric evaluation exceeded the bound result type.
     NumericOverflow,
     /// Binary numeric coercion encountered invalid UTF-8.
@@ -151,7 +178,9 @@ impl fmt::Display for ExecError {
                 formatter,
                 "Invalid JSON path expression. The error is around character position {position}."
             ),
-            Self::OutOfRange(message) => formatter.write_str(message),
+            Self::OutOfRange(message) | Self::Spatial { message, .. } => {
+                formatter.write_str(message)
+            }
             Self::NumericOverflow => formatter.write_str("numeric expression overflow"),
             Self::CharacterConversion(charset) => write!(formatter, "Cannot convert string from binary to {}", charset.default_collation().split('_').next().unwrap_or("text")),
             Self::InvalidUtf8Number => {
