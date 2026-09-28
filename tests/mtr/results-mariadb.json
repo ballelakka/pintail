@@ -5,18 +5,18 @@
   "ref": "170b1d70737be6f134448f51713cdc1ae215b420",
   "mysqlVersion": "8.4.11",
   "provenance": {
-    "sourceCommit": "4df891994f4bf06eaf7345b63671a823d0fc87c1",
+    "sourceCommit": "67219d6fa185ada84b0dce2ea4c5bd9a0fa78c0f",
     "sourceDirty": false,
-    "binarySha256": "d41dc68fa19a5944fcd9665449cd394773228f6ea45acc86927e8eac7223dd1f"
+    "binarySha256": "34e2adc2f9cc2a726806174746d28f81c61f7fdd3ec27cb7a9736cb54e85c10c"
   },
-  "artifacts": "validate-out/mtr/runs/mujo4oj8-34773",
-  "measuredAt": "2026-09-27T10:30:31.029Z",
+  "artifacts": "validate-out/mtr/runs/mul0ius7-410038",
+  "measuredAt": "2026-09-28T09:10:02.717Z",
   "totals": {
-    "exact": 8148,
-    "compared": 8580,
+    "exact": 8604,
+    "compared": 9013,
     "queries": 24004,
     "replayed": 30174,
-    "notCompared": 21594
+    "notCompared": 21161
   },
   "results": [
     {
@@ -942,8 +942,8 @@
       "file": "cast",
       "statements": 366,
       "counts": {
-        "exact": 138,
-        "mismatch": 6,
+        "exact": 142,
+        "mismatch": 2,
         "name-mismatch": 0,
         "pintail-error": 15,
         "mysql-error": 9,
@@ -2148,10 +2148,10 @@
       "file": "cte_recursive",
       "statements": 488,
       "counts": {
-        "exact": 39,
+        "exact": 46,
         "mismatch": 4,
         "name-mismatch": 0,
-        "pintail-error": 22,
+        "pintail-error": 15,
         "mysql-error": 31,
         "tainted": 16,
         "setup": 182,
@@ -2164,11 +2164,9 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unknown table mtr_cte_recursive.ancestors": 3,
-        "Error: query engine failed: physical input is missing t1__2.id": 2,
+        "Error: unknown table mtr_cte_recursive.ancestors": 1,
         "PREPARED: Error: sql parser error: Unterminated string literal at Line: _, Column: _": 6,
         "PREPARED: Error: Unknown prepared statement handler (stmt1)": 3,
-        "Error: unknown table mtr_cte_recursive.ancestor_ids": 3,
         "PREPARED: Error: Unknown prepared statement handler (stmt)": 36,
         "INSERT: Error: column _ is AUTO_INCREMENT; a local table needs its value supplied": 2,
         "Error: sql parser error: Expected: ), found: int at Line: _, Column: _": 1,
@@ -2243,7 +2241,8 @@
       "errorClasses": {
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "Error: unsupported expression: strcmp(_, _)": 10,
         "DDL: Error: character set big5 is not supported on a local table": 3,
@@ -2262,10 +2261,10 @@
       "file": "ctype_binary",
       "statements": 878,
       "counts": {
-        "exact": 128,
+        "exact": 137,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 24,
+        "pintail-error": 15,
         "mysql-error": 17,
         "tainted": 36,
         "setup": 234,
@@ -2279,14 +2278,6 @@
       },
       "errorClasses": {
         "Error: unsupported expression: charset(concat(_ + _))": 1,
-        "Error: unsupported expression: acos(_._)": 1,
-        "Error: unsupported expression: asin(_._)": 1,
-        "Error: unsupported expression: atan(_._)": 1,
-        "Error: unsupported expression: cos(_._)": 1,
-        "Error: unsupported expression: sin(_._)": 1,
-        "Error: unsupported expression: tan(_._)": 1,
-        "Error: unsupported expression: degrees(_)": 1,
-        "Error: unsupported expression: radians(_)": 1,
         "Error: unsupported expression: bit_length(_)": 1,
         "Error: unsupported expression: coercibility(_)": 1,
         "Error: unsupported expression: uncompressed_length(_)": 1,
@@ -2301,7 +2292,6 @@
         "Error: unsupported expression: ltrim(_)": 1,
         "Error: unsupported expression: mid(_, _, _)": 1,
         "Error: unsupported expression: rtrim(_)": 1,
-        "Error: unsupported expression: soundex(_)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: zerofill at Line": 8,
         "INSERT: Error: Incorrect value _ for column _: Out of range value": 1,
         "DDL: Error: column option DEFAULT CURRENT_TIMESTAMP is not supported on a local table": 1,
@@ -2525,7 +2515,8 @@
         "Error: unsupported expression: COLLATION(_)": 2,
         "DDL: Error: character set cp1250 is not supported on a local table": 4,
         "Error: unsupported expression: strcmp(_, _)": 5,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
+        "Error: unknown column CURRENT_USER": 1,
+        "Error: unsupported expression: MID(_, _)": 1,
         "Error: unsupported expression: weight_string(_)": 8,
         "Error: sql parser error: Expected: ), found: as at Line: _, Column: _": 15,
         "Error: unsupported expression: weight_string(_, _, _, X_)": 18,
@@ -2538,10 +2529,10 @@
       "file": "ctype_cp1251",
       "statements": 946,
       "counts": {
-        "exact": 128,
+        "exact": 137,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 29,
+        "pintail-error": 20,
         "mysql-error": 17,
         "tainted": 48,
         "setup": 240,
@@ -2558,14 +2549,6 @@
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: binary at Line: ": 1,
         "Error: unsupported expression: strcmp(_, _)": 6,
         "Error: unsupported expression: charset(concat(_ + _))": 1,
-        "Error: unsupported expression: acos(_._)": 1,
-        "Error: unsupported expression: asin(_._)": 1,
-        "Error: unsupported expression: atan(_._)": 1,
-        "Error: unsupported expression: cos(_._)": 1,
-        "Error: unsupported expression: sin(_._)": 1,
-        "Error: unsupported expression: tan(_._)": 1,
-        "Error: unsupported expression: degrees(_)": 1,
-        "Error: unsupported expression: radians(_)": 1,
         "Error: unsupported expression: bit_length(_)": 1,
         "Error: unsupported expression: coercibility(_)": 1,
         "Error: unsupported expression: uncompressed_length(_)": 1,
@@ -2579,7 +2562,6 @@
         "Error: unsupported expression: ltrim(_)": 1,
         "Error: unsupported expression: mid(_, _, _)": 1,
         "Error: unsupported expression: rtrim(_)": 1,
-        "Error: unsupported expression: soundex(_)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: zerofill at Line": 8,
         "INSERT: Error: Incorrect value _ for column _: Out of range value": 1,
         "DDL: Error: column option DEFAULT CURRENT_TIMESTAMP is not supported on a local table": 1,
@@ -2740,7 +2722,8 @@
       },
       "errorClasses": {
         "DDL: Error: character set eucjpms is not supported on a local table": 4,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "Error: unsupported expression: character set introducer _eucjpms": 2,
         "Error: unsupported expression: weight_string(_)": 6,
@@ -2773,7 +2756,8 @@
       "errorClasses": {
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "DDL: Error: character set euckr is not supported on a local table": 3
       }
@@ -2844,7 +2828,8 @@
       "errorClasses": {
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "DDL: Error: character set gb2312 is not supported on a local table": 1,
         "Error: unsupported expression: weight_string(_)": 6,
@@ -2879,7 +2864,8 @@
       "errorClasses": {
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "DDL: Error: character set gbk is not supported on a local table": 3,
         "Error: unsupported expression: character set introducer _gbk": 1,
@@ -2941,10 +2927,10 @@
       "file": "ctype_latin1",
       "statements": 1092,
       "counts": {
-        "exact": 150,
+        "exact": 159,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 47,
+        "pintail-error": 38,
         "mysql-error": 17,
         "tainted": 50,
         "setup": 279,
@@ -2961,7 +2947,8 @@
         "Error: unsupported expression: COLLATE latin1_general_cs is unsupported; supported: utf8mb": 1,
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: unsupported expression: strcmp(_, _)": 11,
         "Error: unsupported expression: COLLATE latin1_german1_ci is unsupported; supported: utf8mb": 1,
         "Error: unsupported expression: COLLATE latin1_danish_ci is unsupported; supported: utf8mb4": 1,
@@ -2970,14 +2957,6 @@
         "Error: sql parser error: Expected: ), found: character at Line: _, Column: _": 1,
         "Error: sql parser error: Expected: a concrete value, found: EXPORT_SET at Line: _, Column:": 1,
         "Error: unsupported expression: charset(concat(_ + _))": 1,
-        "Error: unsupported expression: acos(_._)": 1,
-        "Error: unsupported expression: asin(_._)": 1,
-        "Error: unsupported expression: atan(_._)": 1,
-        "Error: unsupported expression: cos(_._)": 1,
-        "Error: unsupported expression: sin(_._)": 1,
-        "Error: unsupported expression: tan(_._)": 1,
-        "Error: unsupported expression: degrees(_)": 1,
-        "Error: unsupported expression: radians(_)": 1,
         "Error: unsupported expression: bit_length(_)": 1,
         "Error: unsupported expression: coercibility(_)": 1,
         "Error: unsupported expression: uncompressed_length(_)": 1,
@@ -2991,7 +2970,6 @@
         "Error: unsupported expression: ltrim(_)": 1,
         "Error: unsupported expression: mid(_, _, _)": 1,
         "Error: unsupported expression: rtrim(_)": 1,
-        "Error: unsupported expression: soundex(_)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: zerofill at Line": 8,
         "INSERT: Error: Incorrect value _ for column _: Out of range value": 1,
         "DDL: Error: column option DEFAULT CURRENT_TIMESTAMP is not supported on a local table": 1,
@@ -3023,7 +3001,8 @@
         "Error: sql parser error: Expected: end of statement, found: a at Line: _, Column: _": 1,
         "INSERT: Error: Incorrect value X_ for column _": 2,
         "Error: unsupported expression: text collation latin1_german2_ci is unsupported; supported:": 4,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
+        "Error: unknown column CURRENT_USER": 1,
+        "Error: unsupported expression: MID(_, _)": 1,
         "Error: unsupported expression: weight_string(_)": 12,
         "Error: sql parser error: Expected: ), found: as at Line: _, Column: _": 14,
         "Error: unsupported expression: weight_string(_, _, _, X_)": 18,
@@ -3288,7 +3267,8 @@
         "Error: invalid scalar function CONVERT USING unsupported character set sjis": 4,
         "DDL: Error: character set sjis is not supported on a local table": 3,
         "DDL: Error: sql parser error: Expected: literal string, found: X_ at Line: _, Column: _": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "Error: unsupported expression: weight_string(_)": 6,
         "Error: sql parser error: Expected: ), found: as at Line: _, Column: _": 22,
@@ -3346,7 +3326,8 @@
       "errorClasses": {
         "Error: unsupported expression: STRCMP(a, _)": 1,
         "DDL: Error: Invalid default value for _": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: unsupported expression: weight_string(_)": 6,
         "Error: sql parser error: Expected: ), found: as at Line: _, Column: _": 8,
         "Error: unsupported expression: weight_string(_, _, _, X_)": 36,
@@ -3380,7 +3361,8 @@
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
         "Error: unsupported expression: text collation utf8_estonian_ci is unsupported; supported: ": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
+        "Error: unknown column CURRENT_USER": 1,
+        "Error: unsupported expression: MID(_, _)": 1,
         "Error: unsupported expression: text collation utf8_danish_ci is unsupported; supported: ut": 5,
         "Error: unsupported expression: text collation utf8_spanish2_ci is unsupported; supported: ": 5,
         "Error: unsupported expression: text collation utf8_czech_ci is unsupported; supported: utf": 1,
@@ -3425,10 +3407,10 @@
       "file": "ctype_ucs",
       "statements": 1515,
       "counts": {
-        "exact": 223,
+        "exact": 236,
         "mismatch": 2,
         "name-mismatch": 0,
-        "pintail-error": 51,
+        "pintail-error": 38,
         "mysql-error": 18,
         "tainted": 127,
         "setup": 320,
@@ -3445,15 +3427,14 @@
         "Error: unsupported expression: COLLATION(_)": 1,
         "DDL: Error: character set ucs2 is not supported on a local table": 29,
         "Error: sql parser error: Expected: ), found: character at Line: _, Column: _": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "Error: sql parser error: Expected: ), found: UNICODE at Line: _, Column: _": 4,
         "PREPARED: Error: unknown table mtr_ctype_ucs.t1__43": 2,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: unicode at Line:": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: CHARSET at Line:": 2,
         "PREPARED: Error: unknown table mtr_ctype_ucs.t1__49": 2,
-        "Error: unsupported expression: soundex(_)": 3,
-        "Error: unsupported expression: soundex(_ucs2 X_)": 2,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: charset at Line:": 1,
         "Error: unsupported expression: collation(group_concat(a SEPARATOR _))": 1,
         "Error: unsupported expression: text collation ascii_general_ci is unsupported; supported: ": 2,
@@ -3461,14 +3442,6 @@
         "Error: unsupported expression: CHARSET(DAYNAME(_))": 2,
         "Error: unsupported expression: CHARSET(MONTHNAME(_))": 2,
         "Error: unsupported expression: charset(concat(_ + _))": 1,
-        "Error: unsupported expression: acos(_._)": 1,
-        "Error: unsupported expression: asin(_._)": 1,
-        "Error: unsupported expression: atan(_._)": 1,
-        "Error: unsupported expression: cos(_._)": 1,
-        "Error: unsupported expression: sin(_._)": 1,
-        "Error: unsupported expression: tan(_._)": 1,
-        "Error: unsupported expression: degrees(_)": 1,
-        "Error: unsupported expression: radians(_)": 1,
         "Error: unsupported expression: bit_length(_)": 1,
         "Error: unsupported expression: coercibility(_)": 1,
         "Error: unsupported expression: uncompressed_length(_)": 1,
@@ -3605,7 +3578,8 @@
         "Error: invalid scalar function CONVERT USING unsupported character set ujis": 5,
         "INSERT: Error: Incorrect value X_ for column _": 1,
         "DDL: Error: character set collate is not supported on a local table": 2,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 2,
         "Error: unsupported expression: weight_string(_)": 6,
         "Error: sql parser error: Expected: ), found: as at Line: _, Column: _": 54,
@@ -3642,10 +3616,10 @@
       "file": "ctype_utf16",
       "statements": 955,
       "counts": {
-        "exact": 123,
+        "exact": 128,
         "mismatch": 3,
         "name-mismatch": 0,
-        "pintail-error": 123,
+        "pintail-error": 118,
         "mysql-error": 23,
         "tainted": 153,
         "setup": 111,
@@ -3660,12 +3634,11 @@
       "errorClasses": {
         "DDL: Error: character set utf16 is not supported on a local table": 32,
         "Error: sql parser error: Expected: ), found: character at Line: _, Column: _": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "PREPARED: Error: unknown table mtr_ctype_utf16.t1__29": 2,
         "PREPARED: Error: unknown table mtr_ctype_utf16.t1__33": 2,
-        "Error: unsupported expression: soundex(_)": 3,
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
-        "Error: unsupported expression: soundex(_utf16 X_)": 2,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: charset at Line:": 1,
         "Error: unsupported expression: POSITION(_ IN _)": 1,
         "Error: unsupported expression: octet_length(_)": 1,
@@ -3737,7 +3710,8 @@
         "DDL: Error: character set utf16 is not supported on a local table": 7,
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
+        "Error: unknown column CURRENT_USER": 1,
+        "Error: unsupported expression: MID(_, _)": 1,
         "Error: unsupported expression: weight_string(_)": 8,
         "Error: sql parser error: Expected: ), found: as at Line: _, Column: _": 15,
         "Error: unsupported expression: weight_string(_, _, _, X_)": 18,
@@ -3752,10 +3726,10 @@
       "file": "ctype_utf16le",
       "statements": 952,
       "counts": {
-        "exact": 97,
+        "exact": 102,
         "mismatch": 2,
         "name-mismatch": 0,
-        "pintail-error": 123,
+        "pintail-error": 118,
         "mysql-error": 18,
         "tainted": 166,
         "setup": 126,
@@ -3770,12 +3744,11 @@
       "errorClasses": {
         "DDL: Error: character set utf16le is not supported on a local table": 31,
         "Error: sql parser error: Expected: ), found: CHARACTER at Line: _, Column: _": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "PREPARED: Error: unknown table mtr_ctype_utf16le.t1__32": 2,
         "PREPARED: Error: unknown table mtr_ctype_utf16le.t1__36": 2,
-        "Error: unsupported expression: SOUNDEX(_)": 3,
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
-        "Error: unsupported expression: SOUNDEX(_utf16le X_)": 2,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: CHARSET at Line:": 1,
         "Error: unsupported expression: POSITION(_ IN _)": 1,
         "Error: unsupported expression: OCTET_LENGTH(_)": 1,
@@ -3806,10 +3779,10 @@
       "file": "ctype_utf32",
       "statements": 1051,
       "counts": {
-        "exact": 124,
+        "exact": 129,
         "mismatch": 15,
         "name-mismatch": 0,
-        "pintail-error": 126,
+        "pintail-error": 121,
         "mysql-error": 30,
         "tainted": 154,
         "setup": 127,
@@ -3824,12 +3797,11 @@
       "errorClasses": {
         "DDL: Error: character set utf32 is not supported on a local table": 44,
         "Error: sql parser error: Expected: ), found: character at Line: _, Column: _": 2,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "PREPARED: Error: unknown table mtr_ctype_utf32.t1__30": 2,
         "PREPARED: Error: unknown table mtr_ctype_utf32.t1__34": 2,
-        "Error: unsupported expression: soundex(_)": 3,
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
-        "Error: unsupported expression: soundex(_utf32 X_)": 2,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: charset at Line:": 1,
         "Error: unsupported expression: POSITION(_ IN _)": 1,
         "Error: unsupported expression: octet_length(_)": 1,
@@ -3921,7 +3893,8 @@
         "DDL: Error: character set utf32 is not supported on a local table": 8,
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 1,
         "Error: unsupported expression: COLLATION(_)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
+        "Error: unknown column CURRENT_USER": 1,
+        "Error: unsupported expression: MID(_, _)": 1,
         "Error: unsupported expression: weight_string(_)": 8,
         "Error: sql parser error: Expected: ), found: as at Line: _, Column: _": 15,
         "Error: unsupported expression: weight_string(_, _, _, X_)": 18,
@@ -3936,10 +3909,10 @@
       "file": "ctype_utf8",
       "statements": 1845,
       "counts": {
-        "exact": 296,
+        "exact": 312,
         "mismatch": 2,
         "name-mismatch": 0,
-        "pintail-error": 65,
+        "pintail-error": 49,
         "mysql-error": 24,
         "tainted": 120,
         "setup": 562,
@@ -3958,9 +3931,8 @@
         "DDL: Error: character set koi8r is not supported on a local table": 1,
         "Error: unsupported expression: octet_length(s1)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: BINARY at Line: ": 1,
-        "Error: unsupported expression: soundex(a)": 3,
-        "Error: unsupported expression: soundex(_utf8 X_)": 4,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: unsupported expression: CHARSET(_)": 1,
         "Error: unsupported expression: text collation utf8_lithuanian_ci is unsupported; supported": 2,
         "Error: unsupported expression: text collation utf8_czech_ci is unsupported; supported: utf": 4,
@@ -3973,14 +3945,6 @@
         "Error: unsupported expression: COLLATE utf8_sinhala_ci is unsupported; supported: utf8mb4_": 1,
         "Error: unsupported expression: text collation utf8_sinhala_ci is unsupported; supported: u": 2,
         "Error: unsupported expression: charset(concat(_ + _))": 1,
-        "Error: unsupported expression: acos(_._)": 1,
-        "Error: unsupported expression: asin(_._)": 1,
-        "Error: unsupported expression: atan(_._)": 1,
-        "Error: unsupported expression: cos(_._)": 1,
-        "Error: unsupported expression: sin(_._)": 1,
-        "Error: unsupported expression: tan(_._)": 1,
-        "Error: unsupported expression: degrees(_)": 1,
-        "Error: unsupported expression: radians(_)": 1,
         "Error: unsupported expression: bit_length(_)": 1,
         "Error: unsupported expression: coercibility(_)": 1,
         "Error: unsupported expression: uncompressed_length(_)": 1,
@@ -3995,7 +3959,6 @@
         "Error: unsupported expression: ltrim(_)": 1,
         "Error: unsupported expression: mid(_, _, _)": 1,
         "Error: unsupported expression: rtrim(_)": 1,
-        "Error: unsupported expression: soundex(_)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: zerofill at Line": 8,
         "INSERT: Error: Incorrect value _ for column _: Out of range value": 1,
         "DDL: Error: column option DEFAULT CURRENT_TIMESTAMP is not supported on a local table": 1,
@@ -4074,10 +4037,10 @@
       "file": "ctype_utf8mb4",
       "statements": 1460,
       "counts": {
-        "exact": 169,
+        "exact": 176,
         "mismatch": 2,
         "name-mismatch": 0,
-        "pintail-error": 147,
+        "pintail-error": 140,
         "mysql-error": 31,
         "tainted": 161,
         "setup": 430,
@@ -4096,9 +4059,8 @@
         "DDL: Error: character set koi8r is not supported on a local table": 1,
         "Error: unsupported expression: octet_length(s1)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: BINARY at Line: ": 1,
-        "Error: unsupported expression: soundex(a)": 3,
-        "Error: unsupported expression: soundex(_utf8mb4 X_)": 4,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unknown column CURRENT_USER": 2,
+        "Error: unsupported expression: MID(_, _)": 2,
         "Error: unsupported expression: CHARSET(_)": 1,
         "Error: unsupported expression: text collation utf8mb4_lithuanian_ci is unsupported; suppor": 2,
         "Error: unsupported expression: text collation utf8mb4_czech_ci is unsupported; supported: ": 4,
@@ -4394,10 +4356,10 @@
       "file": "custom_aggregate_functions",
       "statements": 338,
       "counts": {
-        "exact": 1,
+        "exact": 2,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 1,
+        "pintail-error": 0,
         "mysql-error": 85,
         "tainted": 1,
         "setup": 87,
@@ -4411,8 +4373,7 @@
       },
       "errorClasses": {
         "PREPARED: Error: unsupported expression: f2()": 7,
-        "PREPARED: Error: unsupported expression: f1(sal)": 11,
-        "Error: sql parser error: Expected: end of statement, found: with at Line: _, Column: _": 1
+        "PREPARED: Error: unsupported expression: f1(sal)": 11
       }
     },
     {
@@ -4601,7 +4562,7 @@
         "PREPARED: Error: unexpected tokens after prepared statement command": 3,
         "PREPARED: Error: OR REPLACE is not supported on a local table": 5,
         "DDL: Error: column option DEFAULT (a + _) is not supported on a local table": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 1
+        "Error: unsupported query clause: GROUP BY a WITH ROLLUP": 1
       }
     },
     {
@@ -4933,10 +4894,10 @@
       "file": "derived_view",
       "statements": 1111,
       "counts": {
-        "exact": 45,
+        "exact": 46,
         "mismatch": 8,
         "name-mismatch": 0,
-        "pintail-error": 8,
+        "pintail-error": 7,
         "mysql-error": 0,
         "tainted": 82,
         "setup": 404,
@@ -4953,7 +4914,6 @@
         "Error: unsupported query clause: SELECT STRAIGHT_JOIN * FROM (t2__18 AS s2 JOIN (t3__13 AS": 1,
         "Error: unsupported query clause: SELECT STRAIGHT_JOIN * FROM t2__18 AS s2, t5__1, (t3__13 ": 1,
         "Error: unsupported query clause: SELECT STRAIGHT_JOIN * FROM ((t2__18 AS s2 LEFT JOIN (t3_": 1,
-        "Error: unsupported expression: (t2__19.a, t1__23.b)": 1,
         "INSERT: Error: Incorrect value _ for column _: expected a date": 1,
         "PREPARED: Error: unknown table mtr_derived_view.v1__1": 7,
         "PREPARED: Error: sql parser error: Unterminated string literal at Line: _, Column: _": 7,
@@ -5872,10 +5832,10 @@
       "file": "func_concat",
       "statements": 115,
       "counts": {
-        "exact": 10,
+        "exact": 12,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 3,
+        "pintail-error": 1,
         "mysql-error": 1,
         "tainted": 28,
         "setup": 31,
@@ -5888,7 +5848,6 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: query engine failed: bound expression has an invalid physical type": 2,
         "Error: unsupported expression: comparing text across collations latin1_swedish_ci, utf8mb3": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: CHARSET at Line:": 10
       }
@@ -5923,10 +5882,10 @@
       "file": "func_date_add",
       "statements": 76,
       "counts": {
-        "exact": 5,
+        "exact": 7,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 7,
+        "pintail-error": 5,
         "mysql-error": 0,
         "tainted": 7,
         "setup": 11,
@@ -5941,11 +5900,9 @@
       "errorClasses": {
         "INSERT: Error: Incorrect value _ for column _: expected a datetime": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 1,
-        "Error: unsupported expression: INTERVAL _ WEEK": 1,
         "Error: unsupported expression: adddate(_, _)": 1,
-        "Error: sql parser error: INTERVAL requires a unit after the literal value at Line: _, Colu": 1,
-        "Error: unsupported expression: DATE_ADD(_, INTERVAL _ WEEK)": 1,
-        "Error: unsupported expression: DATE_ADD(_, INTERVAL -_ WEEK)": 3
+        "Error: numeric expression overflow": 1,
+        "Error: BIGINT value is out of range in _": 3
       }
     },
     {
@@ -6025,10 +5982,10 @@
       "file": "func_extract",
       "statements": 149,
       "counts": {
-        "exact": 55,
-        "mismatch": 32,
+        "exact": 56,
+        "mismatch": 34,
         "name-mismatch": 0,
-        "pintail-error": 6,
+        "pintail-error": 3,
         "mysql-error": 4,
         "tainted": 0,
         "setup": 18,
@@ -6041,10 +5998,7 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: EXTRACT(MICROSECOND FROM a)": 1,
-        "Error: unsupported expression: EXTRACT(DAY_MICROSECOND FROM a)": 1,
-        "Error: query engine failed: invalid MySQL date/time value": 3,
-        "Error: unsupported expression: EXTRACT(HOUR_MICROSECOND FROM _)": 1
+        "Error: query engine failed: invalid MySQL date/time value": 3
       }
     },
     {
@@ -6092,10 +6046,10 @@
       "file": "func_gconcat",
       "statements": 255,
       "counts": {
-        "exact": 61,
+        "exact": 63,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 18,
+        "pintail-error": 16,
         "mysql-error": 0,
         "tainted": 27,
         "setup": 107,
@@ -6121,7 +6075,6 @@
         "DDL: Error: character set cp850 is not supported on a local table": 1,
         "Error: unknown column x": 1,
         "INSERT: Error: column _ is AUTO_INCREMENT; a local table needs its value supplied": 1,
-        "Error: sql parser error: Expected: end of statement, found: with at Line: _, Column: _": 2,
         "DDL: Error: sql parser error: Expected: (, found: a at Line: _, Column: _": 1,
         "Error: unsupported expression: charset(group_concat(c1 ORDER BY c2))": 1
       }
@@ -6201,10 +6154,10 @@
       "file": "func_in",
       "statements": 427,
       "counts": {
-        "exact": 93,
-        "mismatch": 9,
+        "exact": 100,
+        "mismatch": 4,
         "name-mismatch": 0,
-        "pintail-error": 12,
+        "pintail-error": 10,
         "mysql-error": 3,
         "tainted": 11,
         "setup": 134,
@@ -6225,7 +6178,6 @@
         "Error: unsupported query clause: SELECT STRAIGHT_JOIN (SELECT SUM(t4__1.a) FROM t4__1 WHER": 1,
         "INSERT: Error: Column count doesn't match value count: _ columns, _ values": 1,
         "Error: numeric expression overflow": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
         "Error: unsupported expression: name_const(_, NULL)": 1,
         "Error: sql parser error: Expected: ), found: , at Line: _, Column: _": 2,
         "PREPARED: Error: expected a user variable": 3
@@ -6281,10 +6233,10 @@
       "file": "func_json",
       "statements": 1422,
       "counts": {
-        "exact": 297,
+        "exact": 312,
         "mismatch": 16,
         "name-mismatch": 0,
-        "pintail-error": 313,
+        "pintail-error": 298,
         "mysql-error": 191,
         "tainted": 62,
         "setup": 97,
@@ -6308,10 +6260,8 @@
         "Error: Invalid JSON path expression. The error is around character position _.": 2,
         "Error: unsupported expression: JSON_SEARCH(_, _, @str, _, @path)": 1,
         "Error: query engine failed: bound expression has an invalid physical type": 7,
-        "Error: operator = does not accept Some(Json) and Some(Utf8)": 13,
         "Error: operator = does not accept Some(Json) and Some(Boolean)": 2,
         "Error: query engine failed: binary value is not valid UTF-_ for numeric coercion": 1,
-        "Error: invalid scalar function IN": 2,
         "INSERT: Error: only literal values are supported in INSERT, got _": 2,
         "Error: unsupported literal: @json__1": 1,
         "Error: unsupported expression: CHARSET(JSON_ARRAY())": 1,
@@ -6453,10 +6403,10 @@
       "file": "func_math",
       "statements": 1158,
       "counts": {
-        "exact": 206,
-        "mismatch": 4,
+        "exact": 236,
+        "mismatch": 6,
         "name-mismatch": 0,
-        "pintail-error": 59,
+        "pintail-error": 27,
         "mysql-error": 28,
         "tainted": 161,
         "setup": 205,
@@ -6469,20 +6419,8 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: sin(pi() / _)": 1,
-        "Error: unsupported expression: degrees(pi())": 1,
-        "Error: unsupported expression: atan(-_, _)": 1,
-        "Error: unsupported expression: atan(pi(), _)": 1,
-        "Error: unsupported expression: atan2(-_, _)": 1,
-        "Error: unsupported expression: atan2(pi(), _)": 1,
-        "Error: unsupported expression: ACOS(_._)": 1,
-        "Error: unsupported expression: ASIN(_._)": 1,
-        "Error: unsupported expression: ACOS(_._ * _._)": 2,
-        "Error: unsupported expression: ASIN(_._ + _._)": 1,
-        "Error: unsupported expression: ASIN(_._ - _._)": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 4,
         "Error: sql parser error: Expected: end of statement, found: - at Line: _, Column: _": 9,
-        "Error: unsupported expression: COT(_ / _)": 1,
         "Error: numeric expression overflow": 2,
         "Error: unsupported expression: @a := @b := _._": 1,
         "Error: sql parser error: Expected: end of statement, found: _ at Line: _, Column: _": 7,
@@ -6491,13 +6429,11 @@
         "Error: unsupported expression: RTRIM(_)": 1,
         "INSERT: Error: value _ is not supported in INSERT": 1,
         "Error: unsupported expression: ST_GeomFromText(_)": 1,
-        "Error: operator = does not accept Some(Json) and Some(Utf8)": 1,
         "Error: unsupported expression: crc32_func(_)": 1,
         "DDL: Error: column _: invalid MySQL metadata: decimal column d is missing precision": 1,
         "Error: unknown column UTC_TIME": 1,
         "DDL: Error: column option DEFAULT NOW() is not supported on a local table": 2,
         "Error: unsupported expression: ExtractValue(_, _)": 1,
-        "Error: query engine failed: bound expression has an invalid physical type": 18,
         "Error: unsupported expression: NAME_CONST(_, X_)": 1
       }
     },
@@ -6672,10 +6608,10 @@
       "file": "func_sapdb",
       "statements": 88,
       "counts": {
-        "exact": 55,
+        "exact": 69,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 22,
+        "pintail-error": 8,
         "mysql-error": 0,
         "tainted": 3,
         "setup": 4,
@@ -6688,12 +6624,6 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: EXTRACT(DAY_MICROSECOND FROM _)": 1,
-        "Error: unsupported expression: EXTRACT(HOUR_MICROSECOND FROM _)": 1,
-        "Error: unsupported expression: EXTRACT(MINUTE_MICROSECOND FROM _)": 1,
-        "Error: unsupported expression: EXTRACT(SECOND_MICROSECOND FROM _)": 1,
-        "Error: unsupported expression: EXTRACT(MICROSECOND FROM _)": 1,
-        "Error: sql parser error: INTERVAL requires a unit after the literal value at Line: _, Colu": 9,
         "Error: unsupported expression: date_add(_, INTERVAL _ MICROSECOND)": 1,
         "Error: unsupported expression: date_sub(_, INTERVAL _ MICROSECOND)": 1,
         "Error: unsupported expression: adddate(_, _)": 1,
@@ -6759,10 +6689,10 @@
       "file": "func_str",
       "statements": 955,
       "counts": {
-        "exact": 367,
+        "exact": 372,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 156,
+        "pintail-error": 151,
         "mysql-error": 64,
         "tainted": 19,
         "setup": 185,
@@ -6779,7 +6709,6 @@
         "Error: sql parser error: Expected: ), found: _ at Line: _, Column: _": 4,
         "Error: unsupported expression: mid(_, _, _)": 1,
         "Error: unsupported expression: ltrim(_)": 4,
-        "Error: unsupported expression: soundex(_)": 1,
         "Error: sql parser error: Expected: end of statement, found: like at Line: _, Column: _": 5,
         "Error: unsupported expression: aes_encrypt(_, _)": 3,
         "Error: unsupported expression: aes_encrypt(NULL, _)": 1,
@@ -6802,8 +6731,6 @@
         "Error: unsupported expression: quote(a)": 1,
         "Error: unsupported expression: ltrim(concat(_, _))": 1,
         "Error: unsupported expression: quote(TRIM(concat(_, _)))": 1,
-        "Error: unsupported expression: row(_, _, _)": 3,
-        "Error: unsupported expression: row(_ COLLATE latin1_bin, _, _)": 1,
         "Error: unsupported expression: POSITION(_latin1 _ IN _latin1 _)": 1,
         "Error: unsupported expression: POSITION(_latin1 _ IN _latin1 _ COLLATE latin1_bin)": 1,
         "Error: unsupported expression: POSITION(_latin1 _ COLLATE latin1_bin IN _latin1 _)": 1,
@@ -6833,7 +6760,7 @@
         "Error: unsupported expression: collation(repeat(_latin2 _, _))": 1,
         "Error: unsupported expression: collation(reverse(_latin2 _))": 1,
         "Error: unsupported expression: quote(_latin2 _)": 1,
-        "Error: unsupported expression: soundex(_latin2 _)": 1,
+        "Error: unsupported expression: collation(soundex(_latin2 _))": 1,
         "Error: unsupported expression: collation(SUBSTRING(_latin2 _, _))": 1,
         "Error: unsupported expression: collation(insert(_latin2 _, _, _, _latin2 _))": 1,
         "Error: unsupported expression: collation(replace(_latin2 _, _latin2 _, _latin2 _))": 1,
@@ -6903,10 +6830,10 @@
       "file": "func_time",
       "statements": 1047,
       "counts": {
-        "exact": 422,
-        "mismatch": 37,
+        "exact": 454,
+        "mismatch": 19,
         "name-mismatch": 0,
-        "pintail-error": 80,
+        "pintail-error": 66,
         "mysql-error": 17,
         "tainted": 38,
         "setup": 217,
@@ -6930,27 +6857,19 @@
         "Error: unsupported expression: CHARSET(DAYNAME(_))": 1,
         "Error: unsupported expression: CHARSET(MONTHNAME(_))": 1,
         "Error: unsupported expression: COERCIBILITY(MONTHNAME(_))": 1,
-        "Error: unsupported expression: date_add(date, INTERVAL _ WEEK)": 1,
-        "Error: unsupported expression: date_add(date, INTERVAL _ QUARTER)": 1,
-        "Error: unsupported expression: timestampadd(WEEK, _, date)": 1,
         "Error: unsupported expression: timestampadd(SQL_TSI_SECOND, _, date)": 1,
-        "Error: unsupported expression: timestampdiff(QUARTER, _, _)": 1,
         "Error: unsupported expression: timestampdiff(SQL_TSI_WEEK, _, _)": 1,
         "Error: unsupported expression: timestampdiff(SQL_TSI_HOUR, _, _)": 1,
         "Error: unsupported expression: timestampdiff(SQL_TSI_DAY, _, _)": 2,
         "Error: unsupported expression: timestampdiff(SQL_TSI_MINUTE, _, _)": 1,
         "Error: unsupported expression: timestampdiff(SQL_TSI_SECOND, _, _)": 1,
-        "Error: unsupported expression: TIMESTAMPDIFF(week, _, _)": 6,
         "INSERT: Error: only literal values are supported in INSERT, got _": 2,
         "Error: unsupported expression: TIME_FORMAT(SEC_TO_TIME(a), _)": 1,
-        "Error: sql parser error: INTERVAL requires a unit after the literal value at Line: _, Colu": 2,
         "Error: unknown column TIME": 1,
         "Error: unsupported expression: INTERVAL _ HOUR": 2,
         "Error: unsupported expression: INTERVAL _ MICROSECOND": 4,
-        "Error: unsupported expression: timestampadd(week, _, date(_))": 1,
         "Error: unsupported expression: microsecond(_)": 1,
         "Error: sql parser error: Expected: ), found: MOD at Line: _, Column: _": 2,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 1,
         "Error: unsupported expression: ADDDATE(IFNULL(a, b), _)": 4,
         "Error: unsupported expression: ADDDATE(COALESCE(a, b), _)": 2,
         "Error: unsupported expression: ADDDATE(CASE WHEN _ THEN a ELSE b END, _)": 2,
@@ -7273,10 +7192,10 @@
       "file": "group_by",
       "statements": 902,
       "counts": {
-        "exact": 120,
+        "exact": 123,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 22,
+        "pintail-error": 19,
         "mysql-error": 14,
         "tainted": 69,
         "setup": 352,
@@ -7300,7 +7219,6 @@
         "DDL: Error: PRIMARY KEY over the expression _ is not supported": 1,
         "Error: unsupported query clause: SELECT SQL_BUFFER_RESULT max(f1) IS NULL FROM t1__31": 1,
         "Error: unsupported query clause: SELECT SQL_BUFFER_RESULT max(f1) + _ FROM t1__31": 1,
-        "Error: unsupported expression: ROW(_._, _._)": 1,
         "INSERT: Error: column _ is AUTO_INCREMENT; a local table needs its value supplied": 1,
         "Error: unknown column c": 4,
         "Error: unknown column t1__46.a": 1,
@@ -7309,9 +7227,9 @@
         "Error: invalid use of group function: AVG(t1__51.b)": 1,
         "Error: unknown column f3": 1,
         "Error: invalid use of group function: max(b)": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 3,
         "INSERT: Error: value _ is not supported in INSERT": 1,
-        "Error: invalid ORDER BY expression test IS NULL": 1
+        "Error: invalid ORDER BY expression test IS NULL": 1,
+        "Error: unsupported expression: ExtractValue(_, _)": 1
       }
     },
     {
@@ -7406,10 +7324,10 @@
       "file": "having",
       "statements": 355,
       "counts": {
-        "exact": 73,
+        "exact": 78,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 8,
+        "pintail-error": 3,
         "mysql-error": 1,
         "tainted": 16,
         "setup": 194,
@@ -7423,7 +7341,6 @@
       },
       "errorClasses": {
         "Error: unsupported expression: text collation latin1_german1_ci is unsupported; supported:": 1,
-        "Error: unsupported expression: (_, _)": 5,
         "INSERT: Error: column _ is AUTO_INCREMENT; a local table needs its value supplied": 2,
         "Error: unsupported table expression: t1__31 FORCE INDEX (t)": 1,
         "Error: unsupported expression: (b, c)": 1,
@@ -7610,10 +7527,10 @@
       "file": "in_subq_cond_pushdown",
       "statements": 45,
       "counts": {
-        "exact": 3,
+        "exact": 6,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 3,
+        "pintail-error": 0,
         "mysql-error": 1,
         "tainted": 1,
         "setup": 32,
@@ -7626,7 +7543,6 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: (t1__1.a, t1__1.b, t1__1.c)": 3,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: ZEROFILL at Line": 1
       }
     },
@@ -8355,10 +8271,10 @@
       "file": "join_cache",
       "statements": 1410,
       "counts": {
-        "exact": 83,
+        "exact": 85,
         "mismatch": 2,
         "name-mismatch": 0,
-        "pintail-error": 14,
+        "pintail-error": 12,
         "mysql-error": 0,
         "tainted": 88,
         "setup": 473,
@@ -8381,7 +8297,6 @@
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: CHARSET at Line:": 2,
         "Error: unsupported table expression: (t2__36 JOIN t3__18 ON t2__36.c2 = t3__18.a3)": 3,
         "Error: unsupported table expression: (t2__39 JOIN t3__21 ON t2__39.a2 = t3__21.a3)": 2,
-        "Error: unsupported expression: (t1__48.b, t2__48.b)": 2,
         "INSERT: Error: only literal values are supported in INSERT, got _": 1
       }
     },
@@ -10675,8 +10590,7 @@
         "DDL: Error: Invalid default value for _": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: ZEROFILL at Line": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 1,
-        "Error: unsupported expression: CHARSET(NULLIF(a, _utf8 _ COLLATE utf8_bin))": 1,
-        "PREPARED: Error: unsupported expression: (_, _)": 2
+        "Error: unsupported expression: CHARSET(NULLIF(a, _utf8 _ COLLATE utf8_bin))": 1
       }
     },
     {
@@ -10749,10 +10663,10 @@
       "file": "olap",
       "statements": 222,
       "counts": {
-        "exact": 7,
-        "mismatch": 0,
+        "exact": 60,
+        "mismatch": 4,
         "name-mismatch": 0,
-        "pintail-error": 72,
+        "pintail-error": 15,
         "mysql-error": 1,
         "tainted": 4,
         "setup": 101,
@@ -10765,10 +10679,11 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: sql parser error: Expected: end of statement, found: with at Line: _, Column: _": 19,
-        "Error: sql parser error: Expected: joined table, found: , at Line: _, Column: _": 5,
-        "Error: sql parser error: Expected: ), found: with at Line: _, Column: _": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 47
+        "Error: query engine failed: invalid physical plan: scalar or IN subquery must produce exac": 1,
+        "Error: unsupported query clause: GROUP BY a WITH ROLLUP": 6,
+        "Error: unsupported query clause: GROUP BY a, b WITH ROLLUP": 5,
+        "Error: unsupported query clause: GROUP BY _, _ WITH ROLLUP": 2,
+        "Error: unsupported expression: CHARSET(d)": 1
       }
     },
     {
@@ -10842,10 +10757,10 @@
       "file": "opt_trace",
       "statements": 580,
       "counts": {
-        "exact": 14,
+        "exact": 15,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 5,
+        "pintail-error": 4,
         "mysql-error": 4,
         "tainted": 7,
         "setup": 194,
@@ -10862,7 +10777,6 @@
         "Error: unsupported expression: f2(a)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: CHARSET at Line:": 1,
         "Error: unsupported table expression: t1__29 FORCE INDEX (kp1)": 1,
-        "Error: unsupported expression: (a, b)": 1,
         "INSERT: Error: Column count doesn't match value count: _ columns, _ values": 1,
         "Error: unsupported table expression: JSON_TABLE(f1, _ COLUMNS(jf FOR ORDINALITY)) AS tbl": 1,
         "DDL: Error: sql parser error: Expected: end of statement, found: partition at Line: _, Column: ": 3
@@ -11290,10 +11204,10 @@
       "file": "parser",
       "statements": 768,
       "counts": {
-        "exact": 24,
-        "mismatch": 0,
+        "exact": 34,
+        "mismatch": 5,
         "name-mismatch": 0,
-        "pintail-error": 38,
+        "pintail-error": 23,
         "mysql-error": 32,
         "tainted": 7,
         "setup": 209,
@@ -11306,7 +11220,6 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: atan(_, _)": 1,
         "Error: sql parser error: INTERVAL requires a unit after the literal value at Line: _, Colu": 3,
         "Error: sql parser error: INTERVAL requires a unit after the literal value": 5,
         "INSERT: Error: sql parser error: INTERVAL requires a unit after the literal value at Line: _, Colu": 1,
@@ -11316,9 +11229,7 @@
         "Error: unsupported query clause: SELECT _ FROM t1__6 UNION SELECT _ FROM DUAL WHERE _ GROU": 1,
         "Error: unsupported query clause: SELECT _ FROM t1__6 FOR UPDATE": 1,
         "Error: unsupported query clause: SELECT _ FROM t1__6 UNION SELECT _ FROM t1__6 ORDER BY _ ": 1,
-        "Error: sql parser error: Expected: ), found: WITH at Line: _, Column: _": 10,
-        "Error: sql parser error: Expected: joined table, found: * at Line: _, Column: _": 4,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
+        "Error: unsupported query clause: GROUP BY a__1 WITH ROLLUP": 2,
         "Error: sql parser error: recursion limit exceeded": 1,
         "DDL: Error: column option AS (_ IN (_ NOT BETWEEN _ AND _)) is not supported on a local table": 1,
         "Error: unsupported query clause: (SELECT * FROM t1__23) FOR UPDATE": 1,
@@ -12009,10 +11920,10 @@
       "file": "row",
       "statements": 180,
       "counts": {
-        "exact": 42,
+        "exact": 82,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 48,
+        "pintail-error": 8,
         "mysql-error": 0,
         "tainted": 8,
         "setup": 43,
@@ -12025,24 +11936,11 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: row(_, _, _)": 5,
-        "Error: unsupported expression: row(_, _._, _)": 5,
-        "Error: unsupported expression: (_, _)": 1,
-        "Error: unsupported expression: row(_, _)": 1,
-        "Error: unsupported expression: row(_, NULL)": 2,
-        "Error: unsupported expression: ROW(_, _, _)": 14,
-        "Error: unsupported expression: ROW(NULL, _, _)": 2,
-        "Error: unsupported expression: ROW(_, _, _._)": 1,
-        "Error: unsupported expression: ROW(_, _)": 10,
-        "Error: unsupported expression: ROW(a, _, _)": 1,
-        "Error: unsupported expression: ROW(c, _, _)": 1,
-        "Error: unsupported expression: ROW(a, b, c)": 1,
-        "Error: unsupported expression: ROW(NULL, _)": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 1,
-        "Error: unsupported expression: row(NULL, _)": 1,
-        "Error: unsupported expression: ROW(a, _)": 2,
+        "Error: query engine failed: physical input is missing t1__7.b": 2,
         "INSERT: Error: column _ is AUTO_INCREMENT; a local table needs its value supplied": 2,
-        "INSERT: Error: Incorrect value _ for column _: expected a datetime": 1
+        "INSERT: Error: Incorrect value _ for column _: expected a datetime": 1,
+        "Error: unsupported expression: ROW(_, _)": 6
       }
     },
     {
@@ -12412,10 +12310,10 @@
       "file": "selectivity",
       "statements": 952,
       "counts": {
-        "exact": 25,
+        "exact": 26,
         "mismatch": 2,
         "name-mismatch": 0,
-        "pintail-error": 4,
+        "pintail-error": 3,
         "mysql-error": 0,
         "tainted": 12,
         "setup": 472,
@@ -12429,7 +12327,6 @@
       },
       "errorClasses": {
         "DDL: Error: column option DEFAULT CURRENT_TIMESTAMP is not supported on a local table": 1,
-        "Error: unsupported expression: (_, _)": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 1,
         "INSERT: Error: Incorrect value _ for column _: expected a date": 1,
         "Error: unsupported expression: f1()": 2,
@@ -13279,10 +13176,10 @@
       "file": "statement-expr",
       "statements": 32,
       "counts": {
-        "exact": 0,
+        "exact": 1,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 1,
+        "pintail-error": 0,
         "mysql-error": 0,
         "tainted": 0,
         "setup": 9,
@@ -13295,7 +13192,6 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: ROW(_, _)": 1,
         "PREPARED: Error: unexpected tokens after prepared statement command": 1
       }
     },
@@ -13580,10 +13476,10 @@
       "file": "subselect2",
       "statements": 153,
       "counts": {
-        "exact": 6,
+        "exact": 7,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 1,
+        "pintail-error": 0,
         "mysql-error": 0,
         "tainted": 3,
         "setup": 53,
@@ -13597,7 +13493,6 @@
       },
       "errorClasses": {
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: BINARY at Line: ": 4,
-        "Error: unsupported expression: (_, _)": 1,
         "DDL: Error: character set engine is not supported on a local table": 3,
         "PREPARED: Error: multiple statements were not enabled by this client": 1
       }
@@ -13648,10 +13543,10 @@
       "file": "subselect4",
       "statements": 1013,
       "counts": {
-        "exact": 69,
+        "exact": 143,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 87,
+        "pintail-error": 13,
         "mysql-error": 2,
         "tainted": 29,
         "setup": 416,
@@ -13664,28 +13559,20 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: (a, b)": 8,
-        "Error: unsupported expression: (c, d)": 2,
-        "Error: unsupported expression: (e, f)": 1,
         "Error: unsupported expression: default(a)": 1,
-        "Error: unsupported expression: (NULL, _)": 6,
         "INSERT: Error: column _ is AUTO_INCREMENT; a local table needs its value supplied": 2,
-        "Error: unsupported expression: (f10, f10)": 2,
-        "Error: unsupported expression: (_, _)": 50,
+        "Error: ambiguous column f10": 2,
         "Error: query engine failed: invalid physical plan: unresolved subquery reached expression ": 4,
-        "Error: unsupported expression: (alias2.f1, alias2.f2)": 2,
-        "Error: unsupported expression: (f1b, f2b)": 2,
         "Error: unsupported query clause: SELECT STRAIGHT_JOIN (SELECT f2 FROM t1__27 WHERE (f2) IN": 1,
         "PREPARED: Error: unknown table mtr_subselect4.v2__1": 8,
         "PREPARED: Error: sql parser error: Unterminated string literal at Line: _, Column: _": 2,
         "PREPARED: Error: query engine failed: invalid physical plan: unresolved subquery reached expression ": 2,
         "Error: unsupported expression: a < ANY(SELECT * FROM t4__4)": 1,
         "Error: a correlated subquery in the select list is neither grouped nor aggregated": 1,
-        "Error: unsupported expression: (pk, pk)": 1,
         "DDL: Error: Invalid default value for _": 1,
-        "Error: unsupported expression: (NULL, NULL)": 2,
+        "Error: unsupported subquery: SELECT * FROM t1__50": 1,
+        "Error: unsupported subquery: SELECT * FROM t2__46": 1,
         "Error: unknown column t1o.b": 1,
-        "Error: unsupported expression: (a, a)": 2,
         "PREPARED: Error: Unknown prepared statement handler (stmt)": 6
       }
     },
@@ -13693,10 +13580,10 @@
       "file": "subselect_cache",
       "statements": 984,
       "counts": {
-        "exact": 36,
+        "exact": 44,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 26,
+        "pintail-error": 18,
         "mysql-error": 0,
         "tainted": 11,
         "setup": 646,
@@ -13711,8 +13598,6 @@
       "errorClasses": {
         "Error: query engine failed: invalid physical plan: unresolved subquery reached expression ": 6,
         "Error: invalid ORDER BY expression (SELECT d FROM t2__1 WHERE b = c)": 2,
-        "Error: unsupported expression: (b, a)": 4,
-        "Error: unsupported expression: (a, b)": 4,
         "PREPARED: Error: query engine failed: invalid physical plan: scalar or IN subquery must produce exac": 2,
         "INSERT: Error: only literal values are supported in INSERT, got _": 1,
         "Error: unknown column x": 1,
@@ -13753,10 +13638,10 @@
       "file": "subselect_exists2in",
       "statements": 341,
       "counts": {
-        "exact": 12,
+        "exact": 16,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 8,
+        "pintail-error": 4,
         "mysql-error": 1,
         "tainted": 15,
         "setup": 159,
@@ -13769,8 +13654,7 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: query engine failed: physical input is missing t1__2.a": 1,
-        "Error: query engine failed: invalid physical plan: scalar or IN subquery must produce exac": 6,
+        "Error: query engine failed: invalid physical plan: scalar or IN subquery must produce exac": 3,
         "Error: unsupported query clause: SELECT STRAIGHT_JOIN * FROM t1__13 AS alias1, t1__13 AS a": 1,
         "PREPARED: Error: unknown table mtr_subselect_exists2in.v__1": 2,
         "PREPARED: Error: unsupported query clause: SELECT STRAIGHT_JOIN * FROM t1__22 WHERE EXISTS (SELECT *": 2,
@@ -13866,10 +13750,10 @@
       "file": "subselect_mat",
       "statements": 163,
       "counts": {
-        "exact": 15,
+        "exact": 18,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 5,
+        "pintail-error": 2,
         "mysql-error": 0,
         "tainted": 7,
         "setup": 65,
@@ -13882,10 +13766,7 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "PREPARED: Error: unsupported expression: (_, _)": 2,
-        "Error: unsupported subquery: scalar subquery must produce exactly one column": 2,
-        "Error: unsupported expression: (f1, f2, f3)": 1,
-        "Error: unsupported expression: (a, b)": 2
+        "Error: unsupported subquery: scalar subquery must produce exactly one column": 2
       }
     },
     {
@@ -13934,10 +13815,10 @@
       "file": "subselect_mat_cost_bugs",
       "statements": 199,
       "counts": {
-        "exact": 11,
+        "exact": 13,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 4,
+        "pintail-error": 2,
         "mysql-error": 0,
         "tainted": 2,
         "setup": 122,
@@ -13950,9 +13831,7 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: (c2, c1)": 1,
-        "Error: unsupported expression: (_, _)": 1,
-        "Error: unsupported expression: (c1, c2)": 2
+        "Error: unsupported subquery: SELECT * FROM t2__13": 2
       }
     },
     {
@@ -14085,10 +13964,10 @@
       "file": "subselect_nulls",
       "statements": 45,
       "counts": {
-        "exact": 10,
+        "exact": 14,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 14,
+        "pintail-error": 10,
         "mysql-error": 0,
         "tainted": 0,
         "setup": 18,
@@ -14101,7 +13980,6 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: (d1, d2)": 4,
         "Error: unsupported subquery: scalar subquery must produce exactly one column": 10
       }
     },
@@ -14109,10 +13987,10 @@
       "file": "subselect_partial_match",
       "statements": 416,
       "counts": {
-        "exact": 0,
+        "exact": 13,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 91,
+        "pintail-error": 78,
         "mysql-error": 0,
         "tainted": 7,
         "setup": 199,
@@ -14125,13 +14003,25 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: (a1, a2)": 13,
-        "Error: unsupported expression: (a1, a2, a3)": 40,
-        "Error: unsupported expression: (a1, a2, a3, a4)": 19,
-        "Error: unsupported expression: (f1, f2)": 7,
-        "Error: unsupported expression: (t1__20.d, t1__20.d)": 2,
-        "Error: unsupported expression: (_, _)": 6,
-        "Error: unsupported expression: (a, b)": 4
+        "Error: unsupported subquery: SELECT * FROM t2__1 WHERE b1 IS NOT NULL AND b2 IS NOT NULL": 1,
+        "Error: unsupported subquery: SELECT * FROM t2__1": 1,
+        "Error: unsupported subquery: SELECT * FROM t2__2 WHERE b1 IS NOT NULL AND b2 IS NOT NULL": 2,
+        "Error: unsupported subquery: SELECT * FROM t2__2": 2,
+        "Error: unsupported subquery: SELECT * FROM t2__3": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__4": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__5": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__6": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__7": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__8": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__9": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__10": 6,
+        "Error: unsupported subquery: SELECT * FROM t2__11": 4,
+        "Error: unsupported subquery: SELECT * FROM t2__12": 4,
+        "Error: unsupported subquery: SELECT * FROM t2__13": 4,
+        "Error: unsupported subquery: SELECT * FROM t2__14": 4,
+        "Error: unsupported subquery: SELECT * FROM t2__15": 1,
+        "Error: unsupported subquery: SELECT * FROM t2__18": 1,
+        "Error: unsupported subquery: SELECT * FROM inner_sq__1": 6
       }
     },
     {
@@ -14201,10 +14091,10 @@
       "file": "subselect_sj2_mat",
       "statements": 144,
       "counts": {
-        "exact": 8,
+        "exact": 10,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 2,
+        "pintail-error": 0,
         "mysql-error": 0,
         "tainted": 4,
         "setup": 69,
@@ -14216,9 +14106,7 @@
         "replica-lag": 0,
         "replica-unsettled": 0
       },
-      "errorClasses": {
-        "Error: unsupported expression: (b1, b1)": 2
-      }
+      "errorClasses": {}
     },
     {
       "file": "subselect_sj_jcl6",
@@ -14245,10 +14133,10 @@
       "file": "subselect_sj_mat",
       "statements": 872,
       "counts": {
-        "exact": 34,
+        "exact": 45,
         "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 18,
+        "pintail-error": 7,
         "mysql-error": 0,
         "tainted": 61,
         "setup": 373,
@@ -14261,21 +14149,17 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: unsupported expression: (a1, a2)": 6,
         "PREPARED: Error: unsupported EXPLAIN statement: EXPLAIN SELECT * FROM t1__1 WHERE (a1, a2) IN (SELEC": 2,
-        "PREPARED: Error: unsupported expression: (a1, a2)": 6,
+        "PREPARED: Error: unknown table mtr_subselect_sj_mat.t2i_c__1": 2,
+        "Error: unsupported subquery: SELECT * FROM t2__1 WHERE b2 > _": 1,
         "INSERT: Error: Table _ doesn't exist": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 14,
         "INSERT: Error: value _ is not supported in INSERT": 4,
         "INSERT: Error: column _ is AUTO_INCREMENT; a local table needs its value supplied": 2,
-        "Error: unsupported expression: (_, _)": 2,
         "Error: sql parser error: Expected: ), found: t5__1 at Line: _, Column: _": 1,
         "PREPARED: Error: sql parser error: Unterminated string literal at Line: _, Column: _": 1,
         "Error: unsupported query clause: SELECT STRAIGHT_JOIN MIN(a) FROM t1__30 WHERE a IN (SELEC": 1,
-        "Error: unsupported expression: (a, c)": 2,
         "PREPARED: Error: unknown table mtr_subselect_sj_mat.v2__1": 6,
-        "Error: unsupported expression: (t1_1.a, t1_2.a)": 1,
-        "Error: unsupported expression: (alias2.c2, alias1.c1)": 1,
         "Error: sql parser error: Expected: ), found: MIN at Line: _, Column: _": 1,
         "PREPARED: Error: sql parser error: Expected: ), found: MIN at Line: _, Column: _": 1,
         "PREPARED: Error: Unknown prepared statement handler (stmt)": 4,
@@ -14685,8 +14569,6 @@
         "INSERT: Error: Incorrect value _ for column _: expected a datetime": 3,
         "Error: unsupported expression: TO_SECONDS(TIME _)": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 1,
-        "PREPARED: Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 1,
-        "PREPARED: Error: Unknown prepared statement handler (stmt)": 2,
         "PREPARED: Error: CREATE TABLE ... AS SELECT is not supported on a local table": 2
       }
     },
@@ -15093,8 +14975,8 @@
       "file": "type_bit",
       "statements": 297,
       "counts": {
-        "exact": 59,
-        "mismatch": 2,
+        "exact": 60,
+        "mismatch": 1,
         "name-mismatch": 0,
         "pintail-error": 0,
         "mysql-error": 0,
@@ -15192,10 +15074,10 @@
       "file": "type_date",
       "statements": 431,
       "counts": {
-        "exact": 57,
+        "exact": 59,
         "mismatch": 10,
         "name-mismatch": 0,
-        "pintail-error": 4,
+        "pintail-error": 2,
         "mysql-error": 2,
         "tainted": 22,
         "setup": 181,
@@ -15211,7 +15093,6 @@
         "INSERT: Error: Incorrect value _ for column _: expected a date": 6,
         "INSERT: Error: only literal values are supported in INSERT, got _": 3,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: ZEROFILL at Line": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 2,
         "Error: unsupported expression: d >= ALL(SELECT * FROM t1__45)": 1,
         "Error: unsupported expression: d <= ALL(SELECT * FROM t1__45)": 1,
         "PREPARED: Error: unexpected tokens after prepared statement command": 9
@@ -15374,10 +15255,10 @@
       "file": "type_float",
       "statements": 409,
       "counts": {
-        "exact": 58,
+        "exact": 59,
         "mismatch": 10,
         "name-mismatch": 0,
-        "pintail-error": 5,
+        "pintail-error": 4,
         "mysql-error": 6,
         "tainted": 30,
         "setup": 171,
@@ -15393,7 +15274,6 @@
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: zerofill at Line": 1,
         "PREPARED: Error: Unknown prepared statement handler (stmt1)": 1,
         "Error: numeric expression overflow": 1,
-        "Error: query engine failed: bound expression has an invalid physical type": 1,
         "Error: unsupported expression: format(truncate(_, -_), _, _)": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: ZEROFILL at Line": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: ( at Line: _, Co": 1,
@@ -15429,8 +15309,8 @@
       "file": "type_int",
       "statements": 329,
       "counts": {
-        "exact": 32,
-        "mismatch": 6,
+        "exact": 36,
+        "mismatch": 2,
         "name-mismatch": 0,
         "pintail-error": 1,
         "mysql-error": 7,
@@ -15449,7 +15329,7 @@
         "INSERT: Error: Incorrect value _ for column _: expected an integer": 1,
         "INSERT: Error: only literal values are supported in INSERT, got _": 7,
         "PREPARED: Error: unexpected tokens after prepared statement command": 3,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 1
+        "Error: unsupported query clause: GROUP BY _ >> NULL WITH ROLLUP": 1
       }
     },
     {
@@ -16060,10 +15940,10 @@
       "file": "union",
       "statements": 916,
       "counts": {
-        "exact": 93,
+        "exact": 94,
         "mismatch": 1,
         "name-mismatch": 0,
-        "pintail-error": 21,
+        "pintail-error": 20,
         "mysql-error": 6,
         "tainted": 57,
         "setup": 350,
@@ -16085,12 +15965,12 @@
         "INSERT: Error: only literal values are supported in INSERT, got _": 1,
         "DDL: Error: Invalid default value for _": 3,
         "DDL: Error: sql parser error: Expected: (, found: sdate at Line: _, Column: _": 1,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 4,
+        "Error: unsupported query clause: GROUP BY b WITH ROLLUP": 4,
         "Error: invalid ORDER BY expression a + _": 1,
         "Error: invalid ORDER BY expression (SELECT a FROM t2__34 WHERE b = _)": 1,
         "Error: invalid ORDER BY expression (SELECT * FROM t1__78 WHERE MATCH (a) AGAINST (_ IN BOO": 1,
         "Error: sql parser error: Expected: joined table, found: ) at Line: _, Column: _": 2,
-        "Error: unsupported expression: (e, f)": 2,
+        "Error: query engine failed: invalid physical plan: unresolved subquery reached expression ": 1,
         "Error: unsupported query clause: SELECT SQL_CALC_FOUND_ROWS * FROM t2__45": 1,
         "Error: unsupported query clause: SELECT SQL_CALC_FOUND_ROWS * FROM t1__96": 1,
         "Error: invalid ORDER BY expression (SELECT max(aa) FROM t1__113 WHERE aa < a)": 4
@@ -16274,10 +16154,10 @@
       "file": "varbinary",
       "statements": 69,
       "counts": {
-        "exact": 16,
-        "mismatch": 4,
+        "exact": 21,
+        "mismatch": 0,
         "name-mismatch": 0,
-        "pintail-error": 3,
+        "pintail-error": 2,
         "mysql-error": 0,
         "tainted": 7,
         "setup": 21,
@@ -16290,7 +16170,6 @@
         "replica-unsettled": 0
       },
       "errorClasses": {
-        "Error: query engine failed: bound expression has an invalid physical type": 1,
         "DDL: Error: sql parser error: Expected: _ or _ after column definition, found: zerofill at Line": 1,
         "Error: unknown column 0b01000001": 1,
         "Error: unsupported literal: b_": 1
@@ -16453,7 +16332,7 @@
         "INSERT: Error: only literal values are supported in INSERT, got _": 2,
         "Error: sql parser error: INTERVAL requires a unit after the literal value at Line: _, Colu": 1,
         "Error: unsupported query clause: window functions cannot combine with DISTINCT": 8,
-        "Error: sql parser error: Expected: end of statement, found: WITH at Line: _, Column: _": 1,
+        "Error: unsupported query clause: GROUP BY LEFT(_, _) WITH ROLLUP": 1,
         "PREPARED: Error: unknown table mtr_win.v1__1": 1,
         "Error: unsupported expression: row_number() OVER (ORDER BY b2)": 2,
         "Error: unsupported expression: max(t1__69.a) OVER (PARTITION BY c)": 2,
