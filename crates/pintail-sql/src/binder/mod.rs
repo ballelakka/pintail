@@ -1033,7 +1033,7 @@ impl<'catalog> Binder<'catalog> {
         &self,
         subquery: &Query,
         negated: bool,
-        from: &mut [BoundFrom],
+        from: &mut Vec<BoundFrom>,
         tables: &mut Vec<BoundTable>,
         ctes: &[BoundCte],
     ) -> Result<(), BindError> {
@@ -1132,7 +1132,7 @@ impl<'catalog> Binder<'catalog> {
                 column.relation_name.clone_from(&renamed);
             }
         }
-        let Some(last) = from.last_mut() else {
+        let Some(last) = join_chain(from, Some(&condition)) else {
             return Err(unsupported());
         };
         tables.push(inner_table.clone());
@@ -1163,7 +1163,7 @@ impl<'catalog> Binder<'catalog> {
         outer: &Expr,
         subquery: &Query,
         negated: bool,
-        from: &mut [BoundFrom],
+        from: &mut Vec<BoundFrom>,
         tables: &mut Vec<BoundTable>,
         ctes: &[BoundCte],
     ) -> Result<(), BindError> {
@@ -1263,7 +1263,7 @@ impl<'catalog> Binder<'catalog> {
             }
             condition = and_bound(condition, bound);
         }
-        let Some(last) = from.last_mut() else {
+        let Some(last) = join_chain(from, Some(&condition)) else {
             tables.pop();
             return Err(unsupported());
         };
@@ -1298,7 +1298,7 @@ impl<'catalog> Binder<'catalog> {
         &self,
         operand: &Expr,
         subquery: &Query,
-        from: &mut [BoundFrom],
+        from: &mut Vec<BoundFrom>,
         tables: &mut Vec<BoundTable>,
         ctes: &[BoundCte],
     ) -> Result<(), BindError> {
@@ -1336,7 +1336,7 @@ impl<'catalog> Binder<'catalog> {
         if operand_nullable {
             clauses.push(Expr::IsNull(Box::new(nested(operand))));
         }
-        let mut trial_from = from.to_vec();
+        let mut trial_from = from.clone();
         let mut trial_tables = tables.clone();
         for clause in clauses {
             let mut exists = subquery.clone();
@@ -1370,7 +1370,7 @@ impl<'catalog> Binder<'catalog> {
                 )?;
             }
         }
-        from.clone_from_slice(&trial_from);
+        *from = trial_from;
         *tables = trial_tables;
         Ok(())
     }
@@ -1394,7 +1394,7 @@ impl<'catalog> Binder<'catalog> {
         subquery: &Query,
         operand: Option<&Expr>,
         negated: bool,
-        from: &mut [BoundFrom],
+        from: &mut Vec<BoundFrom>,
         tables: &mut Vec<BoundTable>,
         ctes: &[BoundCte],
     ) -> Result<(), BindError> {
@@ -1587,7 +1587,7 @@ impl<'catalog> Binder<'catalog> {
                 Some(existing) => and_bound(existing, bound),
             });
         }
-        let Some(last) = from.last_mut() else {
+        let Some(last) = join_chain(from, condition.as_ref()) else {
             return Err(unsupported());
         };
         tables.push(derived_table.clone());
@@ -1891,7 +1891,7 @@ impl<'catalog> Binder<'catalog> {
     fn decorrelate_scalar(
         &self,
         subquery: &Query,
-        from: &mut [BoundFrom],
+        from: &mut Vec<BoundFrom>,
         tables: &mut Vec<BoundTable>,
         ctes: &[BoundCte],
     ) -> Result<(Expr, bool, ScalarCorrelation), BindError> {
@@ -2038,7 +2038,7 @@ impl<'catalog> Binder<'catalog> {
                 return Err(error);
             }
         };
-        let Some(last) = from.last_mut() else {
+        let Some(last) = join_chain(from, Some(&condition)) else {
             tables.pop();
             return Err(unsupported());
         };
@@ -5189,6 +5189,47 @@ fn relation_key(table: &BoundTable) -> RelationKey {
         table.table_id,
         table.relation_name.to_ascii_lowercase(),
     )
+}
+
+/// The join chain a decorrelated subquery joins onto: the last FROM item,
+/// unless its condition also reads an earlier comma-separated item. A join
+/// sees only its own chain, so those items first become one chain, each
+/// later one cross joined onto the first - the same rows a comma join
+/// produces - and the subquery joins after all of them.
+fn join_chain<'a>(
+    from: &'a mut Vec<BoundFrom>,
+    condition: Option<&BoundExpr>,
+) -> Option<&'a mut BoundFrom> {
+    let chain_keys = |source: &BoundFrom| {
+        std::iter::once(&source.base)
+            .chain(source.joins.iter().map(|join| &join.table))
+            .map(relation_key)
+            .collect::<Vec<_>>()
+    };
+    if let Some(condition) = condition
+        && let [earlier @ .., _] = from.as_slice()
+        && !earlier.is_empty()
+    {
+        let earlier = earlier.iter().flat_map(chain_keys).collect::<Vec<_>>();
+        if expr_tables(condition)
+            .iter()
+            .any(|key| earlier.contains(key))
+        {
+            let mut items = std::mem::take(from).into_iter();
+            let mut merged = items.next()?;
+            for item in items {
+                merged.joins.push(BoundJoin {
+                    scalar_aggregate: false,
+                    kind: BoundJoinKind::Cross,
+                    table: item.base,
+                    condition: None,
+                });
+                merged.joins.extend(item.joins);
+            }
+            from.push(merged);
+        }
+    }
+    from.last_mut()
 }
 
 /// Boolean conjunction of two bound predicates.

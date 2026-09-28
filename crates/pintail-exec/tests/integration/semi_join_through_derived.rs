@@ -196,3 +196,20 @@ fn not_in_over_nullable_columns_is_three_anti_joins() {
     assert!(decorrelated(over_a_join));
     assert_eq!(ids(over_a_join), ["3", "4"]);
 }
+
+#[test]
+fn a_subquery_reading_two_comma_joined_items_sees_both() {
+    // The membership operand reads the first FROM item and the subquery
+    // correlates to the second: the semi join has to see both.
+    assert_eq!(
+        run("SELECT x.id, y.id FROM pairs AS x, pairs AS y \
+             WHERE x.b IN (SELECT p.b FROM pairs AS p WHERE p.a < y.b) ORDER BY x.id, y.id"),
+        ["1,2", "2,2", "3,2", "4,2"]
+    );
+    assert_eq!(
+        run("SELECT x.id, y.id FROM pairs AS x, pairs AS y \
+             WHERE EXISTS (SELECT 1 FROM pairs AS p WHERE p.b = x.a AND p.a < y.b) \
+             ORDER BY x.id, y.id"),
+        ["1,2", "2,2", "3,2"]
+    );
+}
