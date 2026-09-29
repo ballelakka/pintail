@@ -30,9 +30,9 @@ pub use join::compare_collated_text;
 
 use aggregate::{AggregateState, CompiledAggregate, build_hash_aggregate};
 use join::{
-    HashJoinState, JoinHashKey, ProbePrefetch, build_hash_join_state, execute_nested_loop_join,
-    next_hash_join_batch, normalized_collation_value, normalized_join_key, peek_small_probe,
-    prefetch_probe, probe_prefetch_applies,
+    HashJoinState, JoinHashKey, ProbePrefetch, ResidualReads, build_hash_join_state,
+    execute_nested_loop_join, next_hash_join_batch, normalized_collation_value,
+    normalized_join_key, peek_small_probe, prefetch_probe, probe_prefetch_applies,
 };
 use memo::DependentMemo;
 use sort::{
@@ -3918,6 +3918,9 @@ enum PullOperator {
         /// Compiled residual ON predicate and the combined columns it reads.
         residual: Option<CompiledExpr>,
         residual_columns: Vec<BoundColumn>,
+        /// The residual again, compiled against the columns it reads alone,
+        /// for the probe that gathers candidate pairs into a batch.
+        residual_reads: Option<Box<ResidualReads>>,
         /// The plan's collation. The key mode carries it for hashing; this is
         /// for the row-level work either side of the probe.
         collation: Collation,
@@ -4336,6 +4339,7 @@ impl PullOperator {
                 state,
                 residual,
                 residual_columns,
+                residual_reads,
                 collation,
                 probe_prefetch,
                 build_estimate,
@@ -4437,6 +4441,7 @@ impl PullOperator {
                     column_types,
                     residual.as_ref(),
                     residual_columns,
+                    residual_reads.as_deref(),
                     state.as_mut().expect("initialized above"),
                     memory,
                 );
@@ -5214,6 +5219,11 @@ fn build_operator_inner(
             // anti joins project the left side alone.
             let mut residual_columns = left_columns.clone();
             residual_columns.extend(right_columns.iter().cloned());
+            let residual_reads = residual
+                .as_ref()
+                .map(|predicate| ResidualReads::compile(predicate, &residual_columns, collation))
+                .transpose()?
+                .map(Box::new);
             let residual = residual
                 .map(|predicate| CompiledExpr::compile(&predicate, &residual_columns, collation))
                 .transpose()?;
@@ -5239,6 +5249,7 @@ fn build_operator_inner(
                     state: None,
                     residual,
                     residual_columns,
+                    residual_reads,
                     collation,
                     probe_prefetch,
                     build_estimate,

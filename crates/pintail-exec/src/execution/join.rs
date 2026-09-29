@@ -64,6 +64,10 @@ pub(super) struct PartitionedBuild<R = BuildRow> {
     dense_buckets: Vec<Vec<R>>,
     /// The batches a resident build's row references point into.
     batches: Vec<RecordBatch>,
+    /// About what one kept row holds, once the probe first asks. Summing
+    /// the kept batches' sizes walks every value of a materialized column,
+    /// and the probe asked for every chunk of output it built.
+    kept_row_bytes: std::sync::OnceLock<usize>,
 }
 
 /// A resident build row: its batch among the build's kept batches, and its
@@ -94,16 +98,18 @@ impl PartitionedBuild<BuildRow> {
 
     /// About what one row of the build holds.
     fn row_bytes(&self) -> usize {
-        let rows = self
-            .batches
-            .iter()
-            .map(RecordBatch::row_count)
-            .sum::<usize>();
-        self.batches
-            .iter()
-            .map(RecordBatch::estimated_bytes)
-            .sum::<usize>()
-            / rows.max(1)
+        *self.kept_row_bytes.get_or_init(|| {
+            let rows = self
+                .batches
+                .iter()
+                .map(RecordBatch::row_count)
+                .sum::<usize>();
+            self.batches
+                .iter()
+                .map(RecordBatch::estimated_bytes)
+                .sum::<usize>()
+                / rows.max(1)
+        })
     }
 
     /// Each build column across the kept batches, as gather sources.
@@ -126,6 +132,7 @@ impl<R> PartitionedBuild<R> {
             dense_index: None,
             dense_buckets: Vec::new(),
             batches: Vec::new(),
+            kept_row_bytes: std::sync::OnceLock::new(),
         }
     }
 
@@ -308,6 +315,7 @@ impl<R> PartitionedBuild<R> {
             partition.clear();
         }
         self.batches.clear();
+        self.kept_row_bytes = std::sync::OnceLock::new();
     }
 }
 
@@ -590,6 +598,8 @@ pub(super) struct HashJoinState {
     pub(super) key_bounds: Option<(Value, Value)>,
     batch: Option<RecordBatch>,
     batch_reserved: usize,
+    /// [`probe_row_bytes`] of `batch`, taken once as it loads.
+    batch_row_bytes: usize,
     row: usize,
     match_index: usize,
     left_values: Option<Vec<Value>>,
@@ -1051,6 +1061,7 @@ pub(super) fn build_hash_join_state(
         key_bounds,
         batch: None,
         batch_reserved: 0,
+        batch_row_bytes: 0,
         row: 0,
         match_index: 0,
         left_values: None,
@@ -2045,6 +2056,7 @@ pub(super) fn next_hash_join_batch(
     column_types: &[DataType],
     residual: Option<&CompiledExpr>,
     residual_columns: &[BoundColumn],
+    residual_reads: Option<&ResidualReads>,
     state: &mut HashJoinState,
     memory: &MemoryTracker,
 ) -> Result<Option<RecordBatch>, ExecError> {
@@ -2071,31 +2083,110 @@ pub(super) fn next_hash_join_batch(
         right_width,
         column_types,
     };
-    let paired_residual = match residual {
-        Some(_) if matches!(kind, BoundJoinKind::Semi | BoundJoinKind::Anti) => None,
-        Some(residual) => Some(Some((residual, residual_columns))),
-        None => Some(None),
+    let reads = match (residual, residual_reads) {
+        (None, _) => None,
+        (Some(_), Some(reads)) => Some(reads),
+        (Some(_), None) => {
+            return Err(ExecError::InvalidPhysicalPlan(
+                "a join residual reached the probe without its read columns",
+            ));
+        }
     };
-    if let Some(residual) = paired_residual
-        && let Pooled::Served(output) = next_parallel_probe(left, &probe, residual, state, memory)?
+    let semi_or_anti = matches!(kind, BoundJoinKind::Semi | BoundJoinKind::Anti);
+    if !(semi_or_anti && reads.is_some())
+        && let Pooled::Served(output) = next_parallel_probe(left, &probe, reads, state, memory)?
     {
         return Ok(output);
     }
-    match residual {
+    match reads {
         None => next_hash_join_columns(left, &probe, state, memory),
-        Some(residual) if matches!(kind, BoundJoinKind::Semi | BoundJoinKind::Anti) => {
-            next_hash_join_existence_columns(
-                left,
-                &probe,
-                residual,
-                residual_columns,
-                state,
-                memory,
-            )
+        Some(reads) if semi_or_anti => {
+            next_hash_join_existence_columns(left, &probe, reads, state, memory)
         }
-        Some(residual) => {
-            next_hash_join_residual_columns(left, &probe, residual, residual_columns, state, memory)
+        Some(reads) => next_hash_join_residual_columns(left, &probe, reads, state, memory),
+    }
+}
+
+/// A residual ON predicate compiled against only the columns it reads.
+///
+/// The probe gathers each candidate pair into a batch the residual reads.
+/// Gathering every probe and build column there copied the whole joined
+/// row for each candidate, though a residual such as `b.at >= a.from`
+/// reads two of them; the batch holds the read columns alone.
+pub(super) struct ResidualReads {
+    /// The residual, compiled against `sources` in order.
+    expr: CompiledExpr,
+    /// Each read column's position in the probe-then-build layout.
+    sources: Vec<usize>,
+    /// Each read column's type.
+    types: Vec<DataType>,
+    /// Columns in the probe-then-build layout.
+    layout_width: usize,
+}
+
+impl ResidualReads {
+    /// `predicate` over the probe-then-build `columns`. A predicate that
+    /// holds a subquery, or reads by a position rather than a column, is
+    /// compiled against every column as before.
+    pub(super) fn compile(
+        predicate: &BoundExpr,
+        columns: &[BoundColumn],
+        collation: Collation,
+    ) -> Result<Self, ExecError> {
+        let mut read = std::collections::BTreeSet::new();
+        let sources = if residual_positions(predicate, columns, &mut read) && !read.is_empty() {
+            read.into_iter().collect::<Vec<_>>()
+        } else {
+            (0..columns.len()).collect()
+        };
+        let narrowed = sources
+            .iter()
+            .map(|position| columns[*position].clone())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            expr: CompiledExpr::compile(predicate, &narrowed, collation)?,
+            types: narrowed.iter().map(|column| column.data_type).collect(),
+            sources,
+            layout_width: columns.len(),
+        })
+    }
+}
+
+/// Collects the position in `columns` each column of `expr` compiles to -
+/// the first that names it, as compilation resolves it. `false` where the
+/// expression holds anything whose reads this does not follow.
+fn residual_positions(
+    expr: &BoundExpr,
+    columns: &[BoundColumn],
+    read: &mut std::collections::BTreeSet<usize>,
+) -> bool {
+    use pintail_sql::BoundExprKind;
+    match &expr.kind {
+        BoundExprKind::Column(column) => {
+            let Some(position) = columns.iter().position(|candidate| {
+                candidate.database_id == column.database_id
+                    && candidate.table_id == column.table_id
+                    && candidate.column_id == column.column_id
+                    && candidate
+                        .relation_name
+                        .eq_ignore_ascii_case(&column.relation_name)
+            }) else {
+                return false;
+            };
+            read.insert(position);
+            true
         }
+        BoundExprKind::Literal(_) => true,
+        BoundExprKind::Unary { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+            residual_positions(expr, columns, read)
+        }
+        BoundExprKind::Binary { left, right, .. } => {
+            residual_positions(left, columns, read) && residual_positions(right, columns, read)
+        }
+        BoundExprKind::Scalar { args, .. } => args
+            .iter()
+            .all(|argument| residual_positions(argument, columns, read)),
+        _ => false,
     }
 }
 
@@ -2134,16 +2225,12 @@ impl Existence<'_> {
 fn next_hash_join_existence_columns(
     left: &mut PullOperator,
     probe: &Probe<'_>,
-    residual: &CompiledExpr,
-    residual_columns: &[BoundColumn],
+    reads: &ResidualReads,
     state: &mut HashJoinState,
     memory: &MemoryTracker,
 ) -> Result<Option<RecordBatch>, ExecError> {
-    let left_width = residual_columns.len().saturating_sub(probe.right_width);
-    let residual_types = residual_columns
-        .iter()
-        .map(|column| column.data_type)
-        .collect::<Vec<_>>();
+    let residual = &reads.expr;
+    let left_width = reads.layout_width.saturating_sub(probe.right_width);
     loop {
         let exhausted = state
             .batch
@@ -2176,7 +2263,7 @@ fn next_hash_join_existence_columns(
             .filter(|index| rows[*index].undecided())
             .collect::<VecDeque<_>>();
         while !open.is_empty() {
-            let mut candidates = Picks::new(&state.build, batch, 0);
+            let mut candidates = Picks::new(&state.build, state.batch_row_bytes, 0);
             let mut owners = Vec::new();
             let mut reached = Vec::new();
             // A round holds about a batch of candidates; the rows it does not
@@ -2200,7 +2287,8 @@ fn next_hash_join_existence_columns(
                 row.tries = row.tries.saturating_mul(2).min(SPILL_SERVE_BATCH_ROWS);
                 reached.push(index);
             }
-            let candidate_batch = candidates.output(batch, &residual_types, left_width)?;
+            let candidate_batch =
+                candidates.gather(batch, &reads.sources, &reads.types, left_width)?;
             memory.ensure_transient(candidate_batch.estimated_bytes())?;
             // A probe row decided by an earlier candidate is never tested
             // again, so the vector pass declines any batch that raises
@@ -2221,7 +2309,7 @@ fn next_hash_join_existence_columns(
             }
             open.extend(reached.into_iter().filter(|index| rows[*index].undecided()));
         }
-        let mut picks = Picks::new(&state.build, batch, rows.len());
+        let mut picks = Picks::new(&state.build, state.batch_row_bytes, rows.len());
         let semi = probe.kind == BoundJoinKind::Semi;
         for row in &rows {
             if row.found == semi {
@@ -2301,6 +2389,7 @@ fn load_probe_batch(
     let batch_bytes = batch.estimated_bytes();
     memory.reserve(batch_bytes)?;
     state.batch_reserved = batch_bytes;
+    state.batch_row_bytes = batch_bytes / batch.row_count().max(1);
     state.probe_batches += 1;
     state.batch = Some(batch);
     Ok(true)
@@ -2342,7 +2431,7 @@ enum Pooled {
 fn next_parallel_probe(
     left: &mut PullOperator,
     probe: &Probe<'_>,
-    residual: Option<(&CompiledExpr, &[BoundColumn])>,
+    residual: Option<&ResidualReads>,
     state: &mut HashJoinState,
     memory: &MemoryTracker,
 ) -> Result<Pooled, ExecError> {
@@ -2437,23 +2526,26 @@ fn probe_whole_batch(
     probe: &Probe<'_>,
     build: &PartitionedBuild,
     batch: &RecordBatch,
-    residual: Option<(&CompiledExpr, &[BoundColumn])>,
+    residual: Option<&ResidualReads>,
     memory: &MemoryTracker,
 ) -> Result<Vec<RecordBatch>, ExecError> {
     let (mut row, mut match_index) = (0, 0);
+    let row_bytes = probe_row_bytes(batch);
     let mut outputs = Vec::new();
     loop {
         let next = match residual {
-            None => probe_columns_chunk(probe, build, batch, &mut row, &mut match_index, memory)?,
-            Some((residual, residual_columns)) => probe_residual_chunk(
+            None => probe_columns_chunk(
                 probe,
                 build,
                 batch,
+                row_bytes,
                 &mut row,
-                residual,
-                residual_columns,
+                &mut match_index,
                 memory,
             )?,
+            Some(reads) => {
+                probe_residual_chunk(probe, build, batch, row_bytes, &mut row, reads, memory)?
+            }
         };
         match next {
             Some(output) => outputs.push(output),
@@ -2488,6 +2580,7 @@ fn next_hash_join_columns(
             probe,
             &state.build,
             batch,
+            state.batch_row_bytes,
             &mut state.row,
             &mut state.match_index,
             memory,
@@ -2504,6 +2597,7 @@ fn probe_columns_chunk(
     probe: &Probe<'_>,
     build: &PartitionedBuild,
     batch: &RecordBatch,
+    batch_row_bytes: usize,
     row: &mut usize,
     match_index: &mut usize,
     memory: &MemoryTracker,
@@ -2513,7 +2607,7 @@ fn probe_columns_chunk(
         if *row >= batch.row_count() {
             return Ok(None);
         }
-        let mut picks = Picks::new(build, batch, SPILL_SERVE_BATCH_ROWS);
+        let mut picks = Picks::new(build, batch_row_bytes, SPILL_SERVE_BATCH_ROWS);
         while *row < batch.row_count() && picks.probe_rows.len() < SPILL_SERVE_BATCH_ROWS {
             // Turning the picked rows into columns needs about as much again,
             // so under a tight ceiling the batch is cut where that still fits.
@@ -2589,8 +2683,7 @@ fn probe_row_index(row: usize) -> Result<u32, ExecError> {
 fn next_hash_join_residual_columns(
     left: &mut PullOperator,
     probe: &Probe<'_>,
-    residual: &CompiledExpr,
-    residual_columns: &[BoundColumn],
+    reads: &ResidualReads,
     state: &mut HashJoinState,
     memory: &MemoryTracker,
 ) -> Result<Option<RecordBatch>, ExecError> {
@@ -2607,9 +2700,9 @@ fn next_hash_join_residual_columns(
             probe,
             &state.build,
             batch,
+            state.batch_row_bytes,
             &mut state.row,
-            residual,
-            residual_columns,
+            reads,
             memory,
         )? {
             return Ok(Some(output));
@@ -2623,17 +2716,18 @@ fn probe_residual_chunk(
     probe: &Probe<'_>,
     build: &PartitionedBuild,
     batch: &RecordBatch,
+    batch_row_bytes: usize,
     row: &mut usize,
-    residual: &CompiledExpr,
-    residual_columns: &[BoundColumn],
+    reads: &ResidualReads,
     memory: &MemoryTracker,
 ) -> Result<Option<RecordBatch>, ExecError> {
-    let left_width = residual_columns.len().saturating_sub(probe.right_width);
+    let residual = &reads.expr;
+    let left_width = reads.layout_width.saturating_sub(probe.right_width);
     loop {
         if *row >= batch.row_count() {
             return Ok(None);
         }
-        let mut candidates = Picks::new(build, batch, SPILL_SERVE_BATCH_ROWS);
+        let mut candidates = Picks::new(build, batch_row_bytes, SPILL_SERVE_BATCH_ROWS);
         // Each probe row with the span of `candidates` its bucket filled.
         let mut groups = Vec::new();
         while *row < batch.row_count() {
@@ -2673,14 +2767,7 @@ fn probe_residual_chunk(
         // batch first. Splitting a bucket across pulls needs match state
         // carried per probe row and is not attempted here.
         memory.ensure_transient(candidates.bytes)?;
-        let candidate_batch = candidates.output(
-            batch,
-            &residual_columns
-                .iter()
-                .map(|column| column.data_type)
-                .collect::<Vec<_>>(),
-            left_width,
-        )?;
+        let candidate_batch = candidates.gather(batch, &reads.sources, &reads.types, left_width)?;
         memory.ensure_transient(candidate_batch.estimated_bytes())?;
         let mask = if candidate_batch.row_count() == 0 {
             None
@@ -2780,12 +2867,13 @@ struct Picks<'build> {
 }
 
 impl<'build> Picks<'build> {
-    fn new(build: &'build PartitionedBuild, batch: &RecordBatch, capacity: usize) -> Self {
+    /// `probe_row_bytes` is [`probe_row_bytes`] of the probe batch.
+    fn new(build: &'build PartitionedBuild, probe_row_bytes: usize, capacity: usize) -> Self {
         Self {
             build,
             probe_rows: Vec::with_capacity(capacity),
             build_rows: Vec::with_capacity(capacity),
-            probe_row_bytes: batch.estimated_bytes() / batch.row_count().max(1),
+            probe_row_bytes,
             build_row_bytes: build.row_bytes(),
             bytes: 0,
         }
@@ -2838,6 +2926,49 @@ impl<'build> Picks<'build> {
         }
         Ok(RecordBatch::new(self.probe_rows.len(), columns)?)
     }
+
+    /// The columns at `sources` of the probe-then-build layout alone, a
+    /// probe column below `probe_width` and a build column from there on.
+    fn gather(
+        &self,
+        batch: &RecordBatch,
+        sources: &[usize],
+        types: &[DataType],
+        probe_width: usize,
+    ) -> Result<RecordBatch, ExecError> {
+        let mut build_picks = None;
+        let mut columns = Vec::with_capacity(sources.len());
+        for (&source, &data_type) in sources.iter().zip(types) {
+            if source < probe_width {
+                let column = batch.column(source).ok_or(ExecError::InvalidBatch(
+                    "join output is outside a probe column",
+                ))?;
+                columns.push(super::gather::gather(
+                    &[column],
+                    &self.probe_rows,
+                    data_type,
+                )?);
+            } else {
+                let picks = build_picks.get_or_insert_with(|| {
+                    self.build_rows
+                        .iter()
+                        .map(|row| row.map(|row| (row.batch, row.row)))
+                        .collect::<Vec<_>>()
+                });
+                columns.push(super::gather::gather_optional(
+                    &self.build.sources(source - probe_width)?,
+                    picks,
+                    data_type,
+                )?);
+            }
+        }
+        Ok(RecordBatch::new(self.probe_rows.len(), columns)?)
+    }
+}
+
+/// About what one row of a probe batch holds, for the output's size.
+fn probe_row_bytes(batch: &RecordBatch) -> usize {
+    batch.estimated_bytes() / batch.row_count().max(1)
 }
 
 /// Serves a grace-partitioned join: routes remaining probe rows to their
@@ -3123,6 +3254,7 @@ fn prepare_hash_join_left(
             let batch_bytes = batch.estimated_bytes();
             memory.reserve(batch_bytes)?;
             state.batch_reserved = batch_bytes;
+            state.batch_row_bytes = batch_bytes / batch.row_count().max(1);
             state.batch = Some(batch);
         }
         let batch = state.batch.as_ref().expect("left batch initialized");
@@ -4090,6 +4222,7 @@ mod tests {
             key_bounds: None,
             batch: None,
             batch_reserved: 0,
+            batch_row_bytes: 0,
             row: 0,
             match_index: 0,
             left_values: None,
@@ -4144,6 +4277,7 @@ mod tests {
             key_bounds: None,
             batch: None,
             batch_reserved: 0,
+            batch_row_bytes: 0,
             row: 0,
             match_index: 0,
             left_values: None,

@@ -4648,6 +4648,7 @@ fn build_fused_inner_join_aggregate(
         state,
         residual,
         residual_columns: _,
+        residual_reads: _,
         collation: _,
         probe_prefetch: _,
         build_estimate: _,
