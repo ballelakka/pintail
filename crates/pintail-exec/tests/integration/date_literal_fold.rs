@@ -131,12 +131,12 @@ fn a_range_from_a_literal_date_prunes_like_the_day_it_names() {
     assert!(!folded.is_empty());
     assert_eq!(warnings, 0);
     assert_eq!(
-        (folded_stats.blocks_pruned, folded_stats.blocks_read),
-        (literal_stats.blocks_pruned, literal_stats.blocks_read),
+        (folded_stats.segments_pruned, folded_stats.blocks_decoded),
+        (literal_stats.segments_pruned, literal_stats.blocks_decoded),
         "DATE('...') reads what the day it names reads: {folded_stats:?} against {literal_stats:?}"
     );
     assert!(
-        folded_stats.blocks_pruned > 0,
+        folded_stats.segments_pruned > folded_stats.segments_read,
         "a range past most of the table skips some of it: {folded_stats:?}"
     );
 }
@@ -156,20 +156,33 @@ fn a_literal_date_cannot_read_still_warns_when_the_statement_runs() {
 #[test]
 #[ignore = "measurement"]
 fn measure_a_literal_date_range() {
+    // Two years of minutes; each statement asks for about the last month,
+    // with a different day each time so no answer is reused.
     let fixture = Fixture::new(65_536, 16);
-    for sql in [
-        "SELECT SUM(id) FROM readings \
-         WHERE logged >= DATE_SUB(DATE('2026-02-28 15:00:00'), INTERVAL 30 DAY)",
-        "SELECT SUM(id) FROM readings WHERE logged >= '2026-01-29'",
-    ] {
-        let _ = fixture.run(sql);
+    let _ = fixture.run("SELECT SUM(id) FROM readings WHERE logged >= '2027-12-01'");
+    let end = chrono::NaiveDate::from_ymd_opt(2027, 12, 30).expect("date");
+    for folded in [true, false] {
         let started = Instant::now();
-        for _ in 0..5 {
-            let _ = fixture.run(sql);
+        for days in 30..35 {
+            let sql = if folded {
+                format!(
+                    "SELECT SUM(id) FROM readings \
+                     WHERE logged >= DATE_SUB(DATE('{end} 15:00:00'), INTERVAL {days} DAY)"
+                )
+            } else {
+                let day = end - chrono::Duration::days(days);
+                format!("SELECT SUM(id) FROM readings WHERE logged >= '{day}'")
+            };
+            let _ = fixture.run(&sql);
         }
         println!(
-            "{:>8.2} ms  {sql}",
-            started.elapsed().as_secs_f64() * 1000.0 / 5.0
+            "{:>8.2} ms  {}",
+            started.elapsed().as_secs_f64() * 1000.0 / 5.0,
+            if folded {
+                "DATE_SUB(DATE('...'), INTERVAL n DAY)"
+            } else {
+                "'YYYY-MM-DD'"
+            }
         );
     }
 }
