@@ -263,11 +263,18 @@ fn trim_derived_columns(
             } = input.as_mut()
                 && by_reference
                 && expressions.len() == columns.len()
-                && merges(source)
             {
+                // Where the derived table materializes, an unread column is
+                // dropped only when it is a bare column reference: reading
+                // a column raises nothing, so no warning or error is lost.
+                let merged = merges(source);
                 let mut keep = columns
                     .iter()
-                    .map(|column| required.contains(&column_key(column)))
+                    .zip(expressions.iter())
+                    .map(|(column, projection)| {
+                        required.contains(&column_key(column))
+                            || !(merged || matches!(projection.expr.kind, BoundExprKind::Column(_)))
+                    })
                     .collect::<Vec<_>>();
                 // One column stays whatever is read, so the rows remain.
                 if let Some(first) = keep.first_mut()
@@ -3056,6 +3063,25 @@ mod tests {
             panic!("scan");
         };
         assert_eq!(scan.projected_column_ids, [1]);
+    }
+
+    /// A derived table joined to a DISTINCT input materializes, but a plain
+    /// column reference nothing reads still goes: reading it raises nothing.
+    #[test]
+    fn prunes_unread_column_references_of_a_derived_table_that_materializes() {
+        let LogicalPlan::Derived { columns, .. } = project_input(optimized(
+            "SELECT d.id FROM (SELECT u.id, u.name, UPPER(u.name) AS shout FROM users u \
+             JOIN (SELECT DISTINCT id FROM events) e ON e.id = u.id) AS d",
+        )) else {
+            panic!("derived");
+        };
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "shout"]
+        );
     }
 
     /// A derived table that groups is materialized, and every expression of
