@@ -4650,6 +4650,7 @@ fn build_fused_inner_join_aggregate(
         residual_columns: _,
         collation: _,
         probe_prefetch: _,
+        build_estimate: _,
     } = input
     else {
         return Ok(None);

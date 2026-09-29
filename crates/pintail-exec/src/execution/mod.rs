@@ -31,8 +31,8 @@ pub use join::compare_collated_text;
 use aggregate::{AggregateState, CompiledAggregate, build_hash_aggregate};
 use join::{
     HashJoinState, JoinHashKey, ProbePrefetch, build_hash_join_state, execute_nested_loop_join,
-    next_hash_join_batch, normalized_collation_value, normalized_join_key, prefetch_probe,
-    probe_prefetch_applies,
+    next_hash_join_batch, normalized_collation_value, normalized_join_key, peek_small_probe,
+    prefetch_probe, probe_prefetch_applies,
 };
 use memo::DependentMemo;
 use sort::{
@@ -3924,6 +3924,9 @@ enum PullOperator {
         /// Whether to read the probe side ahead of the build, so that when
         /// it is small its keys can filter the build side.
         probe_prefetch: bool,
+        /// Row estimate of the build input, which a probe found small only
+        /// at run time must still be much smaller than to filter it.
+        build_estimate: Option<u64>,
     },
     Filter {
         input: Box<Self>,
@@ -4113,6 +4116,17 @@ impl PullOperator {
     /// Forwards a probe-side key restriction to the underlying scan, passing
     /// through filters only — any other operator changes row identity or
     /// layout and stops the pushdown.
+    /// Whether [`Self::restrict_probe_range`] reaches a scan from here.
+    fn probe_range_restrictable(&self) -> bool {
+        match self {
+            Self::Scan { .. } => true,
+            Self::Filter { input, .. }
+            | Self::KeyFilter { input, .. }
+            | Self::Profiled { input, .. } => input.probe_range_restrictable(),
+            _ => false,
+        }
+    }
+
     fn restrict_probe_range(&mut self, position: usize, min: &Value, max: &Value) {
         match self {
             Self::Scan { stream, .. } => stream.restrict_key_position_range(position, min, max),
@@ -4324,6 +4338,7 @@ impl PullOperator {
                 residual_columns,
                 collation,
                 probe_prefetch,
+                build_estimate,
             } => {
                 if state.is_none() {
                     // A small probe side is read in full first: its keys
@@ -4331,7 +4346,35 @@ impl PullOperator {
                     // built, which is what turns a join against a large
                     // table into one against the rows that can match.
                     let prefetch = if *probe_prefetch {
-                        prefetch_probe(left, left_key, *key_mode, memory)?
+                        prefetch_probe(left, left_key, *key_mode, extra_keys, memory)?
+                    } else if matches!(kind, BoundJoinKind::Left | BoundJoinKind::Anti)
+                        || (matches!(kind, BoundJoinKind::Inner | BoundJoinKind::Semi)
+                            && extra_keys.is_empty()
+                            && !left.probe_range_restrictable())
+                    {
+                        // A probe side too large by estimate to read ahead
+                        // is still looked at. Estimates of a join chain
+                        // multiply, so a chain that filtered down to a few
+                        // rows, or none, can still claim millions; when it
+                        // ends within a few batches its keys filter the
+                        // build side after all, and when it is empty the
+                        // build side is never read. Left and anti joins
+                        // never restrict their probe scan, so taking
+                        // batches early changes nothing else; inner and
+                        // semi joins do, once built, but only a scan reached
+                        // directly, and only by the primary key alone.
+                        let prefetch = peek_small_probe(
+                            left,
+                            left_key,
+                            *key_mode,
+                            extra_keys,
+                            *build_estimate,
+                            memory,
+                        )?;
+                        if prefetch.keys.is_some() && prefetch.batches.is_empty() {
+                            **right = PullOperator::Empty;
+                        }
+                        prefetch
                     } else {
                         ProbePrefetch::default()
                     };
@@ -4339,6 +4382,15 @@ impl PullOperator {
                         right.restrict_build_keys(
                             right_key.clone(),
                             *key_mode,
+                            std::sync::Arc::clone(keys),
+                        );
+                    }
+                    for ((_, extra_right, extra_mode), keys) in
+                        extra_keys.iter().zip(&prefetch.extra_keys)
+                    {
+                        right.restrict_build_keys(
+                            extra_right.clone(),
+                            *extra_mode,
                             std::sync::Arc::clone(keys),
                         );
                     }
@@ -5189,6 +5241,7 @@ fn build_operator_inner(
                     residual_columns,
                     collation,
                     probe_prefetch,
+                    build_estimate,
                 },
                 output_columns,
             ))

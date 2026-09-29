@@ -1071,6 +1071,9 @@ pub(super) fn build_hash_join_state(
 pub(super) struct ProbePrefetch {
     pub(super) batches: VecDeque<(RecordBatch, usize)>,
     pub(super) keys: Option<Arc<HashSet<JoinHashKey>>>,
+    /// The complete key set of each additional key, in order, when the
+    /// read-ahead collected them; empty otherwise.
+    pub(super) extra_keys: Vec<Arc<HashSet<JoinHashKey>>>,
     pub(super) keys_reserved: usize,
 }
 
@@ -1125,11 +1128,13 @@ pub(super) const fn probe_prefetch_applies(
 /// caps, collecting the normalized join key of every row. The batches are
 /// kept for the probe in their original order; the key set exists only if
 /// the probe side ended within the caps, since a partial set would drop
-/// build rows that later probe rows need.
+/// build rows that later probe rows need. A complete probe also gets a set
+/// per additional key, as [`peek_small_probe`] collects them.
 pub(super) fn prefetch_probe(
     left: &mut PullOperator,
     left_key: &CompiledExpr,
     key_mode: JoinKeyMode,
+    extra_keys: &[(CompiledExpr, CompiledExpr, JoinKeyMode)],
     memory: &MemoryTracker,
 ) -> Result<ProbePrefetch, ExecError> {
     let mut prefetch = ProbePrefetch::default();
@@ -1180,12 +1185,124 @@ pub(super) fn prefetch_probe(
         prefetch.batches.push_back((batch, bytes));
     };
     if complete {
+        for (extra_left, _, extra_mode) in extra_keys {
+            let extra = probe_key_set(
+                &prefetch.batches,
+                extra_left,
+                *extra_mode,
+                &mut keys_reserved,
+                memory,
+            )?;
+            prefetch.extra_keys.push(Arc::new(extra));
+        }
         prefetch.keys = Some(Arc::new(keys));
         prefetch.keys_reserved = keys_reserved;
     } else {
         memory.release(keys_reserved);
     }
     Ok(prefetch)
+}
+
+/// Probe rows a join that did not read ahead by estimate still peeks at
+/// before building, to find a probe side that turned out small.
+const PROBE_PEEK_ROWS: u64 = 8_192;
+
+/// Reads the probe side's first batches, up to [`PROBE_PEEK_ROWS`], ahead of
+/// the build. The batches are kept for the probe in order. When the probe
+/// ends within them and is at most a [`PROBE_PREFETCH_BUILD_RATIO`]th of the
+/// build's estimate, their keys are collected to filter the build side, as a
+/// read-ahead chosen by estimate would. Keys are taken only once the probe
+/// is known to be complete, so a large probe costs the peek nothing but the
+/// batches it holds a little early.
+///
+/// Every additional key gets its own set too. A build row that matches some
+/// probe row has each of its keys among that key's probe values, so each set
+/// filters the build on its own; for a composite key whose first part is
+/// shared by many build rows, the second part is often the one that narrows.
+pub(super) fn peek_small_probe(
+    left: &mut PullOperator,
+    left_key: &CompiledExpr,
+    key_mode: JoinKeyMode,
+    extra_keys: &[(CompiledExpr, CompiledExpr, JoinKeyMode)],
+    build_estimate: Option<u64>,
+    memory: &MemoryTracker,
+) -> Result<ProbePrefetch, ExecError> {
+    let mut prefetch = ProbePrefetch::default();
+    let mut rows = 0_u64;
+    let mut held = 0_usize;
+    loop {
+        let ceiling = (memory.limit() / 4).min(memory.remaining() / 2);
+        if rows > PROBE_PEEK_ROWS || held > ceiling {
+            return Ok(prefetch);
+        }
+        let Some(batch) = left.next_batch(memory)? else {
+            break;
+        };
+        let bytes = batch.estimated_bytes();
+        memory.reserve(bytes)?;
+        held = held.saturating_add(bytes);
+        rows = rows.saturating_add(u64::try_from(batch.visible_row_count()).unwrap_or(u64::MAX));
+        prefetch.batches.push_back((batch, bytes));
+    }
+    if rows > 0
+        && build_estimate
+            .is_some_and(|build| rows.saturating_mul(PROBE_PREFETCH_BUILD_RATIO) > build)
+    {
+        return Ok(prefetch);
+    }
+    let mut keys_reserved = 0_usize;
+    let keys = probe_key_set(
+        &prefetch.batches,
+        left_key,
+        key_mode,
+        &mut keys_reserved,
+        memory,
+    )?;
+    for (extra_left, _, extra_mode) in extra_keys {
+        let extra = probe_key_set(
+            &prefetch.batches,
+            extra_left,
+            *extra_mode,
+            &mut keys_reserved,
+            memory,
+        )?;
+        prefetch.extra_keys.push(Arc::new(extra));
+    }
+    prefetch.keys = Some(Arc::new(keys));
+    prefetch.keys_reserved = keys_reserved;
+    Ok(prefetch)
+}
+
+/// The distinct normalized values of `key` over the held probe batches,
+/// charging each new one to `reserved`.
+fn probe_key_set(
+    batches: &VecDeque<(RecordBatch, usize)>,
+    key: &CompiledExpr,
+    key_mode: JoinKeyMode,
+    reserved: &mut usize,
+    memory: &MemoryTracker,
+) -> Result<HashSet<JoinHashKey>, ExecError> {
+    let mut keys: HashSet<JoinHashKey> = HashSet::new();
+    for (batch, bytes) in batches {
+        for row in batch.selection().selected_rows() {
+            memory
+                .ensure_transient(bytes.saturating_add(key.allocation_upper_bound(batch, row)))?;
+            let Some(value) = normalized_join_key(key.evaluate(batch, row)?, key_mode)? else {
+                continue;
+            };
+            if keys.contains(&value) {
+                continue;
+            }
+            let cost = value
+                .heap_bytes()
+                .saturating_add(size_of::<JoinHashKey>())
+                .saturating_add(HASH_ENTRY_OVERHEAD);
+            memory.reserve(cost)?;
+            *reserved = reserved.saturating_add(cost);
+            keys.insert(value);
+        }
+    }
+    Ok(keys)
 }
 
 /// The probe side's integer keys as a membership structure the build-side
