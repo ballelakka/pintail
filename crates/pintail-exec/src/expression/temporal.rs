@@ -443,7 +443,9 @@ pub(super) fn convert_tz_bounded(text: &str, from: &str, to: &str) -> Option<Str
 
 fn convert_tz_impl(text: &str, from: &str, to: &str, bounded: bool) -> Option<String> {
     let trimmed = text.trim();
-    let naive = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f")
+    let naive = canonical_datetime(trimmed)
+        .ok_or(())
+        .or_else(|()| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f"))
         .or_else(|_| {
             NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
                 .map(|date| date.and_hms_opt(0, 0, 0).expect("midnight exists"))
@@ -480,12 +482,71 @@ fn convert_tz_impl(text: &str, from: &str, to: &str, bounded: bool) -> Option<St
             ZoneSpec::Named(zone) => utc.with_timezone(&zone).naive_local(),
         }
     };
-    let base = converted.format("%Y-%m-%d %H:%M:%S").to_string();
+    let base = canonical_datetime_text(converted)
+        .unwrap_or_else(|| converted.format("%Y-%m-%d %H:%M:%S").to_string());
     if fraction_digits == 0 {
         return Some(base);
     }
     let micros = format!("{:06}", converted.and_utc().timestamp_subsec_micros());
     Some(format!("{base}.{}", &micros[..fraction_digits]))
+}
+
+/// Reads the canonical datetime text a datetime column renders,
+/// `YYYY-MM-DD HH:MM:SS` with up to six fraction digits, without the
+/// general format parser: `CONVERT_TZ` over a column met nothing else and
+/// spent most of its time interpreting the format per row. Anything else,
+/// or a date the calendar rejects, answers `None` and takes the general
+/// parser, which decides what it means.
+fn canonical_datetime(text: &str) -> Option<NaiveDateTime> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b' '
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| {
+        bytes[range].iter().try_fold(0_u32, |value, byte| {
+            byte.is_ascii_digit()
+                .then(|| value * 10 + u32::from(byte - b'0'))
+        })
+    };
+    let micros = match bytes.get(19..) {
+        Some([]) => 0,
+        Some([b'.', digits @ ..]) if (1..=6).contains(&digits.len()) => {
+            let fraction = number(20..bytes.len())?;
+            let scale = 6 - u32::try_from(digits.len()).ok()?;
+            fraction * 10_u32.pow(scale)
+        }
+        _ => return None,
+    };
+    NaiveDate::from_ymd_opt(
+        i32::try_from(number(0..4)?).ok()?,
+        number(5..7)?,
+        number(8..10)?,
+    )?
+    .and_hms_micro_opt(number(11..13)?, number(14..16)?, number(17..19)?, micros)
+}
+
+/// `YYYY-MM-DD HH:MM:SS` for a datetime in the four-digit years, written
+/// directly rather than through the general formatter. `None` otherwise,
+/// and for a leap second, which the general formatter spells its own way.
+fn canonical_datetime_text(value: NaiveDateTime) -> Option<String> {
+    if !(0..=9999).contains(&value.year()) || value.nanosecond() >= 1_000_000_000 {
+        return None;
+    }
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        value.year(),
+        value.month(),
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second()
+    ))
 }
 
 const WEEK_MONDAY_FIRST: u32 = 1;
@@ -1053,4 +1114,67 @@ fn dashed_date(value: &str) -> Option<String> {
         &rest[..month_end],
         day
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDateTime;
+
+    use super::{canonical_datetime, canonical_datetime_text, convert_tz_bounded};
+
+    #[test]
+    fn canonical_datetime_text_reads_as_the_general_parser_does() {
+        for text in [
+            "2026-09-29 15:00:00",
+            "2026-09-29 15:00:00.5",
+            "2026-09-29 15:00:00.123456",
+            "0001-01-01 00:00:00",
+            "9999-12-31 23:59:59.999999",
+            "2024-02-29 12:34:56.07",
+        ] {
+            assert_eq!(
+                canonical_datetime(text),
+                NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").ok(),
+                "{text}"
+            );
+            let value = canonical_datetime(text).expect("canonical");
+            assert_eq!(
+                canonical_datetime_text(value),
+                Some(value.format("%Y-%m-%d %H:%M:%S").to_string())
+            );
+        }
+        // Everything else is left to the general parser.
+        for text in [
+            "2026-02-30 00:00:00",
+            "2026-9-29 15:00:00",
+            "2026-09-29 15:00:60",
+            "2026-09-29 15:00:00.",
+            "2026-09-29 15:00:00.1234567",
+            "2026-09-29T15:00:00",
+            "2026-09-29",
+            "2026-09-29 15:00:0x",
+        ] {
+            assert_eq!(canonical_datetime(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn converting_between_offsets_keeps_its_answers() {
+        assert_eq!(
+            convert_tz_bounded("2026-09-29 20:00:00", "+00:00", "+05:30").as_deref(),
+            Some("2026-09-30 01:30:00")
+        );
+        assert_eq!(
+            convert_tz_bounded("2026-09-29 20:00:00.25", "+00:00", "-03:00").as_deref(),
+            Some("2026-09-29 17:00:00.25")
+        );
+        assert_eq!(
+            convert_tz_bounded("2026-09-29", "+00:00", "+01:00").as_deref(),
+            Some("2026-09-29 01:00:00")
+        );
+        assert_eq!(
+            convert_tz_bounded("2026-02-30 00:00:00", "+00:00", "+01:00"),
+            None
+        );
+    }
 }
