@@ -51,6 +51,7 @@ mod mtr_answer_drift;
 mod multi_core;
 mod mutated_scan_cost;
 mod mysql_scalar_parity;
+mod narrow_first_scan;
 mod no_unsigned_subtraction;
 mod null_rejected_outer_join;
 mod null_safe_join;

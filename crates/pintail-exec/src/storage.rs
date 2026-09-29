@@ -982,6 +982,21 @@ struct PrewhereSpec {
     /// left some out (a wide column's test, deferred until the narrow ones
     /// have chosen rows) never marks a chunk as passing them all.
     complete: bool,
+    /// An integer span a join proved every useful row's column lies in,
+    /// applied beside the predicates. It is not a scan predicate: rows it
+    /// drops could match nothing above, so it never makes a chunk exact.
+    runtime_range: Option<RuntimeRange>,
+}
+
+/// A join key span pushed into a scan on a column that is not the table's
+/// key: rows outside it skip decoding every other projected column.
+#[derive(Clone, Copy)]
+struct RuntimeRange {
+    /// Position of the constrained column among the spec's predicate
+    /// columns.
+    index: usize,
+    lower: i128,
+    upper: i128,
 }
 
 /// Column types whose values are wide enough that decoding them for every
@@ -1044,6 +1059,63 @@ const SLICES_PER_SCAN_THREAD: usize = 4;
 const TIGHT_CEILING_BYTES: usize = 64 * 1024 * 1024;
 
 impl SnapshotStream {
+    /// Narrows a not-yet-started streamed scan to the rows whose integer
+    /// column at `position` lies in `[min, max]`, the span of the keys a
+    /// join can match. The column is decoded first, alone or beside the
+    /// scan's own predicate columns, and the rest of the projection only
+    /// for the rows inside the span. A column that is not the table's key
+    /// cannot bound the key range, so without this every row of the table
+    /// was decoded and then handed to the join to be thrown away.
+    fn restrict_value_range(&mut self, position: usize, min: &Value, max: &Value) {
+        let Some(stream) = &self.stream else {
+            return;
+        };
+        let (Some(lower), Some(upper)) = (integer_bound(min), integer_bound(max)) else {
+            return;
+        };
+        let Some(data_type) = self.types.get(position).copied() else {
+            return;
+        };
+        let Some(column_id) = stream.column_ids().get(position).copied() else {
+            return;
+        };
+        if !is_integer_type(data_type) || lower > upper {
+            return;
+        }
+        let spec = self.prewhere.get_or_insert_with(|| PrewhereSpec {
+            predicate_ids: Vec::new(),
+            predicates: Vec::new(),
+            data_types: Vec::new(),
+            enum_labels: Vec::new(),
+            set_members: Vec::new(),
+            collation: Collation::default(),
+            complete: true,
+            runtime_range: None,
+        });
+        let index = if let Some(index) = spec.predicate_ids.iter().position(|id| *id == column_id) {
+            index
+        } else {
+            // Appended, not sorted in: the compiled predicates address
+            // their columns by position in this list.
+            spec.predicate_ids.push(column_id);
+            spec.data_types.push(data_type);
+            spec.enum_labels.push(None);
+            spec.set_members.push(None);
+            spec.predicate_ids.len() - 1
+        };
+        let (lower, upper) = match spec.runtime_range {
+            Some(existing) if existing.index == index => {
+                (lower.max(existing.lower), upper.min(existing.upper))
+            }
+            _ => (lower, upper),
+        };
+        spec.runtime_range = Some(RuntimeRange {
+            index,
+            lower,
+            upper,
+        });
+    }
+
     /// Folds one chunk's counters into the provider's per-table totals.
     fn accumulate(&self, stats: ScanStats) {
         let mut all = self
@@ -1431,7 +1503,11 @@ impl BatchStream for SnapshotStream {
     }
 
     fn restrict_key_position_range(&mut self, position: usize, min: &Value, max: &Value) {
-        if self.started || self.key_position != Some(position) {
+        if self.started {
+            return;
+        }
+        if self.key_position != Some(position) {
+            self.restrict_value_range(position, min, max);
             return;
         }
         let Some(stream) = &self.stream else {
@@ -1774,7 +1850,71 @@ fn build_prewhere_spec(
         set_members,
         collation,
         complete,
+        runtime_range: None,
     })
+}
+
+/// Integer carrier types a runtime join span can be compared against.
+fn is_integer_type(data_type: pintail_types::DataType) -> bool {
+    matches!(
+        data_type,
+        pintail_types::DataType::Int8
+            | pintail_types::DataType::Int16
+            | pintail_types::DataType::Int32
+            | pintail_types::DataType::Int64
+            | pintail_types::DataType::UInt8
+            | pintail_types::DataType::UInt16
+            | pintail_types::DataType::UInt32
+            | pintail_types::DataType::UInt64
+    )
+}
+
+fn integer_bound(value: &Value) -> Option<i128> {
+    match value {
+        Value::Int64(value) => Some(i128::from(*value)),
+        Value::UInt64(value) => Some(i128::from(*value)),
+        _ => None,
+    }
+}
+
+fn intersect_masks(
+    combined: Option<crate::SelectionMask>,
+    mask: crate::SelectionMask,
+) -> Result<crate::SelectionMask, String> {
+    match combined {
+        None => Ok(mask),
+        Some(mut existing) => {
+            existing
+                .intersect(&mask)
+                .map_err(|error| error.to_string())?;
+            Ok(existing)
+        }
+    }
+}
+
+/// Rows of an integer column inside `[lower, upper]`; NULLs are outside.
+fn runtime_range_mask(
+    range: RuntimeRange,
+    columns: &[DecodedColumn],
+    rows: usize,
+) -> Option<crate::SelectionMask> {
+    let mut mask = crate::SelectionMask::none(rows);
+    macro_rules! fill {
+        ($values:expr, $validity:expr) => {
+            for (row, value) in $values.iter().enumerate() {
+                let value = i128::from(*value);
+                if $validity.is_valid(row) && value >= range.lower && value <= range.upper {
+                    mask.set(row, true).ok()?;
+                }
+            }
+        };
+    }
+    match columns.get(range.index)? {
+        DecodedColumn::Int64 { values, validity } => fill!(values, validity),
+        DecodedColumn::UInt64 { values, validity } => fill!(values, validity),
+        _ => return None,
+    }
+    Some(mask)
 }
 
 /// The relation name the first column a predicate reads is bound under.
@@ -1921,7 +2061,7 @@ fn prewhere_ranges(
                     .map_err(|error| error.to_string())?,
             }
         }
-    } else {
+    } else if !spec.predicates.is_empty() {
         let vectors = spec
             .data_types
             .iter()
@@ -1961,6 +2101,11 @@ fn prewhere_ranges(
                     .map_err(|error| error.to_string())?,
             }
         }
+    }
+    if let Some(range) = spec.runtime_range
+        && let Some(mask) = runtime_range_mask(range, columns, row_count)
+    {
+        combined = Some(intersect_masks(combined, mask)?);
     }
     let Some(mask) = combined else {
         return Ok(None);
@@ -2003,7 +2148,7 @@ fn prewhere_ranges(
     }
     Ok(Some(pintail_store::PrewhereRanges {
         ranges,
-        exact: !coalesced && spec.complete,
+        exact: !coalesced && spec.complete && !spec.predicates.is_empty(),
     }))
 }
 
