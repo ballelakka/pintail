@@ -31,8 +31,8 @@ pub use execution::compare_collated_text;
 pub use execution::take_fold_phase_timings;
 pub use execution::{
     BatchStream, ConversionWarning, DEFAULT_CTE_MAX_RECURSION_DEPTH, DEFAULT_MAX_ALLOWED_PACKET,
-    ExecError, Execution, ExecutionCancellation, MemoryTracker, OutputField, PhysicalPlan,
-    PhysicalPlanner, ScanProvider, SpatialError, with_execution_cancellation,
+    ExecError, Execution, ExecutionCancellation, IntegerMembership, MemoryTracker, OutputField,
+    PhysicalPlan, PhysicalPlanner, ScanProvider, SpatialError, with_execution_cancellation,
 };
 pub use execution::{
     MemoryBudget, MemoryScope, init_parallel_pool, init_shared_memory_budget,

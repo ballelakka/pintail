@@ -1514,6 +1514,10 @@ fn collect_expression_tables(expression: &BoundExpr, tables: &mut BTreeSet<Relat
     }
 }
 
+/// A test of an integer column value, shared between the operator that
+/// holds the set and the scan it narrows.
+pub type IntegerMembership = std::sync::Arc<dyn Fn(i128) -> bool + Send + Sync>;
+
 /// Pull-based batch source opened for one physical scan.
 pub trait BatchStream: Send {
     /// Produces the next batch, or `None` at end of stream.
@@ -1540,6 +1544,13 @@ pub trait BatchStream: Send {
     /// `position` lies within `[min, max]`. Best-effort: streams that cannot
     /// prune (already started, non-key column, type mismatch) ignore it.
     fn restrict_key_position_range(&mut self, _position: usize, _min: &Value, _max: &Value) {}
+
+    /// Narrows the stream to rows whose integer value in the projected
+    /// column at `position` the test accepts, NULL never. Best-effort like
+    /// the range above: a stream that has started, or cannot test the
+    /// column ahead of the others, ignores it, and the caller still tests
+    /// every row the stream returns.
+    fn restrict_integer_membership(&mut self, _position: usize, _member: &IntegerMembership) {}
 
     /// The collation this stream's own predicate evaluation compared text
     /// under, when it evaluates the scan's predicates itself. `None` when it
@@ -4006,7 +4017,7 @@ enum PullOperator {
         /// The same keys as a packed integer membership test, when every
         /// key is an integer; a typed integer key column is filtered
         /// through this without a `Value` per row.
-        integers: Option<join::IntegerKeySet>,
+        integers: Option<std::sync::Arc<join::IntegerKeySet>>,
     },
     HashAggregate {
         input: Box<Self>,
@@ -4192,6 +4203,20 @@ impl PullOperator {
         }
     }
 
+    /// Hands the scan beneath, through filters only, a membership test for
+    /// the projected column at `position`, so it can test that column
+    /// before decoding the others. The `KeyFilter` above still tests every
+    /// row, so a scan that cannot apply it loses nothing.
+    fn restrict_scan_membership(&mut self, position: usize, member: &IntegerMembership) {
+        match self {
+            Self::Scan { stream, .. } => stream.restrict_integer_membership(position, member),
+            Self::Filter { input, .. }
+            | Self::KeyFilter { input, .. }
+            | Self::Profiled { input, .. } => input.restrict_scan_membership(position, member),
+            _ => {}
+        }
+    }
+
     /// Keeps only build rows whose key is in `keys`, the set the probe side
     /// carries. A row whose key no probe row has can match nothing, so for
     /// inner, left, semi and anti joins it contributes nothing to the
@@ -4246,7 +4271,14 @@ impl PullOperator {
         {
             self.restrict_probe_range(position, &minimum, &maximum);
         }
-        let integers = join::IntegerKeySet::from_keys(&keys);
+        let integers = join::IntegerKeySet::from_keys(&keys).map(std::sync::Arc::new);
+        if let Some(position) = key.column_index()
+            && let Some(set) = &integers
+        {
+            let set = std::sync::Arc::clone(set);
+            let member: IntegerMembership = std::sync::Arc::new(move |value| set.contains(value));
+            self.restrict_scan_membership(position, &member);
+        }
         let input = std::mem::replace(self, Self::Empty);
         *self = Self::KeyFilter {
             input: Box::new(input),

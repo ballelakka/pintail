@@ -986,6 +986,10 @@ struct PrewhereSpec {
     /// applied beside the predicates. It is not a scan predicate: rows it
     /// drops could match nothing above, so it never makes a chunk exact.
     runtime_range: Option<RuntimeRange>,
+    /// A join's probe keys, tested against the integer predicate column at
+    /// this index: rows it rejects are not decoded. The join's own key
+    /// filter still tests every row, so this only narrows the decode.
+    membership: Option<(usize, crate::execution::IntegerMembership)>,
 }
 
 /// A join key span pushed into a scan on a column that is not the table's
@@ -1067,41 +1071,14 @@ impl SnapshotStream {
     /// cannot bound the key range, so without this every row of the table
     /// was decoded and then handed to the join to be thrown away.
     fn restrict_value_range(&mut self, position: usize, min: &Value, max: &Value) {
-        let Some(stream) = &self.stream else {
-            return;
-        };
         let (Some(lower), Some(upper)) = (integer_bound(min), integer_bound(max)) else {
             return;
         };
-        let Some(data_type) = self.types.get(position).copied() else {
-            return;
-        };
-        let Some(column_id) = stream.column_ids().get(position).copied() else {
-            return;
-        };
-        if !is_integer_type(data_type) || lower > upper {
+        if lower > upper {
             return;
         }
-        let spec = self.prewhere.get_or_insert_with(|| PrewhereSpec {
-            predicate_ids: Vec::new(),
-            predicates: Vec::new(),
-            data_types: Vec::new(),
-            enum_labels: Vec::new(),
-            set_members: Vec::new(),
-            collation: Collation::default(),
-            complete: true,
-            runtime_range: None,
-        });
-        let index = if let Some(index) = spec.predicate_ids.iter().position(|id| *id == column_id) {
-            index
-        } else {
-            // Appended, not sorted in: the compiled predicates address
-            // their columns by position in this list.
-            spec.predicate_ids.push(column_id);
-            spec.data_types.push(data_type);
-            spec.enum_labels.push(None);
-            spec.set_members.push(None);
-            spec.predicate_ids.len() - 1
+        let Some((spec, index)) = self.filter_first_column(position) else {
+            return;
         };
         let (lower, upper) = match spec.runtime_range {
             Some(existing) if existing.index == index => {
@@ -1114,6 +1091,41 @@ impl SnapshotStream {
             lower,
             upper,
         });
+    }
+
+    /// Makes the integer column at `position` one the filter-first decode
+    /// reads, creating a spec with no predicates of its own when the scan
+    /// had none, and answers the spec and the column's index in it.
+    fn filter_first_column(&mut self, position: usize) -> Option<(&mut PrewhereSpec, usize)> {
+        let stream = self.stream.as_ref()?;
+        let data_type = self.types.get(position).copied()?;
+        let column_id = stream.column_ids().get(position).copied()?;
+        if !is_integer_type(data_type) {
+            return None;
+        }
+        let spec = self.prewhere.get_or_insert_with(|| PrewhereSpec {
+            predicate_ids: Vec::new(),
+            predicates: Vec::new(),
+            data_types: Vec::new(),
+            enum_labels: Vec::new(),
+            set_members: Vec::new(),
+            collation: Collation::default(),
+            complete: true,
+            runtime_range: None,
+            membership: None,
+        });
+        let index = if let Some(index) = spec.predicate_ids.iter().position(|id| *id == column_id) {
+            index
+        } else {
+            // Appended, not sorted in: the compiled predicates address
+            // their columns by position in this list.
+            spec.predicate_ids.push(column_id);
+            spec.data_types.push(data_type);
+            spec.enum_labels.push(None);
+            spec.set_members.push(None);
+            spec.predicate_ids.len() - 1
+        };
+        Some((spec, index))
     }
 
     /// Folds one chunk's counters into the provider's per-table totals.
@@ -1502,6 +1514,19 @@ impl BatchStream for SnapshotStream {
         batch_memory_upper_bound(&self.types, row_count)
     }
 
+    fn restrict_integer_membership(
+        &mut self,
+        position: usize,
+        member: &crate::execution::IntegerMembership,
+    ) {
+        if self.started {
+            return;
+        }
+        if let Some((spec, index)) = self.filter_first_column(position) {
+            spec.membership = Some((index, Arc::clone(member)));
+        }
+    }
+
     fn restrict_key_position_range(&mut self, position: usize, min: &Value, max: &Value) {
         if self.started {
             return;
@@ -1851,6 +1876,7 @@ fn build_prewhere_spec(
         collation,
         complete,
         runtime_range: None,
+        membership: None,
     })
 }
 
@@ -2031,6 +2057,50 @@ fn prewhere_integer_mask(
     Some(mask)
 }
 
+/// Narrows the predicates' mask by the scan's key membership, when it has
+/// one its column can answer.
+fn with_membership(
+    spec: &PrewhereSpec,
+    columns: &[DecodedColumn],
+    row_count: usize,
+    combined: Option<crate::batch::SelectionMask>,
+) -> Result<Option<crate::batch::SelectionMask>, String> {
+    let Some(mask) = spec
+        .membership
+        .as_ref()
+        .and_then(|(index, member)| membership_mask(member, columns.get(*index), row_count))
+    else {
+        return Ok(combined);
+    };
+    intersect_masks(combined, mask).map(Some)
+}
+
+/// The rows of a decoded integer column whose value `member` accepts;
+/// `None` for a column of any other form, which the caller leaves
+/// unrestricted.
+fn membership_mask(
+    member: &crate::execution::IntegerMembership,
+    column: Option<&DecodedColumn>,
+    rows: usize,
+) -> Option<crate::SelectionMask> {
+    let mut mask = crate::SelectionMask::none(rows);
+    macro_rules! fill {
+        ($values:expr, $validity:expr) => {
+            for (row, value) in $values.iter().enumerate().take(rows) {
+                if $validity.is_valid(row) && member(i128::from(*value)) {
+                    mask.set(row, true).ok()?;
+                }
+            }
+        };
+    }
+    match column? {
+        DecodedColumn::Int64 { values, validity } => fill!(values, validity),
+        DecodedColumn::UInt64 { values, validity } => fill!(values, validity),
+        _ => return None,
+    }
+    Some(mask)
+}
+
 /// Evaluates the compiled predicates over one chunk's predicate columns and
 /// returns the surviving row ranges (coalesced), or `None` when the chunk
 /// cannot or need not be restricted.
@@ -2107,7 +2177,7 @@ fn prewhere_ranges(
     {
         combined = Some(intersect_masks(combined, mask)?);
     }
-    let Some(mask) = combined else {
+    let Some(mask) = with_membership(spec, columns, row_count, combined)? else {
         return Ok(None);
     };
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
