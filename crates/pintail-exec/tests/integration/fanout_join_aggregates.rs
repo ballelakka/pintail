@@ -202,7 +202,13 @@ fn fixture(members_per_group: u64, entries: u64, items: u64, sessions: u64) -> F
         .map(|id| vec![number(id), number(id), number(id % 50 + 1)])
         .collect();
     let refs = (1..=60)
-        .map(|id| vec![number(id), number(id % 55 + 1), number(u64::from(id % 4 != 0))])
+        .map(|id| {
+            vec![
+                number(id),
+                number(id % 55 + 1),
+                number(u64::from(id % 4 != 0)),
+            ]
+        })
         .collect();
     let submissions = (1..=people * 3)
         .map(|id| vec![number(id), number(id % 51 + 1), number(id % people + 1)])
@@ -299,6 +305,9 @@ fn fanout_join_aggregates_measure() {
     let fixture = fixture(80, 20, 60, 20);
     for on in ["m.person_id + 0", "m.person_id"] {
         let (rows, elapsed, profile) = fixture.run(&fanout(on));
-        println!("ON {on}: {} groups in {elapsed:.1} ms\n{profile}", rows.len());
+        println!(
+            "ON {on}: {} groups in {elapsed:.1} ms\n{profile}",
+            rows.len()
+        );
     }
 }

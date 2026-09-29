@@ -123,7 +123,9 @@ fn same_column(left: &BoundColumn, right: &BoundColumn) -> bool {
         && left.database_id == right.database_id
         && left.table_id == right.table_id
         && left.column_id == right.column_id
-        && left.relation_name.eq_ignore_ascii_case(&right.relation_name)
+        && left
+            .relation_name
+            .eq_ignore_ascii_case(&right.relation_name)
 }
 
 #[allow(clippy::too_many_lines)] // one linear sequence of shape checks
