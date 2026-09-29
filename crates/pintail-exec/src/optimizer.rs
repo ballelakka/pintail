@@ -1751,6 +1751,7 @@ fn fold_expr(expr: BoundExpr) -> BoundExpr {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one arm per expression kind reads best unsplit
 fn evaluate_constant(expr: &BoundExpr) -> Option<Value> {
     match &expr.kind {
         // Integer casts of decimals may warn. Keep them in execution so
