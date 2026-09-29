@@ -2483,39 +2483,79 @@ pub(super) fn build_hash_aggregate(
         }
     }
     /// Data-version identity of a whole settled plan: scans directly,
-    /// filters transparently (their predicates ARE the scan signature),
-    /// and fresh inner joins when BOTH sides are settled — either table's
-    /// ingest or flush changes its component of the key.
+    /// filters by their own predicate, and fresh inner joins when BOTH
+    /// sides are settled — either table's ingest or flush changes its
+    /// component of the key.
     ///
-    /// No collation here: a scan signature already fixes the columns, and the
-    /// collation is a property of those columns, so two scans that share a
-    /// signature necessarily share a collation.
+    /// Every Filter's predicate joins the key, not only the scan's. A
+    /// Filter above a join tests columns no scan signature covers (the
+    /// null-extended side of an outer join, say), so walking through it
+    /// gave `IS NULL` and `COALESCE(.., 0) = 0` over one join the same key
+    /// and served the first one's answer to the second. A Filter repeating
+    /// a scan predicate adds nothing but a longer key.
     fn settled_plan_key(operator: &PullOperator) -> Option<(std::path::PathBuf, u64, String)> {
         match operator {
             PullOperator::Scan { stream, .. } => stream.settled_identity(),
-            PullOperator::Filter { input, .. } | PullOperator::Profiled { input, .. } => {
-                settled_plan_key(input)
+            PullOperator::Profiled { input, .. } => settled_plan_key(input),
+            PullOperator::Filter {
+                input, predicate, ..
+            } => {
+                let (directory, generation, signature) = settled_plan_key(input)?;
+                Some((
+                    directory,
+                    generation,
+                    format!("F({})|{signature}", predicate.deterministic_signature()?),
+                ))
             }
+            // Every part of the join that decides which rows pair up is in
+            // the key: the extra key columns of a composite key and the
+            // residual ON predicate too, or two joins that differ only there
+            // share one entry.
             PullOperator::HashJoin {
                 left,
                 right,
                 kind,
                 left_key,
                 right_key,
+                extra_keys,
                 key_mode,
                 right_width,
                 state,
+                residual,
+                residual_columns,
+                collation,
                 ..
             } if state.is_none() => {
+                use std::fmt::Write as _;
                 let (left_dir, left_gen, left_sig) = settled_plan_key(left)?;
                 let (right_dir, right_gen, right_sig) = settled_plan_key(right)?;
+                let mut join = format!(
+                    "J{kind:?}|{key_mode:?}|{}|{}|{right_width}|{collation:?}",
+                    left_key.deterministic_signature()?,
+                    right_key.deterministic_signature()?,
+                );
+                for (left, right, mode) in extra_keys {
+                    write!(
+                        join,
+                        "|x{mode:?}({},{})",
+                        left.deterministic_signature()?,
+                        right.deterministic_signature()?
+                    )
+                    .ok()?;
+                }
+                if let Some(residual) = residual {
+                    write!(
+                        join,
+                        "|on({})[{residual_columns:?}]",
+                        residual.deterministic_signature()?
+                    )
+                    .ok()?;
+                }
                 Some((
                     left_dir,
                     left_gen,
                     format!(
-                        "J{kind:?}|{key_mode:?}|{}|{}|{right_width}|L({left_sig})|R({}:{right_gen}:{right_sig})",
-                        left_key.deterministic_signature()?,
-                        right_key.deterministic_signature()?,
+                        "{join}|L({left_sig})|R({}:{right_gen}:{right_sig})",
                         right_dir.display(),
                     ),
                 ))
@@ -2530,7 +2570,13 @@ pub(super) fn build_hash_aggregate(
     } else {
         settled_plan_key(input).and_then(|(directory, generation, scan)| {
             settled_signature(group_by, aggregates)
-                .map(|signature| (directory, generation, format!("p{scan:?};{signature}")))
+                .map(|signature| {
+                    (
+                        directory,
+                        generation,
+                        format!("p{scan:?};{signature}k{collation:?}{key_collations:?}"),
+                    )
+                })
         })
     };
     if std::env::var_os("PINTAIL_AGG_DEBUG").is_some() {
@@ -2562,7 +2608,10 @@ pub(super) fn build_hash_aggregate(
         });
     }
     if memo_key.is_none()
-        && let Some(PullOperator::Scan { stream, .. }) = settled_scan(input)
+        // A bare scan only: the delta rows are raw inserts, and a Filter
+        // above the scan (the delta exists only for a predicate-free scan,
+        // so any Filter is residual) would be skipped by the merge.
+        && let PullOperator::Scan { stream, .. } = super::unprofiled_ref(input)
         && let Some(delta) = stream.insert_only_delta()
         && let Some(signature) = settled_signature(group_by, aggregates)
         && aggregates.iter().all(mergeable_across_disjoint_rows)
@@ -2572,7 +2621,10 @@ pub(super) fn build_hash_aggregate(
         let key = (
             delta.directory.clone(),
             delta.generation,
-            format!("p{:?};{signature}", delta.scan),
+            format!(
+                "p{:?};{signature}k{collation:?}{key_collations:?}",
+                delta.scan
+            ),
         );
         let base = SETTLED_AGGREGATE_MEMO
             .lock()

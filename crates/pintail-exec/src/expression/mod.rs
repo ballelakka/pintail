@@ -1113,10 +1113,10 @@ impl CompiledExpr {
                 left,
                 right,
                 data_type,
-                collation: _,
+                collation,
                 overflow: _,
             } => Some(format!(
-                "b{op:?}({},{}){data_type:?}",
+                "b{op:?}({},{}){data_type:?}{collation:?}",
                 left.deterministic_signature()?,
                 right.deterministic_signature()?
             )),
@@ -1130,13 +1130,14 @@ impl CompiledExpr {
                 literal_regex: _,
                 variables: _,
                 data_type,
-                collation: _,
+                collation,
                 overflow: _,
             } => {
                 if matches!(
                     function,
                     ScalarFunction::Now
                         | ScalarFunction::UnixTimestamp
+                        | ScalarFunction::CurrentDate
                         | ScalarFunction::Curtime
                         | ScalarFunction::UtcTimestamp
                         | ScalarFunction::UtcDate
@@ -1157,7 +1158,7 @@ impl CompiledExpr {
                     inner.push(',');
                 }
                 Some(format!(
-                    "s{function:?}({inner}){argument_types:?}{data_type:?}"
+                    "s{function:?}({inner}){argument_types:?}{data_type:?}{collation:?}"
                 ))
             }
         }

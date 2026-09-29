@@ -74,6 +74,7 @@ mod semi_join_through_derived;
 mod session_timestamp_prune;
 mod set_ordinal;
 mod settled_delta_memo;
+mod settled_memo_filter;
 mod settled_memo_group_concat;
 mod settled_memo_identity;
 mod settled_memo_scale;
