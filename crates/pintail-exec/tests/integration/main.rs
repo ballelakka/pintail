@@ -5,6 +5,7 @@
 mod admission;
 mod binary_bit_aggregates;
 mod computed_aggregate_arguments;
+mod conditional_count_windows;
 mod constant_predicate_folds;
 mod correlated_self_join;
 mod decimal_average_exactness;

@@ -86,6 +86,13 @@ impl LazyText {
         }
     }
 
+    /// Derived text whose rows are already built: `text` must be exactly
+    /// what the units format to.
+    fn prebuilt(self, text: StrColumn) -> Self {
+        let _ = self.cell.set(text);
+        self
+    }
+
     pub(crate) const fn date() -> Self {
         Self {
             kind: TextKind::Date,
@@ -385,6 +392,38 @@ impl TypedValues {
     }
 }
 
+/// The text of a temporal column built from row values: derived from its
+/// units when every value was written canonically at the column's own
+/// precision, as an aggregate or a join's rows carry them, so kernels that
+/// copy units - a gather, `COALESCE`, `IF` - take the column as packed
+/// instead of converting its values row by row. Text written any other way
+/// is kept as it was.
+fn canonical_temporal_text(
+    data_type: DataType,
+    units: &[i64],
+    values: &[Value],
+    text: StrColumn,
+) -> LazyText {
+    let derived = match data_type {
+        DataType::Date32 => LazyText::date(),
+        DataType::DateTime64 { fsp } => LazyText::datetime(fsp),
+        _ => return LazyText::ready(text),
+    };
+    let canonical = units.iter().zip(values).all(|(&unit, value)| match value {
+        Value::Utf8(written) => match data_type {
+            DataType::DateTime64 { fsp } => pintail_types::format_datetime_micros(unit, fsp),
+            _ => pintail_types::format_date_days(unit),
+        }
+        .is_some_and(|formatted| formatted == *written),
+        _ => matches!(value, Value::Null),
+    });
+    if canonical {
+        derived.prebuilt(text)
+    } else {
+        LazyText::ready(text)
+    }
+}
+
 /// Builds the packed projection for a homogeneous column: one builder chosen
 /// by the declared type's physical carrier, `None` when values defeat packing
 /// (mixed variants, unparseable decimal text, empty column).
@@ -542,9 +581,9 @@ fn build_typed(data_type: DataType, values: &[Value]) -> Option<(TypedValues, Va
     } else if let Some(units) = temporal.take() {
         // temporal is only alive for Date32/DateTime64 columns whose every
         // non-null value parsed; the text views must exist alongside it.
-        utf8.take().map(|text| TypedValues::Temporal {
-            units,
-            text: LazyText::ready(text),
+        utf8.take().map(|text| {
+            let text = canonical_temporal_text(data_type, &units, values, text);
+            TypedValues::Temporal { units, text }
         })
     } else if let Some(packed) = int64 {
         Some(TypedValues::Int64(packed))
@@ -1408,6 +1447,42 @@ mod tests {
     use pintail_types::{DataType, Value};
 
     use super::{BatchError, ColumnVector, RecordBatch, SelectionMask};
+
+    #[test]
+    fn temporal_columns_from_canonical_values_derive_their_text() {
+        let packs = |data_type: DataType, texts: &[Option<&str>]| {
+            let values = texts
+                .iter()
+                .map(|text| text.map_or(Value::Null, |text| Value::Utf8(text.to_owned())))
+                .collect();
+            let column = ColumnVector::new(data_type, values).expect("column");
+            let packed = crate::execution::gather::packed(&column);
+            // Either way the column reads back exactly as written.
+            for (row, text) in texts.iter().enumerate() {
+                assert_eq!(
+                    column.value_owned(row),
+                    Some(text.map_or(Value::Null, |text| Value::Utf8(text.to_owned())))
+                );
+            }
+            packed
+        };
+        let datetime = DataType::DateTime64 { fsp: 0 };
+        assert!(packs(datetime, &[Some("2026-03-01 10:00:00"), None]));
+        assert!(packs(DataType::Date32, &[Some("2026-03-01"), None]));
+        assert!(packs(
+            DataType::DateTime64 { fsp: 3 },
+            &[Some("2026-03-01 10:00:00.250")]
+        ));
+        // Text a canonical rendering would change stays as written.
+        assert!(!packs(
+            datetime,
+            &[Some("2026-03-01 10:00:00"), Some("2026-3-1 10:00:00")]
+        ));
+        assert!(!packs(
+            DataType::DateTime64 { fsp: 3 },
+            &[Some("2026-03-01 10:00:00.25")]
+        ));
+    }
 
     #[test]
     fn validates_vector_types_and_batch_lengths() {
