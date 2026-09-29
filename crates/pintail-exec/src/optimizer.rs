@@ -3,12 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use pintail_catalog::{DatabaseId, TableId};
 use pintail_sql::{
     AggregateFunction, BinaryOp, BoundAggregate, BoundColumn, BoundExpr, BoundExprKind,
-    BoundJoinKind, BoundProjection, BoundQuery, ScalarFunction, WindowFunction,
+    BoundJoinKind, BoundLimit, BoundOrderKey, BoundProjection, BoundQuery, ScalarFunction,
+    WindowFunction,
 };
 use pintail_types::{DataType, Value};
 
 use crate::{
-    LogicalPlan,
+    LogicalPlan, Scan,
     expression::{
         evaluate_binary as evaluate_runtime_binary, evaluate_unary as evaluate_runtime_unary,
         mysql_truth,
@@ -44,9 +45,168 @@ impl Optimizer {
         let mut plan = plan;
         prune_derived_columns(&mut plan);
         prune_projections(&mut plan);
+        push_top_k_below_left_joins(&mut plan);
         push_limits(&mut plan);
         plan
     }
+}
+
+/// `ORDER BY` columns of a LEFT JOIN's preserved table, then `LIMIT n`,
+/// needs only that table's first n rows in the same order: a LEFT JOIN
+/// keeps every left row and gives each one at least one output row, so the
+/// first n output rows come from at most the first n left rows. The table
+/// is sorted and cut to n before the joins, and the sort above them stays,
+/// so it orders the few joined rows exactly as it ordered the many.
+///
+/// Ties keep their meaning: rows equal on the keys go by arrival in both
+/// sorts, and the joins keep the left rows' arrival order.
+fn push_top_k_below_left_joins(plan: &mut LogicalPlan) {
+    if let LogicalPlan::Limit { input, limit } = plan
+        && let LogicalPlan::Sort {
+            input: sorted,
+            keys,
+            ..
+        } = input.as_mut()
+        && let LogicalPlan::Project {
+            input: joined,
+            expressions,
+        } = sorted.as_mut()
+        && matches!(
+            joined.as_ref(),
+            LogicalPlan::Join {
+                kind: BoundJoinKind::Left,
+                ..
+            }
+        )
+    {
+        let key_columns = keys
+            .iter()
+            .map(|key| {
+                match expressions
+                    .get(key.index)
+                    .map(|projection| &projection.expr.kind)
+                {
+                    Some(BoundExprKind::Column(column)) if !column.outer => Some(column.clone()),
+                    _ => None,
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(key_columns) = key_columns
+            && !key_columns.is_empty()
+        {
+            let rows = limit.offset.saturating_add(limit.count);
+            let keys = keys.clone();
+            let mut spine: &mut LogicalPlan = joined.as_mut();
+            while let LogicalPlan::Join {
+                kind: BoundJoinKind::Left,
+                left,
+                ..
+            } = spine
+            {
+                spine = left.as_mut();
+            }
+            if let LogicalPlan::Scan(scan) = spine
+                && scan.limit.is_none()
+                && let Some(ordered) = sort_scan_prefix(scan, &key_columns, &keys, rows)
+            {
+                *spine = ordered;
+            }
+        }
+    }
+    match plan {
+        LogicalPlan::CrossJoin { inputs } | LogicalPlan::UnionAll { inputs } => {
+            inputs.iter_mut().for_each(push_top_k_below_left_joins);
+        }
+        LogicalPlan::SetOp { left, right, .. } | LogicalPlan::Join { left, right, .. } => {
+            push_top_k_below_left_joins(left);
+            push_top_k_below_left_joins(right);
+        }
+        LogicalPlan::Recursive { anchor, member, .. } => {
+            push_top_k_below_left_joins(anchor);
+            push_top_k_below_left_joins(member);
+        }
+        LogicalPlan::Derived { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Limit { input, .. } => push_top_k_below_left_joins(input),
+        LogicalPlan::Empty | LogicalPlan::OneRow | LogicalPlan::Scan(_) => {}
+    }
+}
+
+/// The scan's first `rows` rows under `keys`, when every key column is one
+/// of the scan's own: a projection of the scan's columns, sorted and cut.
+fn sort_scan_prefix(
+    scan: &Scan,
+    key_columns: &[BoundColumn],
+    keys: &[BoundOrderKey],
+    rows: u64,
+) -> Option<LogicalPlan> {
+    let columns = scan
+        .projected_column_ids
+        .iter()
+        .map(|id| {
+            scan.table
+                .columns
+                .iter()
+                .find(|column| column.column_id == *id)
+                .cloned()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // Ascending on the table's own leading key columns is the order its
+    // scan already produces, which the key-order join streams without
+    // sorting anything; that plan is the better one, so it is left alone.
+    if keys.iter().all(|key| key.ascending)
+        && key_columns.len() <= scan.table.key_column_ids.len()
+        && key_columns
+            .iter()
+            .zip(&scan.table.key_column_ids)
+            .all(|(column, id)| column.column_id == *id)
+    {
+        return None;
+    }
+    let scan_key = table_key(&scan.table);
+    let keys = keys
+        .iter()
+        .zip(key_columns)
+        .map(|(key, column)| {
+            if column_table_key(column) != scan_key {
+                return None;
+            }
+            let index = columns
+                .iter()
+                .position(|candidate| candidate.column_id == column.column_id)?;
+            Some(BoundOrderKey { index, ..*key })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let expressions = columns
+        .into_iter()
+        .map(|column| BoundProjection {
+            name: column.name.clone(),
+            expr: BoundExpr {
+                data_type: Some(column.data_type),
+                nullable: column.nullable,
+                kind: BoundExprKind::Column(column),
+            },
+        })
+        .collect();
+    Some(LogicalPlan::Limit {
+        input: Box::new(LogicalPlan::Sort {
+            input: Box::new(LogicalPlan::Project {
+                input: Box::new(LogicalPlan::Scan(scan.clone())),
+                expressions,
+            }),
+            keys,
+            trim: 0,
+        }),
+        limit: BoundLimit {
+            offset: 0,
+            count: rows,
+        },
+    })
 }
 
 /// Drops the columns of a derived table that nothing above it reads, with
