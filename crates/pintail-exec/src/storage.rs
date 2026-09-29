@@ -1626,6 +1626,22 @@ fn sma_column_bounds(predicates: &[BoundExpr]) -> Vec<pintail_store::ColumnBound
         }
     }
 
+    // A DATETIME column widened to more fraction digits keeps every value
+    // exactly, so a bound on the widened reading bounds the column.
+    fn widened_datetime(expr: &BoundExpr) -> &BoundExpr {
+        if let BoundExprKind::Scalar {
+            function: ScalarFunction::Cast(pintail_types::DataType::DateTime64 { fsp: wider }),
+            args,
+        } = &expr.kind
+            && let [inner] = args.as_slice()
+            && let BoundExprKind::Column(column) = &inner.kind
+            && matches!(column.data_type, pintail_types::DataType::DateTime64 { fsp } if fsp <= *wider)
+        {
+            return inner;
+        }
+        expr
+    }
+
     let mut bounds: Vec<ColumnBounds> = Vec::new();
     let mut apply =
         |column: &pintail_sql::BoundColumn, lower: Option<i128>, upper: Option<i128>| {
@@ -1657,6 +1673,7 @@ fn sma_column_bounds(predicates: &[BoundExpr]) -> Vec<pintail_store::ColumnBound
     for predicate in predicates {
         match &predicate.kind {
             BoundExprKind::Binary { op, left, right } => {
+                let (left, right) = (widened_datetime(left), widened_datetime(right));
                 let (column, literal, op) = match (&left.kind, &right.kind) {
                     (BoundExprKind::Column(column), BoundExprKind::Literal(value)) => {
                         (column, value, *op)
