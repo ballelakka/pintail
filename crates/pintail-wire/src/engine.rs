@@ -226,14 +226,6 @@ pub enum SqlRejection {
 /// that signature.
 type SignatureMemo = (Vec<FileStamp>, u64);
 
-/// A tables directory as last listed: its modification time, when it was
-/// listed, and each entry's name, path and whether it is a directory.
-struct TableListing {
-    modified: std::time::SystemTime,
-    listed_at: std::time::SystemTime,
-    entries: Arc<[(String, PathBuf, bool)]>,
-}
-
 /// Opens reader-pinned table snapshots and runs Pintail's native SQL engine.
 #[derive(Clone)]
 pub struct ReplicaEngine {
@@ -258,9 +250,6 @@ pub struct ReplicaEngine {
     /// that follows a metadata write does not pay a store open and a
     /// migration check to learn that nothing it reads has changed.
     signature_reader: Arc<Mutex<Option<MetaStore>>>,
-    /// Per tables directory, its entries as last listed, so a stamp lists
-    /// the directory again only when the directory itself moved.
-    listings: Arc<Mutex<HashMap<PathBuf, TableListing>>>,
 }
 
 impl std::fmt::Debug for ReplicaEngine {
@@ -409,7 +398,6 @@ impl ReplicaEngine {
             cache: shared_replica_cache(),
             signatures: Arc::new(Mutex::new(HashMap::new())),
             signature_reader: Arc::new(Mutex::new(None)),
-            listings: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -478,16 +466,14 @@ impl ReplicaEngine {
         wal.push("-wal");
         record(&mut stamp.metadata.files, Path::new(&wal));
         stamp.metadata.signature = self.metadata_signature(database_id, &stamp.metadata.files);
-        let Some(entries) = self.table_entries(&self.tables_root(database_id)) else {
+        let Ok(entries) = std::fs::read_dir(self.tables_root(database_id)) else {
             return stamp;
         };
-        for (name, table, is_directory) in entries.iter().cloned() {
-            // A table no writer here has opened since the process started
-            // is leased on first sight, so it is walked once, not per query.
-            if is_directory
-                && let Some(generation) = pintail_store::published_generation(&table)
-                    .or_else(|| pintail_store::lease_unwritten_table(&table))
-            {
+        for entry in entries.filter_map(Result::ok) {
+            let table = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if is_directory && let Some(generation) = pintail_store::published_generation(&table) {
                 stamp.tables.insert(name, TableStamp::Published(generation));
                 continue;
             }
@@ -520,56 +506,6 @@ impl ReplicaEngine {
         self.cache
             .record_walk(stamp.files() - stamp.metadata.files.len());
         stamp
-    }
-
-    /// The entries of the tables directory `root`: from the last listing
-    /// when the directory has not moved since, otherwise listed afresh.
-    ///
-    /// Adding, removing or renaming an entry moves a directory's
-    /// modification time, but only at the file system's clock resolution, so
-    /// a change in the same tick as the listing could leave it unmoved. A
-    /// listing is therefore trusted only when the directory had already been
-    /// still for a second when it was taken.
-    fn table_entries(&self, root: &Path) -> Option<Arc<[(String, PathBuf, bool)]>> {
-        const SETTLED: Duration = Duration::from_secs(1);
-        let modified = std::fs::metadata(root)
-            .and_then(|meta| meta.modified())
-            .ok();
-        if let Some(modified) = modified
-            && let Ok(listings) = self.listings.lock()
-            && let Some(listing) = listings.get(root)
-            && listing.modified == modified
-            && modified
-                .checked_add(SETTLED)
-                .is_some_and(|settled| settled < listing.listed_at)
-        {
-            return Some(Arc::clone(&listing.entries));
-        }
-        let listed_at = std::time::SystemTime::now();
-        let entries: Arc<[(String, PathBuf, bool)]> = std::fs::read_dir(root)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|entry| {
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    entry.path(),
-                    entry.file_type().is_ok_and(|kind| kind.is_dir()),
-                )
-            })
-            .collect();
-        if let Some(modified) = modified
-            && let Ok(mut listings) = self.listings.lock()
-        {
-            listings.insert(
-                root.to_path_buf(),
-                TableListing {
-                    modified,
-                    listed_at,
-                    entries: Arc::clone(&entries),
-                },
-            );
-        }
-        Some(entries)
     }
 
     fn tables_root(&self, database_id: &str) -> PathBuf {
