@@ -74,6 +74,34 @@ export interface DatabaseRecord {
   updated_at: string
 }
 
+/// Where a source table stands against the catalog: `missing` is an
+/// included table the catalog has no row for, which nothing mirrors.
+export type UpstreamStatus = 'mirrored' | 'missing' | 'not-included' | 'dropped-upstream'
+
+export interface UpstreamTable {
+  name: string
+  status: UpstreamStatus
+  estimated_rows: number | null
+  rows_are_exact: boolean
+  catalog_state: string | null
+  excluded: boolean
+}
+
+export interface UpstreamTablesResponse {
+  database_id: string
+  include_all: boolean
+  probed_at: string
+  counts: { mirrored: number; missing: number; not_included: number; dropped_upstream: number }
+  tables: UpstreamTable[]
+}
+
+export interface AddUpstreamTablesResponse {
+  added_to_include: string[]
+  removed_from_exclude: string[]
+  run_id: string | null
+  state: 'snapshotting' | 'queued'
+}
+
 export interface DatabaseStatus {
   database: DatabaseRecord
   tables: number

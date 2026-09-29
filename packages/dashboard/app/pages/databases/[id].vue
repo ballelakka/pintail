@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, Check, ChevronRight, Eye, HardDrive, LoaderCircle, Pause, Play, Radio, RefreshCw, Table2, Trash2, X } from '@lucide/vue'
+import { AlertTriangle, Check, ChevronRight, Eye, HardDrive, ListTree, LoaderCircle, Pause, Play, Radio, RefreshCw, Table2, Trash2, X } from '@lucide/vue'
 import { useIntervalFn } from '@vueuse/core'
 import { displayValue, formatDate, formatNumber, messageOf, modeOf, snapshotPercent, stateTone } from '@/lib/format'
 import type { DlqRecord, QueryResponse, SnapshotStatus, TableSummary } from '@/types/pintail'
@@ -7,7 +7,7 @@ import type { DlqRecord, QueryResponse, SnapshotStatus, TableSummary } from '@/t
 const route = useRoute()
 const router = useRouter()
 const { request } = usePintailApi()
-const { databases, statuses, deadLetters, error, loading, setMode, setReconcileInterval, forceSnapshot, resetDatabase, runTableAction, removeTable, discardDlq, retryDlq, tableProgress, seedTableProgress, sessionEpoch } = useControlPlane()
+const { databases, statuses, deadLetters, error, loading, loadControlPlane, setMode, setReconcileInterval, forceSnapshot, resetDatabase, runTableAction, removeTable, discardDlq, retryDlq, tableProgress, seedTableProgress, sessionEpoch } = useControlPlane()
 
 const databaseId = computed(() => String(route.params.id))
 const database = computed(() => databases.value.find((item) => item.id === databaseId.value) ?? null)
@@ -172,6 +172,15 @@ function closeView(open: boolean) {
   }
 }
 
+/// The source's tables beside the catalog, for finding drift and adding
+/// tables the include list leaves out.
+const upstreamOpen = ref(false)
+
+async function onUpstreamAdded() {
+  detailTab.value = 'snapshot'
+  await Promise.all([loadControlPlane(), loadDatabaseDetail(false)])
+}
+
 const resetOpen = ref(false)
 const resetting = ref(false)
 
@@ -269,6 +278,7 @@ function describeTable(table: TableSummary) {
         </div>
       </div>
       <div class="flex items-center gap-2">
+        <Button variant="outline" data-testid="upstream-tables-open" title="Every table on the source and whether the mirror holds it" @click="upstreamOpen = true"><ListTree /> Upstream tables</Button>
         <Button variant="outline" @click="pauseResume">
           <Play v-if="database.mode === 'paused'" /><Pause v-else />
           {{ database.mode === 'paused' ? 'Resume' : 'Pause' }}
@@ -557,6 +567,15 @@ function describeTable(table: TableSummary) {
       </DialogFooter>
     </DialogContent>
   </Dialog>
+
+  <UpstreamTablesDialog
+    v-if="database"
+    :open="upstreamOpen"
+    :database-id="database.id"
+    :database-name="database.name"
+    @update:open="(open) => { upstreamOpen = open }"
+    @added="onUpstreamAdded"
+  />
 
   <ConfirmActionDialog
     :open="resetOpen"

@@ -35,7 +35,7 @@ const QUERY_TIMEOUT_MS = 120_000
 /// hit it, which surfaced as "Request timed out after 30s" on a probe the
 /// server went on to complete successfully. Slow here means large, not stuck.
 const SCHEMA_WALK_TIMEOUT_MS = 300_000
-const SCHEMA_WALK_ROUTES = ['/probe', '/test']
+const SCHEMA_WALK_ROUTES = ['/probe', '/test', '/upstream-tables']
 
 export interface RequestOptions extends RequestInit {
   /// Overrides the deadline for this call. Zero disables it.
