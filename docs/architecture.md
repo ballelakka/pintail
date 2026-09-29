@@ -156,6 +156,30 @@ RSS, storage, compaction debt, DLQ depth, and backup outcomes. A failed row is
 quarantined with its source location; retry performs a safe reconciliation
 before deleting the DLQ record.
 
+The include list and the table catalog are reconciled against the source.
+`GET /api/databases/{id}/upstream-tables` probes the source and lists every
+base table with its source row estimate and one status: `mirrored` (in the
+catalog), `missing` (selected by the include/exclude lists but absent from
+the catalog, so nothing mirrors it), `not-included` (left out by the lists),
+or `dropped-upstream` (in the catalog, gone from the source). It is
+read-only: the stored probe is not replaced. `POST
+/api/databases/{id}/upstream-tables` with `{"tables": [...]}` appends the
+named source tables to a non-empty include list (an empty list already
+selects everything), takes them off the exclude list, refreshes the stored
+probe, and starts a non-forced snapshot, which on a live database copies
+only the selected tables the catalog lacks. It answers `202` with the run ID,
+or with `"state": "queued"` and no run ID when the job slot stays busy. The
+supervisor's automatic repair then starts the copy. Both routes need operator
+access, refuse local databases, and the POST is audit-logged as
+`database.upstream_tables.add`. After each cycle on a database that has
+handed off to replication, the supervisor compares the stored probe with the
+catalog. When selected tables are missing, it publishes `catalog.drift` with
+their count and starts the same non-forced snapshot (`catalog.repair`, or
+`catalog.repair_failed`), at most once every ten minutes per database.
+Tables created mid-stream never reach this path, because the stream's DDL
+adoption records them in the catalog and the probe together.
+`pintail_catalog_missing_tables{database}` exports the count.
+
 Backups pin manifests, upload checksum-addressed immutable segments, reuse
 objects across incremental generations, and publish the portable manifest
 last. Restore verifies SHA-256 checksums and creates a new detached database;
