@@ -406,7 +406,11 @@ mod tests {
         let lock_path = directory.join(WRITER_LOCK_FILE);
         let held = File::create(&lock_path).expect("lock file");
         fs2::FileExt::try_lock_exclusive(&held).expect("held elsewhere");
-        assert_eq!(lease_unwritten(directory), None, "a held lock is not leased");
+        assert_eq!(
+            lease_unwritten(directory),
+            None,
+            "a held lock is not leased"
+        );
         fs2::FileExt::unlock(&held).expect("release");
 
         let leased = lease_unwritten(directory).expect("leased");
@@ -417,7 +421,10 @@ mod tests {
             "the lease holds the table's lock"
         );
         let writer = Publisher::claim(directory, &lock_path, || {
-            Err(StoreError::io("lock", std::io::ErrorKind::WouldBlock.into()))
+            Err(StoreError::io(
+                "lock",
+                std::io::ErrorKind::WouldBlock.into(),
+            ))
         })
         .expect("the writer adopts the lease");
         assert_eq!(published_generation(directory), Some(leased));

@@ -62,10 +62,10 @@ fn run(sql: &str) -> Vec<String> {
     .expect("entry")
     .with_key_columns([1])
     .expect("key");
-    let catalog =
-        CatalogSnapshot::new([DatabaseEntry::new(DatabaseId::new(1), "app", [entry])
-            .expect("database")])
-        .expect("catalog");
+    let catalog = CatalogSnapshot::new([
+        DatabaseEntry::new(DatabaseId::new(1), "app", [entry]).expect("database")
+    ])
+    .expect("catalog");
     let snapshot = table.snapshot();
     let provider = SnapshotScanProvider::new([(DatabaseId::new(1), TableId::new(1), &snapshot)])
         .expect("provider");
@@ -130,8 +130,10 @@ fn a_calendar_part_beside_an_hour_groups_on_the_general_path() {
     // September 1st 2026 is a Tuesday: DAYOFWEEK counts Sunday as 1.
     let day_of_week = |day: u64| (day + 1) % 7 + 1;
     assert_eq!(
-        run("SELECT DAYOFWEEK(at) AS dw, HOUR(at) AS h, COUNT(*) FROM events \
-             GROUP BY dw, h ORDER BY dw, h"),
+        run(
+            "SELECT DAYOFWEEK(at) AS dw, HOUR(at) AS h, COUNT(*) FROM events \
+             GROUP BY dw, h ORDER BY dw, h"
+        ),
         expected(|day, hour| (day_of_week(day), hour)),
     );
 }

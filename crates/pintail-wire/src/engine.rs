@@ -532,7 +532,9 @@ impl ReplicaEngine {
     /// still for a second when it was taken.
     fn table_entries(&self, root: &Path) -> Option<Arc<[(String, PathBuf, bool)]>> {
         const SETTLED: Duration = Duration::from_secs(1);
-        let modified = std::fs::metadata(root).and_then(|meta| meta.modified()).ok();
+        let modified = std::fs::metadata(root)
+            .and_then(|meta| meta.modified())
+            .ok();
         if let Some(modified) = modified
             && let Ok(listings) = self.listings.lock()
             && let Some(listing) = listings.get(root)
