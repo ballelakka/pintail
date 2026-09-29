@@ -978,6 +978,20 @@ struct PrewhereSpec {
     /// scan trusts a prefiltered chunk only when it compares text the same
     /// way.
     collation: Collation,
+    /// Whether `predicates` are all of the scan's predicates. A spec that
+    /// left some out (a wide column's test, deferred until the narrow ones
+    /// have chosen rows) never marks a chunk as passing them all.
+    complete: bool,
+}
+
+/// Column types whose values are wide enough that decoding them for every
+/// row costs more than the narrow predicates beside them: a test on one of
+/// these waits until the narrow tests have chosen rows.
+fn is_wide_prewhere_type(data_type: pintail_types::DataType) -> bool {
+    matches!(
+        data_type,
+        pintail_types::DataType::Json | pintail_types::DataType::Binary
+    )
 }
 
 struct SnapshotStream {
@@ -1631,6 +1645,38 @@ fn projected_columns_retained_bytes(outer_capacity: usize, columns: &[DecodedCol
         .saturating_add(columns.iter().map(DecodedColumn::retained_bytes).sum())
 }
 
+/// The predicates that choose a scan's rows first, and whether they are all
+/// of them. A test on a wide column (a JSON document, say, tested only for
+/// NULL) decoded that column for every row of the table before the narrow
+/// tests beside it had rejected almost all of them. Those tests choose the
+/// rows alone; the wide one runs in the Filter above, over the rows they
+/// kept, whose wide values are decoded for the output anyway.
+fn narrow_first_predicates<'a>(
+    scan: &'a Scan,
+    snapshot: &TableSnapshot,
+) -> (Vec<&'a BoundExpr>, bool) {
+    let column_type = |id: u32| {
+        snapshot
+            .schema()
+            .columns()
+            .iter()
+            .find(|column| column.id() == id)
+            .map(pintail_types::Column::data_type)
+    };
+    let (narrow, wide): (Vec<&BoundExpr>, Vec<&BoundExpr>) =
+        scan.predicates.iter().partition(|predicate| {
+            let mut ids = Vec::new();
+            collect_predicate_columns(predicate, &mut ids);
+            !ids.iter()
+                .any(|id| column_type(*id).is_some_and(is_wide_prewhere_type))
+        });
+    if narrow.is_empty() || wide.is_empty() {
+        (scan.predicates.iter().collect(), true)
+    } else {
+        (narrow, false)
+    }
+}
+
 /// Builds the filter-first spec for a scan: every predicate must reference
 /// only projected columns and compile against the predicate-subset layout.
 fn build_prewhere_spec(
@@ -1641,8 +1687,9 @@ fn build_prewhere_spec(
     if scan.predicates.is_empty() {
         return None;
     }
+    let (chosen, complete) = narrow_first_predicates(scan, snapshot);
     let mut predicate_ids = Vec::new();
-    for predicate in &scan.predicates {
+    for predicate in &chosen {
         collect_predicate_columns(predicate, &mut predicate_ids);
     }
     predicate_ids.sort_unstable();
@@ -1659,9 +1706,9 @@ fn build_prewhere_spec(
     // the table, and compiling matches that name: a layout under the bare
     // table name failed to compile for every aliased table, and the scan
     // silently decoded every projected column of every row.
-    let relation_name = scan
-        .predicates
+    let relation_name = chosen
         .iter()
+        .copied()
         .find_map(predicate_relation_name)
         .unwrap_or_else(|| scan.table.table_name.clone());
     let mut layout = Vec::with_capacity(predicate_ids.len());
@@ -1714,8 +1761,7 @@ fn build_prewhere_spec(
     if predicate_ids.len() >= scan.projected_column_ids.len() && !exact_ranges {
         return None;
     }
-    let predicates = scan
-        .predicates
+    let predicates = chosen
         .iter()
         .map(|predicate| crate::expression::CompiledExpr::compile(predicate, &layout, collation))
         .collect::<Result<Vec<_>, _>>()
@@ -1727,6 +1773,7 @@ fn build_prewhere_spec(
         enum_labels,
         set_members,
         collation,
+        complete,
     })
 }
 
@@ -1956,7 +2003,7 @@ fn prewhere_ranges(
     }
     Ok(Some(pintail_store::PrewhereRanges {
         ranges,
-        exact: !coalesced,
+        exact: !coalesced && spec.complete,
     }))
 }
 
