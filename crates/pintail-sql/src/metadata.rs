@@ -685,7 +685,12 @@ fn information_columns(catalog: &CatalogSnapshot, facts: &SourceFacts) -> Metada
                         fact.and_then(|fact| fact.character_set.as_deref()),
                     ))
                 });
-                let key = column_key(table, column.id(), fact);
+                let key = column_key(
+                    table,
+                    column.id(),
+                    fact,
+                    leading_index_column(facts, database.name(), table.name(), column.name()),
+                );
                 let extra = fact.map_or("", |fact| {
                     if !fact.extra.is_empty() {
                         return fact.extra.as_str();
@@ -795,10 +800,25 @@ fn same_columns(left: &[String], right: &[String]) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
+/// Whether the column leads a source index that is not a single-column
+/// unique one: `MySQL` reports those columns as `MUL`.
+fn leading_index_column(facts: &SourceFacts, database: &str, table: &str, column: &str) -> bool {
+    facts.indexes.iter().any(|index| {
+        index.database.eq_ignore_ascii_case(database)
+            && index.table.eq_ignore_ascii_case(table)
+            && (!index.unique || index.columns.len() > 1)
+            && index
+                .columns
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case(column))
+    })
+}
+
 fn column_key(
     table: &pintail_catalog::TableEntry,
     column_id: u32,
     fact: Option<&ColumnFacts>,
+    leads_index: bool,
 ) -> &'static str {
     if table.key_column_ids().contains(&column_id) {
         return match table.schema().key_mode() {
@@ -810,6 +830,8 @@ fn column_key(
     }
     if fact.is_some_and(|fact| fact.unique_single) {
         "UNI"
+    } else if leads_index {
+        "MUL"
     } else {
         ""
     }
@@ -2231,7 +2253,12 @@ fn describe_table(
         .iter()
         .map(|column| {
             let fact = column_fact(database.name(), table.name(), column.name(), facts);
-            let key = column_key(table, column.id(), fact);
+            let key = column_key(
+                table,
+                column.id(),
+                fact,
+                leading_index_column(facts, database.name(), table.name(), column.name()),
+            );
             let extra = fact.map_or("", |fact| {
                 if !fact.extra.is_empty() {
                     return fact.extra.as_str();
@@ -2854,6 +2881,21 @@ mod tests {
         assert_eq!(columns.rows[0][5], Value::Utf8("auto_increment".to_owned()));
         assert_eq!(columns.rows[1][2], Value::Utf8("NO".to_owned()));
         assert_eq!(columns.rows[1][3], Value::Utf8("UNI".to_owned()));
+
+        // A column that only leads a non-unique index reads MUL, as it does
+        // on the source.
+        let mut indexed_facts = facts.clone();
+        indexed_facts.columns[1].unique_single = false;
+        indexed_facts.indexes.retain(|index| !index.unique);
+        let columns = execute_metadata(
+            &parse_statement("SHOW COLUMNS FROM Analytics.Events").expect("parse"),
+            &catalog,
+            None,
+            &indexed_facts,
+        )
+        .expect("show indexed columns");
+        assert_eq!(columns.rows[0][3], Value::Utf8("PRI".to_owned()));
+        assert_eq!(columns.rows[1][3], Value::Utf8("MUL".to_owned()));
 
         let mut default_facts = facts.clone();
         default_facts.columns[1].default_value = Some("CURRENT_TIMESTAMP".to_owned());
