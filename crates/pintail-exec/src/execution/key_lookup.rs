@@ -36,6 +36,10 @@ const RANGE_GAP: i128 = 256;
 /// rather than piecemeal.
 const MAX_RANGES: usize = 4;
 
+/// Driving rows a join about to read its whole lookup table pulls ahead,
+/// to learn whether it knows every key it will look up.
+const KNOWN_KEYS_ROWS: usize = 8_192;
+
 /// Lookup rows the join may read by range before reading the whole table
 /// once is the cheaper plan, when the table's size is unknown.
 const UNKNOWN_TABLE_ROWS: u64 = 1 << 20;
@@ -468,9 +472,24 @@ impl KeyLookupJoin {
             let mut keys = slice.iter().filter_map(|(key, _)| *key).collect::<Vec<_>>();
             keys.sort_unstable();
             keys.dedup();
-            let found = self
-                .lookup
-                .find(&keys, self.lookup_position, memory, self.collation)?;
+            // About to read the whole table for scattered keys: a driving
+            // input that ends within a few more rows names every key the
+            // join will ever look up, and the read keeps only those.
+            let known = if self.lookup.reads_all(&keys) {
+                self.fill_known(memory)?;
+                self.driving_done.then(|| {
+                    let mut known = keys.clone();
+                    known.extend(self.pending.iter().filter_map(|(key, _)| *key));
+                    known.sort_unstable();
+                    known.dedup();
+                    known
+                })
+            } else {
+                None
+            };
+            let found =
+                self.lookup
+                    .find(&keys, known, self.lookup_position, memory, self.collation)?;
             let shape = Shape {
                 kind: self.kind,
                 driving_left: self.driving_left,
@@ -487,6 +506,16 @@ impl KeyLookupJoin {
             let columns = rows_to_columns(&rows, &self.column_types)?;
             return Ok(Some(RecordBatch::new(rows.len(), columns)?));
         }
+    }
+
+    /// Pulls driving batches until the input ends or [`KNOWN_KEYS_ROWS`]
+    /// rows are pending.
+    fn fill_known(&mut self, memory: &MemoryTracker) -> Result<(), ExecError> {
+        let slice = self.slice;
+        self.slice = KNOWN_KEYS_ROWS;
+        let filled = self.fill(memory);
+        self.slice = slice;
+        filled
     }
 
     /// Pulls driving batches until the next round's rows are pending or the
@@ -558,9 +587,19 @@ impl Found<'_> {
 }
 
 impl Lookup {
+    /// Whether finding `keys` reads the whole table rather than its ranges.
+    fn reads_all(&self, keys: &[i128]) -> bool {
+        matches!(self, Self::Ranged(ranged)
+            if !(ranged.read <= ranged.budget
+                && key_ranges(keys, ranged.unsigned).len() <= MAX_RANGES))
+    }
+
+    /// `known`, when given, is every key the join will look up: a whole
+    /// read of the table then decodes only the rows those keys name.
     fn find(
         &mut self,
         keys: &[i128],
+        known: Option<Vec<i128>>,
         position: usize,
         memory: &MemoryTracker,
         collation: Collation,
@@ -574,7 +613,14 @@ impl Lookup {
             }
             // Scattered keys, or ranged reads that have cost a full read of
             // the table already: read it once and answer from that.
-            let input = ranged.read_all(memory, collation)?;
+            let mut input = ranged.read_all(memory, collation)?;
+            // Membership alone: narrowing this read's key range as well
+            // measured thirty times slower on a table of scattered keys.
+            if let Some(known) = known {
+                let member: super::IntegerMembership =
+                    std::sync::Arc::new(move |value| known.binary_search(&value).is_ok());
+                input.restrict_scan_membership(position, &member);
+            }
             *self = Self::Built {
                 input: Some(Box::new(input)),
                 rows: Matches::new(),
