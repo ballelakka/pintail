@@ -145,6 +145,47 @@ pub(crate) fn record_statement_warning(warning: ConversionWarning) {
     });
 }
 
+/// The warnings one piece of work raised on a pool thread. The statement's
+/// diagnostics live on the thread that runs it, so work handed to the pool
+/// carries what it raised back for [`WorkerWarnings::replay`] to record.
+#[derive(Default)]
+pub(crate) struct WorkerWarnings {
+    conversions: (Vec<ConversionWarning>, u64),
+    divisions: u64,
+}
+
+impl WorkerWarnings {
+    /// Runs `work` on this pool thread and keeps the warnings it raised,
+    /// dropping any a previous piece of work left behind on the thread.
+    pub(crate) fn capture<T>(work: impl FnOnce() -> T) -> (T, Self) {
+        let _ = take_session_conversion_warnings();
+        let _ = take_session_division_warnings();
+        let output = work();
+        let warnings = Self {
+            conversions: take_session_conversion_warnings(),
+            divisions: take_session_division_warnings(),
+        };
+        (output, warnings)
+    }
+
+    /// Records the carried warnings on the statement's thread, in the order
+    /// the calls come.
+    pub(crate) fn replay(self) {
+        let (messages, count) = self.conversions;
+        let kept = messages.len() as u64;
+        for warning in messages {
+            record_statement_warning(warning);
+        }
+        if count > kept {
+            SESSION_CONVERSION_WARNINGS.with(|warnings| {
+                let mut warnings = warnings.borrow_mut();
+                warnings.1 = warnings.1.saturating_add(count - kept);
+            });
+        }
+        note_divisions_by_zero(self.divisions);
+    }
+}
+
 /// Takes conversion warning messages and their total count for this statement.
 #[must_use]
 pub fn take_session_conversion_warnings() -> (Vec<ConversionWarning>, u64) {

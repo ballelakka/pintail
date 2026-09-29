@@ -12,9 +12,11 @@ use pintail_types::{DataType, Value};
 
 use crate::collation::Collation;
 
+use rayon::prelude::*;
+
 use super::{
     ExecError, HASH_ENTRY_OVERHEAD, JoinKeyMode, KeyForm, MemoryTracker, PullOperator,
-    ScanProvider, batch_row, compare_sort_values, estimated_batch_row_bytes,
+    ScanProvider, WorkerWarnings, batch_row, compare_sort_values, estimated_batch_row_bytes,
     estimated_record_batch_bytes, estimated_row_payload_bytes, reserve_hash_map_entries,
     reserve_vec_elements, resolve_dependent_expr_subqueries, rows_to_columns,
 };
@@ -596,6 +598,14 @@ pub(super) struct HashJoinState {
     /// Probe batches read ahead of the build, each with the bytes it holds
     /// against the ceiling; served before the probe input is pulled again.
     prefetched: VecDeque<(RecordBatch, usize)>,
+    /// Output batches probed ahead on the pool, in probe order, each with
+    /// the bytes it holds against the ceiling; served before anything else.
+    ready: VecDeque<(RecordBatch, usize)>,
+    /// Probe batches read so far, so a join stopped early by a LIMIT does
+    /// not first probe a pool-wide round of batches it never needed.
+    probe_batches: usize,
+    /// Whether a round read the probe side to its end.
+    probe_done: bool,
     /// Bytes the build-side key filter's set holds, released once the
     /// probe is exhausted.
     filter_reserved: usize,
@@ -709,6 +719,9 @@ impl HashJoinState {
             grace.partition_reserved = 0;
         }
         for (_, bytes) in self.prefetched.drain(..) {
+            memory.release(bytes);
+        }
+        for (_, bytes) in self.ready.drain(..) {
             memory.release(bytes);
         }
     }
@@ -1044,6 +1057,9 @@ pub(super) fn build_hash_join_state(
         left_key: None,
         left_reserved: 0,
         prefetched: VecDeque::new(),
+        ready: VecDeque::new(),
+        probe_batches: 0,
+        probe_done: false,
         filter_reserved: 0,
         build_reserved,
     })
@@ -1938,6 +1954,16 @@ pub(super) fn next_hash_join_batch(
         right_width,
         column_types,
     };
+    let paired_residual = match residual {
+        Some(_) if matches!(kind, BoundJoinKind::Semi | BoundJoinKind::Anti) => None,
+        Some(residual) => Some(Some((residual, residual_columns))),
+        None => Some(None),
+    };
+    if let Some(residual) = paired_residual
+        && let Pooled::Served(output) = next_parallel_probe(left, &probe, residual, state, memory)?
+    {
+        return Ok(output);
+    }
     match residual {
         None => next_hash_join_columns(left, &probe, state, memory),
         Some(residual) if matches!(kind, BoundJoinKind::Semi | BoundJoinKind::Anti) => {
@@ -2158,8 +2184,165 @@ fn load_probe_batch(
     let batch_bytes = batch.estimated_bytes();
     memory.reserve(batch_bytes)?;
     state.batch_reserved = batch_bytes;
+    state.probe_batches += 1;
     state.batch = Some(batch);
     Ok(true)
+}
+
+/// Probe batches a join reads one at a time before it probes a round of
+/// them on the pool.
+const SERIAL_PROBE_BATCHES: usize = 2;
+
+/// Room the ceiling must have left before a round is probed on the pool:
+/// the round's whole output is held at once, where the serial probe holds
+/// one output batch.
+const PARALLEL_PROBE_HEADROOM: usize = 64 << 20;
+
+/// What a pool round did with a call.
+enum Pooled {
+    /// The call is answered: an output batch, or `None` once the probe is done.
+    Served(Option<RecordBatch>),
+    /// The serial probe takes this call.
+    Serial,
+}
+
+/// Serves a resident join from probe batches probed a round at a time on
+/// the pool.
+///
+/// The serial probe runs one probe batch at a time on the statement's
+/// thread, so a chain of joins that fans out below an aggregate spent its
+/// whole run on one core while the aggregate above waited for it. The build
+/// is resident and nothing writes it once probing starts, so a probe
+/// batch's output depends on that batch alone: a round reads as many batches
+/// as the pool has threads, probes each on its own worker exactly as the
+/// serial probe would, and queues the outputs in probe order. The rows, and
+/// their order, are the serial probe's; warnings raised on a worker are
+/// recorded on the statement's thread in that order too.
+///
+/// [`Pooled::Serial`] hands the call back to the serial probe: a batch is part way
+/// through, the join has not read enough yet to be worth a round, the pool
+/// has one thread, or the ceiling is close.
+fn next_parallel_probe(
+    left: &mut PullOperator,
+    probe: &Probe<'_>,
+    residual: Option<(&CompiledExpr, &[BoundColumn])>,
+    state: &mut HashJoinState,
+    memory: &MemoryTracker,
+) -> Result<Pooled, ExecError> {
+    if let Some((output, bytes)) = state.ready.pop_front() {
+        memory.release(bytes);
+        return Ok(Pooled::Served(Some(output)));
+    }
+    if state.probe_done {
+        return Ok(Pooled::Served(None));
+    }
+    let width = rayon::current_num_threads();
+    let idle = state
+        .batch
+        .as_ref()
+        .is_none_or(|batch| state.row >= batch.row_count());
+    if !idle
+        || width < 2
+        || state.probe_batches < SERIAL_PROBE_BATCHES
+        || memory.remaining() < PARALLEL_PROBE_HEADROOM
+    {
+        return Ok(Pooled::Serial);
+    }
+    state.clear_batch(memory);
+    loop {
+        let mut round = Vec::with_capacity(width);
+        let mut round_bytes = 0_usize;
+        while round.len() < width {
+            let next = match state.prefetched.pop_front() {
+                Some((batch, bytes)) => {
+                    memory.release(bytes);
+                    Some(batch)
+                }
+                None => left.next_batch(memory)?,
+            };
+            let Some(batch) = next else {
+                state.probe_done = true;
+                break;
+            };
+            let bytes = batch.estimated_bytes();
+            if !round.is_empty() && memory.reserve(bytes).is_err() {
+                // The round is as large as the ceiling allows; this batch
+                // opens the next one.
+                state.prefetched.push_front((batch, 0));
+                break;
+            }
+            if round.is_empty() {
+                memory.reserve(bytes)?;
+            }
+            round_bytes = round_bytes.saturating_add(bytes);
+            state.probe_batches += 1;
+            round.push(batch);
+        }
+        let build = &state.build;
+        let probed = round
+            .par_iter()
+            .map(|batch| {
+                WorkerWarnings::capture(|| probe_whole_batch(probe, build, batch, residual, memory))
+            })
+            .collect::<Vec<_>>();
+        memory.release(round_bytes);
+        for (outputs, warnings) in probed {
+            warnings.replay();
+            for output in outputs? {
+                // Charged while it waits where the ceiling has room. Each output
+                // already passed the check the serial probe makes of its one
+                // output, so a round never fails a query the serial probe answers.
+                let bytes = output.estimated_bytes();
+                let held = if memory.reserve(bytes).is_ok() {
+                    bytes
+                } else {
+                    0
+                };
+                state.ready.push_back((output, held));
+            }
+        }
+        if let Some((output, bytes)) = state.ready.pop_front() {
+            memory.release(bytes);
+            return Ok(Pooled::Served(Some(output)));
+        }
+        if state.probe_done {
+            memory.release(state.filter_reserved);
+            state.filter_reserved = 0;
+            return Ok(Pooled::Served(None));
+        }
+        // A round whose rows all found nothing reads the next one.
+    }
+}
+
+/// Every output batch of one probe batch, in the order the serial probe
+/// emits them.
+fn probe_whole_batch(
+    probe: &Probe<'_>,
+    build: &PartitionedBuild,
+    batch: &RecordBatch,
+    residual: Option<(&CompiledExpr, &[BoundColumn])>,
+    memory: &MemoryTracker,
+) -> Result<Vec<RecordBatch>, ExecError> {
+    let (mut row, mut match_index) = (0, 0);
+    let mut outputs = Vec::new();
+    loop {
+        let next = match residual {
+            None => probe_columns_chunk(probe, build, batch, &mut row, &mut match_index, memory)?,
+            Some((residual, residual_columns)) => probe_residual_chunk(
+                probe,
+                build,
+                batch,
+                &mut row,
+                residual,
+                residual_columns,
+                memory,
+            )?,
+        };
+        match next {
+            Some(output) => outputs.push(output),
+            None => return Ok(outputs),
+        }
+    }
 }
 
 /// A resident join with no residual, probed a batch at a time.
@@ -2175,7 +2358,6 @@ fn next_hash_join_columns(
     state: &mut HashJoinState,
     memory: &MemoryTracker,
 ) -> Result<Option<RecordBatch>, ExecError> {
-    let kind = probe.kind;
     loop {
         let exhausted = state
             .batch
@@ -2185,21 +2367,50 @@ fn next_hash_join_columns(
             return Ok(None);
         }
         let batch = state.batch.as_ref().expect("probe batch loaded");
-        let mut picks = Picks::new(&state.build, batch, SPILL_SERVE_BATCH_ROWS);
-        while state.row < batch.row_count() && picks.probe_rows.len() < SPILL_SERVE_BATCH_ROWS {
+        if let Some(output) = probe_columns_chunk(
+            probe,
+            &state.build,
+            batch,
+            &mut state.row,
+            &mut state.match_index,
+            memory,
+        )? {
+            return Ok(Some(output));
+        }
+    }
+}
+
+/// The next output batch of one probe batch through a join without a
+/// residual, from probe row `*row` and its bucket's `*match_index` on;
+/// `None` once the batch is done.
+fn probe_columns_chunk(
+    probe: &Probe<'_>,
+    build: &PartitionedBuild,
+    batch: &RecordBatch,
+    row: &mut usize,
+    match_index: &mut usize,
+    memory: &MemoryTracker,
+) -> Result<Option<RecordBatch>, ExecError> {
+    let kind = probe.kind;
+    loop {
+        if *row >= batch.row_count() {
+            return Ok(None);
+        }
+        let mut picks = Picks::new(build, batch, SPILL_SERVE_BATCH_ROWS);
+        while *row < batch.row_count() && picks.probe_rows.len() < SPILL_SERVE_BATCH_ROWS {
             // Turning the picked rows into columns needs about as much again,
             // so under a tight ceiling the batch is cut where that still fits.
             if !picks.probe_rows.is_empty() && picks.bytes.saturating_mul(2) > memory.remaining() {
                 break;
             }
-            let row = state.row;
-            if !batch.selection().is_selected(row) {
-                state.row += 1;
+            let current = *row;
+            if !batch.selection().is_selected(current) {
+                *row += 1;
                 continue;
             }
-            let key = probe.key(batch, row)?;
-            let matches = key.as_ref().and_then(|key| state.build.get(key));
-            let probe_row = probe_row_index(row)?;
+            let key = probe.key(batch, current)?;
+            let matches = key.as_ref().and_then(|key| build.get(key));
+            let probe_row = probe_row_index(current)?;
             let room = SPILL_SERVE_BATCH_ROWS - picks.probe_rows.len();
             match (kind, matches) {
                 (BoundJoinKind::Scalar, Some(rows)) if rows.len() > 1 => {
@@ -2211,12 +2422,12 @@ fn next_hash_join_columns(
                 ) => {
                     // A bucket larger than what is left of the batch resumes
                     // at `match_index` on the next call.
-                    let end = rows.len().min(state.match_index + room);
-                    for build_row in &rows[state.match_index..end] {
+                    let end = rows.len().min(*match_index + room);
+                    for build_row in &rows[*match_index..end] {
                         picks.push(probe_row, Some(*build_row));
                     }
-                    state.match_index = end;
-                    if state.match_index < rows.len() {
+                    *match_index = end;
+                    if *match_index < rows.len() {
                         break;
                     }
                 }
@@ -2229,8 +2440,8 @@ fn next_hash_join_columns(
                     ));
                 }
             }
-            state.match_index = 0;
-            state.row += 1;
+            *match_index = 0;
+            *row += 1;
         }
         if picks.probe_rows.is_empty() {
             continue;
@@ -2266,7 +2477,6 @@ fn next_hash_join_residual_columns(
     state: &mut HashJoinState,
     memory: &MemoryTracker,
 ) -> Result<Option<RecordBatch>, ExecError> {
-    let left_width = residual_columns.len().saturating_sub(probe.right_width);
     loop {
         let exhausted = state
             .batch
@@ -2276,17 +2486,47 @@ fn next_hash_join_residual_columns(
             return Ok(None);
         }
         let batch = state.batch.as_ref().expect("probe batch loaded");
-        let mut candidates = Picks::new(&state.build, batch, SPILL_SERVE_BATCH_ROWS);
+        if let Some(output) = probe_residual_chunk(
+            probe,
+            &state.build,
+            batch,
+            &mut state.row,
+            residual,
+            residual_columns,
+            memory,
+        )? {
+            return Ok(Some(output));
+        }
+    }
+}
+
+/// The next output batch of one probe batch through a join with a
+/// residual, from probe row `*row` on; `None` once the batch is done.
+fn probe_residual_chunk(
+    probe: &Probe<'_>,
+    build: &PartitionedBuild,
+    batch: &RecordBatch,
+    row: &mut usize,
+    residual: &CompiledExpr,
+    residual_columns: &[BoundColumn],
+    memory: &MemoryTracker,
+) -> Result<Option<RecordBatch>, ExecError> {
+    let left_width = residual_columns.len().saturating_sub(probe.right_width);
+    loop {
+        if *row >= batch.row_count() {
+            return Ok(None);
+        }
+        let mut candidates = Picks::new(build, batch, SPILL_SERVE_BATCH_ROWS);
         // Each probe row with the span of `candidates` its bucket filled.
         let mut groups = Vec::new();
-        while state.row < batch.row_count() {
-            let row = state.row;
-            if !batch.selection().is_selected(row) {
-                state.row += 1;
+        while *row < batch.row_count() {
+            let current = *row;
+            if !batch.selection().is_selected(current) {
+                *row += 1;
                 continue;
             }
-            let key = probe.key(batch, row)?;
-            let bucket = key.as_ref().and_then(|key| state.build.get(key));
+            let key = probe.key(batch, current)?;
+            let bucket = key.as_ref().and_then(|key| build.get(key));
             let size = bucket.map_or(0, Vec::len);
             // A probe row keeps its bucket whole; a chunk holds at least one.
             if !groups.is_empty()
@@ -2295,13 +2535,13 @@ fn next_hash_join_residual_columns(
             {
                 break;
             }
-            let probe_row = probe_row_index(row)?;
+            let probe_row = probe_row_index(current)?;
             let start = candidates.probe_rows.len();
             for build_row in bucket.into_iter().flatten() {
                 candidates.push(probe_row, Some(*build_row));
             }
             groups.push((probe_row, start..candidates.probe_rows.len()));
-            state.row += 1;
+            *row += 1;
         }
         if groups.is_empty() {
             continue;
@@ -3739,6 +3979,9 @@ mod tests {
             left_key: None,
             left_reserved: 0,
             prefetched: VecDeque::new(),
+            ready: VecDeque::new(),
+            probe_batches: 0,
+            probe_done: false,
             filter_reserved: 0,
             build_reserved: 0,
         };
@@ -3790,6 +4033,9 @@ mod tests {
             left_key: None,
             left_reserved: 0,
             prefetched: VecDeque::new(),
+            ready: VecDeque::new(),
+            probe_batches: 0,
+            probe_done: false,
             filter_reserved: 0,
             build_reserved: 0,
         };

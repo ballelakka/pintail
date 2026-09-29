@@ -36,6 +36,7 @@ mod join_frees_its_build;
 mod join_group_fold_oracle_shape;
 mod join_key_value_cost;
 mod join_order;
+mod join_probe_rounds;
 mod json_bin_collation;
 mod key_lookup_join;
 mod key_order_scan;
