@@ -3,7 +3,7 @@ use pintail_catalog::CatalogSnapshot;
 use pintail_protocol::{Column, ColumnFlags, ColumnType};
 use pintail_sql::{
     AggregateFunction, BinaryOp, BoundAggregate, BoundExpr, BoundExprKind, BoundJoinKind,
-    BoundQuery, DatePart, ScalarFunction, SourceFacts, WindowFunction,
+    BoundQuery, DatePart, ScalarFunction, SourceFacts, SpatialFunction, WindowFunction,
 };
 use pintail_types::{DataType, Value};
 
@@ -589,6 +589,20 @@ fn expression(
                 }
                 ScalarFunction::Md5 => column.column_length = 128,
                 ScalarFunction::Sha1 => column.column_length = 160,
+                ScalarFunction::Spatial(spatial) => match spatial {
+                    SpatialFunction::AsText => {
+                        column.coltype = ColumnType::MysqlTypeLongBlob;
+                        column.column_length = 256 * 1024 * 1024;
+                    }
+                    SpatialFunction::GeometryType => column.column_length = 60,
+                    // MySQL declares the SRID signed and ten digits wide.
+                    SpatialFunction::Srid => {
+                        column.column_length = 10;
+                        column.colflags.set(ColumnFlags::UNSIGNED_FLAG, false);
+                    }
+                    _ if spatial.result_type() == DataType::Float64 => column.column_length = 23,
+                    _ => {}
+                },
                 ScalarFunction::Coalesce
                 | ScalarFunction::NullIf
                 | ScalarFunction::Greatest { .. }
