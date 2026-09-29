@@ -3547,6 +3547,19 @@ fn build_buffered_hash_aggregate(
         let mut batches = Vec::with_capacity(round);
         let mut batch_reserved = 0_usize;
         let mut selected_rows = 0_usize;
+        // What the query already holds when the round opens - the map, and
+        // whatever the operators below keep, such as a join's resident
+        // build - is not this round's to spend.
+        let held_before = memory.used();
+        let room = memory.limit().saturating_sub(held_before);
+        // The share of the ceiling the aggregate's own state can use: the
+        // ceiling less what the operators below hold. The spill and wave
+        // thresholds are fractions of it - as fractions of the whole
+        // ceiling they spilled this map at every round once a join below
+        // held three quarters, freeing almost nothing each time.
+        let outside = held_before.saturating_sub(groups_reserved);
+        let own_limit = memory.limit().saturating_sub(outside);
+        let pressed = |used: usize| used.saturating_sub(outside) > own_limit.saturating_mul(3) / 4;
         while batches.len() < round {
             let batch = if let Some(batch) = first_batch.take() {
                 Some(batch)
@@ -3582,11 +3595,14 @@ fn build_buffered_hash_aggregate(
             // Tight ceilings cap the round instead of reserving a
             // conservative upper bound larger than the whole budget; the
             // default ceiling keeps full 8-batch rounds. The round also
-            // stops once its batches hold half the ceiling: gathering to
-            // the brim left the first group nothing to reserve against,
-            // and an empty map has nothing to spill for it.
-            if selected_rows.saturating_mul(per_row_upper) > memory.limit() / 4
-                || memory.used() > memory.limit() / 2
+            // stops once it has taken half the room it opened with:
+            // gathering to the brim left the first group nothing to reserve
+            // against, and an empty map has nothing to spill for it. Room,
+            // not the ceiling: measured against the ceiling, a query whose
+            // joins below hold half of it cut every round to one batch, and
+            // the aggregate ran one morsel at a time on a pool of eight.
+            if selected_rows.saturating_mul(per_row_upper) > room / 4
+                || memory.used().saturating_sub(held_before) > room / 2
             {
                 break;
             }
@@ -3617,7 +3633,7 @@ fn build_buffered_hash_aggregate(
             // Never below a thousand rows' worth, so a ceiling the scan has
             // mostly filled still moves the query forward in real steps;
             // `reserve_or_spill_groups` spills the map to fit that.
-            let wave_budget = match (memory.limit() / 2).saturating_sub(memory.used()) {
+            let wave_budget = match (outside + own_limit / 2).saturating_sub(memory.used()) {
                 0 => memory.remaining() / 4,
                 headroom => headroom,
             }
@@ -3682,7 +3698,7 @@ fn build_buffered_hash_aggregate(
             // ceiling is close, and if the build still runs out while the map
             // holds groups, spill, hand back what the failed build took, and
             // build once more.
-            if memory.used() > memory.limit().saturating_mul(3) / 4 && !groups.is_empty() {
+            if pressed(memory.used()) && !groups.is_empty() {
                 spill_runs.push(write_aggregate_spill_run(&mut groups, memory)?);
                 memory.release(groups_reserved);
                 groups_reserved = 0;
@@ -3740,9 +3756,7 @@ fn build_buffered_hash_aggregate(
                         // path, which is why this query failed where it should
                         // have spilled once anything else held a large share of
                         // the budget.
-                        if memory.used() > memory.limit().saturating_mul(3) / 4
-                            && !groups.is_empty()
-                        {
+                        if pressed(memory.used()) && !groups.is_empty() {
                             groups_reserved = groups_reserved
                                 .saturating_add(memory.used().saturating_sub(used_before_merge));
                             spill_runs.push(write_aggregate_spill_run(&mut groups, memory)?);
@@ -3795,8 +3809,8 @@ fn build_buffered_hash_aggregate(
         // of the ceiling those sets hit it first and the query fails where it
         // should have spilled. Larger batches make that ordinary rather than
         // rare, since a batch in flight is then a real share of the budget.
-        let under_pressure = memory.used() > memory.limit().saturating_mul(3) / 4;
-        if (groups_reserved > memory.limit() / 2 || under_pressure) && !groups.is_empty() {
+        let under_pressure = pressed(memory.used());
+        if (groups_reserved > own_limit / 2 || under_pressure) && !groups.is_empty() {
             spill_runs.push(write_aggregate_spill_run(&mut groups, memory)?);
             memory.release(groups_reserved);
             groups_reserved = 0;
