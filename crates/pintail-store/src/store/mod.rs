@@ -12,6 +12,7 @@ pub use snapshot::{BackupArtifacts, BackupSegment, GroupedFoldSpan, TableSnapsho
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
+    ops::{Bound, RangeBounds},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicUsize},
 };
@@ -471,6 +472,7 @@ impl TableStore {
         Self::open_with_wal(&directory, &wal_path, 0, schema, options, true)
     }
 
+    #[allow(clippy::too_many_lines)] // one linear recovery sequence
     pub(crate) fn open_with_wal(
         directory: &Path,
         wal_path: &Path,
@@ -510,6 +512,9 @@ impl TableStore {
         }
         let (mut wal, mut recovery) = Wal::open(wal_path, options.wal_sync)?;
         refuse_a_lost_manifest(&directory, truncate_wal_on_flush, &recovery, table_id)?;
+        if collapse_identical_segments(&directory, &mut manifest)? {
+            changed = true;
+        }
         remove_orphan_segments(&directory, &manifest)?;
         let mut commit_version = manifest.committed_version;
         if options.transactional {
@@ -1002,7 +1007,47 @@ impl TableStore {
     /// checksummed segment/manifest publication.
     pub fn bulk_ingest_snapshot(
         &mut self,
+        rows: Vec<StoredRow>,
+    ) -> Result<BulkIngestOutcome, StoreError> {
+        self.ingest_snapshot_chunk(rows, None)
+    }
+
+    /// Publishes one snapshot chunk that is the whole source content of the
+    /// key range `covers`, retiring in the same manifest swap every earlier
+    /// snapshot copy lying entirely inside that range.
+    ///
+    /// A resumed copy re-reads a range whenever its journal is behind the
+    /// store: a crash between a chunk's publication and its journal entry, or
+    /// a control plane restored from before the last chunks landed. Without
+    /// the retirement the re-read chunk was published beside its first copy,
+    /// the two segments overlapped key for key, and every scan of the table
+    /// fell to the row-merging path for good. Only snapshot copies qualify
+    /// (every row at version zero, no tombstones), so replicated changes are
+    /// never dropped. With no rows the call only retires, which is how a copy
+    /// that finds the source ends earlier than its last run removes the tail.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bulk_ingest_snapshot`], and for rows outside `covers`.
+    pub fn bulk_ingest_snapshot_covering(
+        &mut self,
+        rows: Vec<StoredRow>,
+        covers: (Bound<PrimaryKey>, Bound<PrimaryKey>),
+    ) -> Result<BulkIngestOutcome, StoreError> {
+        if let Some(row) = rows.iter().find(|row| !covers.contains(row.key())) {
+            return Err(StoreError::FormatLimit(format!(
+                "snapshot chunk row {:?} lies outside the range the chunk covers",
+                row.key()
+            )));
+        }
+        self.ingest_snapshot_chunk(rows, Some(&covers))
+    }
+
+    #[allow(clippy::too_many_lines)] // one linear validate-write-publish sequence
+    fn ingest_snapshot_chunk(
+        &mut self,
         mut rows: Vec<StoredRow>,
+        covers: Option<&(Bound<PrimaryKey>, Bound<PrimaryKey>)>,
     ) -> Result<BulkIngestOutcome, StoreError> {
         if self.has_pending_rows() {
             return Err(StoreError::FormatLimit(
@@ -1017,7 +1062,21 @@ impl TableStore {
                 ));
             }
         }
-        if rows.is_empty() {
+        let mut superseded = covers.map_or_else(Vec::new, |covers| {
+            self.manifest
+                .segments
+                .iter()
+                .filter(|meta| {
+                    meta.max_version == 0
+                        && meta.unique_keys
+                        && meta.smas.as_ref().is_none_or(|smas| smas.tombstones == 0)
+                        && covers.contains(&meta.min_key)
+                        && covers.contains(&meta.max_key)
+                })
+                .map(|meta| meta.file_name.clone())
+                .collect::<Vec<_>>()
+        });
+        if rows.is_empty() && superseded.is_empty() {
             return Ok(BulkIngestOutcome {
                 row_count: 0,
                 segment_path: None,
@@ -1049,16 +1108,6 @@ impl TableStore {
         }
 
         let _published = self.publication.publishing();
-        let segment = segment::write(
-            &self.directory,
-            self.manifest.next_segment_id,
-            &self.schema,
-            &rows,
-            self.options.block_rows,
-            segment::Compression::AdaptiveLz4,
-            true,
-        )?;
-        let segment_path = self.directory.join(&segment.file_name);
         let mut next_manifest = self.manifest.as_ref().clone();
         next_manifest.generation = next_manifest
             .generation
@@ -1068,16 +1117,55 @@ impl TableStore {
             .epoch
             .checked_add(1)
             .ok_or(StoreError::SequenceOverflow)?;
-        next_manifest.next_segment_id = next_manifest
-            .next_segment_id
-            .checked_add(1)
-            .ok_or(StoreError::SequenceOverflow)?;
-        next_manifest.segments.push(segment);
+        let mut segment_path = None;
+        if !rows.is_empty() {
+            let segment = segment::write(
+                &self.directory,
+                self.manifest.next_segment_id,
+                &self.schema,
+                &rows,
+                self.options.block_rows,
+                segment::Compression::AdaptiveLz4,
+                true,
+            )?;
+            segment_path = Some(self.directory.join(&segment.file_name));
+            // A chunk re-read from an unchanged source encodes to the same
+            // bytes as its first copy, whatever its key type; that copy goes
+            // too; dropping one of two identical files changes no answer.
+            for meta in &self.manifest.segments {
+                if !superseded.contains(&meta.file_name)
+                    && same_segment_span(meta, &segment)
+                    && same_file_contents(
+                        &self.directory.join(&meta.file_name),
+                        &self.directory.join(&segment.file_name),
+                    )?
+                {
+                    superseded.push(meta.file_name.clone());
+                }
+            }
+            next_manifest.next_segment_id = next_manifest
+                .next_segment_id
+                .checked_add(1)
+                .ok_or(StoreError::SequenceOverflow)?;
+            next_manifest.segments.push(segment);
+        }
+        next_manifest
+            .segments
+            .retain(|meta| !superseded.contains(&meta.file_name));
         manifest::publish(&self.directory, &next_manifest)?;
-        self.manifest = Arc::new(next_manifest);
+        let previous = std::mem::replace(&mut self.manifest, Arc::new(next_manifest));
+        if !superseded.is_empty() {
+            self.retired.push(RetiredGeneration {
+                readers: Arc::downgrade(&previous),
+                paths: superseded
+                    .iter()
+                    .map(|file_name| self.directory.join(file_name))
+                    .collect(),
+            });
+        }
         Ok(BulkIngestOutcome {
             row_count: rows.len(),
-            segment_path: Some(segment_path),
+            segment_path,
         })
     }
 
@@ -2094,6 +2182,122 @@ fn adapt_recovered_row(
     let adapted = StoredRow::new(row.key().clone(), values, row.version(), row.is_deleted());
     schema.validate_row(&adapted)?;
     Ok(adapted)
+}
+
+/// Drops from the manifest every segment whose file is byte for byte the same
+/// as a later one, and publishes the result; the dropped files are then
+/// orphans the open's sweep removes once no reader pins them.
+///
+/// A resumed snapshot copy used to republish ranges the store already held,
+/// leaving identical segment pairs that overlap key for key. Nothing was
+/// wrong in any answer - merge-on-read resolves a tie to one of two equal
+/// rows - but the overlap kept the table off every disjoint-segment path
+/// for good, and compaction never saw a write that would start it. Removing
+/// one of two identical files changes no row, version or tombstone, so this
+/// needs no other precondition. Candidates are the segments with equal key
+/// span, row count and version span; only those have their bytes compared.
+fn collapse_identical_segments(
+    directory: &Path,
+    manifest: &mut Manifest,
+) -> Result<bool, StoreError> {
+    let mut order = (0..manifest.segments.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        let (left, right) = (&manifest.segments[*left], &manifest.segments[*right]);
+        (
+            &left.min_key,
+            &left.max_key,
+            left.row_count,
+            left.min_version,
+            left.max_version,
+        )
+            .cmp(&(
+                &right.min_key,
+                &right.max_key,
+                right.row_count,
+                right.min_version,
+                right.max_version,
+            ))
+    });
+    let mut duplicates = std::collections::HashSet::new();
+    for pair in order.windows(2) {
+        let (left, right) = (&manifest.segments[pair[0]], &manifest.segments[pair[1]]);
+        if !same_segment_span(left, right) {
+            continue;
+        }
+        if same_file_contents(
+            &directory.join(&left.file_name),
+            &directory.join(&right.file_name),
+        )? {
+            // The sort is stable, so the pair is in manifest order and the
+            // earlier segment - the one merge-on-read lets the later outrank -
+            // is the one to drop.
+            duplicates.insert(pair[0]);
+        }
+    }
+    if duplicates.is_empty() {
+        return Ok(false);
+    }
+    let mut index = 0;
+    manifest.segments.retain(|_| {
+        let keep = !duplicates.contains(&index);
+        index += 1;
+        keep
+    });
+    manifest.generation = manifest
+        .generation
+        .checked_add(1)
+        .ok_or(StoreError::SequenceOverflow)?;
+    manifest.epoch = manifest
+        .epoch
+        .checked_add(1)
+        .ok_or(StoreError::SequenceOverflow)?;
+    manifest::publish(directory, manifest)?;
+    Ok(true)
+}
+
+fn same_segment_span(left: &segment::SegmentMeta, right: &segment::SegmentMeta) -> bool {
+    left.min_key == right.min_key
+        && left.max_key == right.max_key
+        && left.row_count == right.row_count
+        && left.min_version == right.min_version
+        && left.max_version == right.max_version
+}
+
+fn same_file_contents(left: &Path, right: &Path) -> Result<bool, StoreError> {
+    use std::io::Read;
+    let open = |path: &Path| {
+        File::open(path).map_err(|error| {
+            StoreError::io(
+                format!("open segment {} for comparison", path.display()),
+                error,
+            )
+        })
+    };
+    let (mut left_file, mut right_file) = (open(left)?, open(right)?);
+    let length = |file: &File, path: &Path| {
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|error| StoreError::io(format!("inspect segment {}", path.display()), error))
+    };
+    if length(&left_file, left)? != length(&right_file, right)? {
+        return Ok(false);
+    }
+    let mut left_buffer = vec![0_u8; 1 << 16];
+    let mut right_buffer = vec![0_u8; 1 << 16];
+    loop {
+        let read = left_file
+            .read(&mut left_buffer)
+            .map_err(|error| StoreError::io("read segment for comparison", error))?;
+        if read == 0 {
+            return Ok(true);
+        }
+        right_file
+            .read_exact(&mut right_buffer[..read])
+            .map_err(|error| StoreError::io("read segment for comparison", error))?;
+        if left_buffer[..read] != right_buffer[..read] {
+            return Ok(false);
+        }
+    }
 }
 
 fn remove_orphan_segments(directory: &Path, manifest: &Manifest) -> Result<(), StoreError> {

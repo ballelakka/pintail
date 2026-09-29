@@ -1037,3 +1037,253 @@ fn scattered_updates_layer_over_their_bases() {
     assert!(!layered(&stale));
     assert_eq!(drain(stale), expected);
 }
+
+/// A two-column table whose snapshot copy lands in chunks of a thousand
+/// keys, with the source modelled as a plain map beside it.
+mod resumed_copy {
+    use super::*;
+    use pintail_types::Value;
+    use std::ops::Bound;
+
+    type Model = BTreeMap<u64, i64>;
+
+    fn schema() -> TableSchema {
+        TableSchema::new(
+            1,
+            vec![
+                Column::new(1, "id", DataType::UInt64, false),
+                Column::new(2, "amount", DataType::Int64, false),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn options() -> StoreOptions {
+        StoreOptions {
+            background_compaction: false,
+            ..StoreOptions::default()
+        }
+    }
+
+    fn key(id: u64) -> PrimaryKey {
+        PrimaryKey::new(vec![KeyPart::UInt64(id)]).unwrap()
+    }
+
+    fn source() -> Model {
+        (1..=3_000)
+            .map(|id| (id, i64::try_from(id % 97).unwrap()))
+            .collect()
+    }
+
+    /// One chunk as the copy reads it: the source rows in `(after, through]`.
+    fn chunk(source: &Model, after: u64, through: u64) -> Vec<StoredRow> {
+        source
+            .range(after + 1..=through)
+            .map(|(id, amount)| {
+                StoredRow::new(
+                    key(*id),
+                    vec![Value::UInt64(*id), Value::Int64(*amount)],
+                    0,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn covers(after: u64, through: Option<u64>) -> (Bound<PrimaryKey>, Bound<PrimaryKey>) {
+        (
+            if after == 0 {
+                Bound::Unbounded
+            } else {
+                Bound::Excluded(key(after))
+            },
+            through.map_or(Bound::Unbounded, |through| Bound::Included(key(through))),
+        )
+    }
+
+    fn visible(table: &TableStore) -> Model {
+        table
+            .snapshot()
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let [Value::UInt64(id), Value::Int64(amount)] = row.values() else {
+                    panic!("unexpected row shape {row:?}");
+                };
+                (*id, *amount)
+            })
+            .collect()
+    }
+
+    /// The first run copies two chunks and dies before its journal records
+    /// the second; the source then deletes one row and changes another in
+    /// that range. The resumed run re-reads the second chunk and the rest.
+    fn changed(source: &Model) -> Model {
+        let mut changed = source.clone();
+        changed.remove(&1_500);
+        changed.insert(1_600, -1);
+        changed
+    }
+
+    #[test]
+    fn a_resumed_chunk_retires_the_copy_an_interrupted_run_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut table = TableStore::open(directory.path(), schema(), options()).unwrap();
+        let first = source();
+        table
+            .bulk_ingest_snapshot_covering(chunk(&first, 0, 1_000), covers(0, Some(1_000)))
+            .unwrap();
+        table
+            .bulk_ingest_snapshot_covering(chunk(&first, 1_000, 2_000), covers(1_000, Some(2_000)))
+            .unwrap();
+        let second = changed(&first);
+        table
+            .bulk_ingest_snapshot_covering(chunk(&second, 1_000, 2_000), covers(1_000, Some(2_000)))
+            .unwrap();
+        table
+            .bulk_ingest_snapshot_covering(chunk(&second, 2_000, 3_000), covers(2_000, None))
+            .unwrap();
+        assert_eq!(visible(&table), second);
+        assert_eq!(table.manifest.segments.len(), 3, "no chunk kept two copies");
+        assert!(
+            table.snapshot().sma_fold_state().is_some(),
+            "the segments are key-disjoint again"
+        );
+    }
+
+    #[test]
+    fn a_copy_that_finds_the_source_shorter_retires_the_old_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut table = TableStore::open(directory.path(), schema(), options()).unwrap();
+        let first = source();
+        for (after, through) in [(0, 1_000), (1_000, 2_000), (2_000, 3_000)] {
+            table
+                .bulk_ingest_snapshot_covering(
+                    chunk(&first, after, through),
+                    covers(after, Some(through)),
+                )
+                .unwrap();
+        }
+        // The source lost its last thousand rows before the resumed run
+        // re-read the second chunk; the page after it comes back empty.
+        let shorter = first
+            .range(..=2_000)
+            .map(|(k, v)| (*k, *v))
+            .collect::<Model>();
+        table
+            .bulk_ingest_snapshot_covering(
+                chunk(&shorter, 1_000, 2_000),
+                covers(1_000, Some(2_000)),
+            )
+            .unwrap();
+        table
+            .bulk_ingest_snapshot_covering(Vec::new(), covers(2_000, None))
+            .unwrap();
+        assert_eq!(visible(&table), shorter);
+        assert_eq!(table.manifest.segments.len(), 2);
+    }
+
+    /// The defect as it stood: a resumed chunk published beside its first
+    /// copy. Merge-on-read resolves keys both copies hold to the later one,
+    /// but a row the source deleted between the runs survives in the older
+    /// copy - a row the source does not have, which no later change event
+    /// removes because the delete predates the copy.
+    #[test]
+    fn a_republished_chunk_without_its_range_keeps_a_deleted_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut table = TableStore::open(directory.path(), schema(), options()).unwrap();
+        let first = source();
+        table.bulk_ingest_snapshot(chunk(&first, 0, 2_000)).unwrap();
+        let second = changed(&first);
+        table
+            .bulk_ingest_snapshot(chunk(&second, 0, 2_000))
+            .unwrap();
+        let seen = visible(&table);
+        assert_eq!(seen.get(&1_600), Some(&-1), "ties go to the later copy");
+        assert_eq!(
+            seen.get(&1_500),
+            first.get(&1_500),
+            "the stale row survives"
+        );
+        assert!(table.snapshot().sma_fold_state().is_none());
+    }
+
+    /// A chunk re-read from an unchanged source is byte-identical to its
+    /// first copy, and replaces it whatever the key type.
+    #[test]
+    fn an_identical_republished_chunk_replaces_its_first_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut table = TableStore::open(directory.path(), schema(), options()).unwrap();
+        let first = source();
+        table.bulk_ingest_snapshot(chunk(&first, 0, 1_000)).unwrap();
+        table
+            .bulk_ingest_snapshot(chunk(&first, 1_000, 2_000))
+            .unwrap();
+        table
+            .bulk_ingest_snapshot(chunk(&first, 1_000, 2_000))
+            .unwrap();
+        assert_eq!(table.manifest.segments.len(), 2);
+        assert_eq!(visible(&table), chunk_model(&first, 2_000));
+    }
+
+    fn chunk_model(source: &Model, through: u64) -> Model {
+        source.range(..=through).map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// A data directory written before the fix holds identical segment
+    /// pairs in its manifest. The next writer open drops the earlier file of
+    /// each pair; the answer is unchanged and the segments are disjoint.
+    #[test]
+    fn identical_segment_pairs_left_by_earlier_copies_collapse_on_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = source();
+        {
+            let mut table = TableStore::open(directory.path(), schema(), options()).unwrap();
+            for (after, through) in [(0, 1_000), (1_000, 2_000), (2_000, 3_000)] {
+                table
+                    .bulk_ingest_snapshot(chunk(&first, after, through))
+                    .unwrap();
+            }
+            // Republish copies of the last two segments the way the old
+            // resumed copy did: same bytes, newer files, both live.
+            let mut manifest = table.manifest.as_ref().clone();
+            for original in &table.manifest.segments[1..] {
+                let id = manifest.next_segment_id;
+                let file_name = format!("segment-{id:020}.ptseg");
+                std::fs::copy(
+                    directory.path().join(&original.file_name),
+                    directory.path().join(&file_name),
+                )
+                .unwrap();
+                let mut copy = original.clone();
+                copy.id = id;
+                copy.file_name = file_name;
+                manifest.segments.push(copy);
+                manifest.next_segment_id += 1;
+            }
+            manifest.generation += 1;
+            manifest.epoch += 1;
+            manifest::publish(directory.path(), &manifest).unwrap();
+            table.manifest = Arc::new(manifest);
+            assert_eq!(visible(&table), first, "the duplicates change no answer");
+            assert!(table.snapshot().sma_fold_state().is_none());
+        }
+        let reopened = TableStore::open(directory.path(), schema(), options()).unwrap();
+        assert_eq!(reopened.manifest.segments.len(), 3);
+        assert_eq!(visible(&reopened), first);
+        assert!(reopened.snapshot().sma_fold_state().is_some());
+        let files = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ptseg")
+            })
+            .count();
+        assert_eq!(files, 3, "the dropped copies are swept from disk");
+    }
+}

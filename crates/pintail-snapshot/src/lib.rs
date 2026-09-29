@@ -9,6 +9,7 @@
 use std::{
     collections::HashMap,
     fmt::Write as _,
+    ops::Bound,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -899,7 +900,31 @@ async fn snapshot_table(
             .exec(sql, Params::Positional(parameters))
             .await?;
         let fetch_ms = fetch_started.elapsed().as_millis();
+        let row_offset = page.saturating_mul(options.chunk_rows);
+        // `None` when the bound cannot be trusted to order the store's keys
+        // the way the source's ORDER BY ordered the rows (see `order_safe`).
+        let lower = if key_indices.is_empty() {
+            Some(Bound::Included(append_key(row_offset)?))
+        } else {
+            match &cursor {
+                Some(cursor) => {
+                    let key = cursor_key(&target.source, &key_indices, cursor)?;
+                    order_safe(&key).then_some(Bound::Excluded(key))
+                }
+                None => Some(Bound::Unbounded),
+            }
+        };
         if rows.is_empty() {
+            // The source ends here. A store a previous, interrupted run left
+            // ahead of the journal can hold copies of rows past this point
+            // that the source no longer has; they go now.
+            if let Some(lower) = lower {
+                run_blocking(|| {
+                    target
+                        .store
+                        .bulk_ingest_snapshot_covering(Vec::new(), (lower, Bound::Unbounded))
+                })?;
+            }
             break;
         }
         let next_cursor = if key_indices.is_empty() {
@@ -938,7 +963,28 @@ async fn snapshot_table(
                 lo_json.as_deref(),
                 hi_json.as_deref(),
             )?;
-            let row_offset = page.saturating_mul(options.chunk_rows);
+            // The chunk is the source's whole content between the cursor it
+            // started after and the key it ended on - or everything past the
+            // cursor when the page came back short. Declaring that range lets
+            // the store retire a copy of it an interrupted run already
+            // published, instead of keeping both (see
+            // `TableStore::bulk_ingest_snapshot_covering`).
+            let upper = if rows.len() < options.chunk_rows {
+                Some(Bound::Unbounded)
+            } else if key_indices.is_empty() {
+                Some(Bound::Excluded(append_key(
+                    row_offset.saturating_add(options.chunk_rows),
+                )?))
+            } else {
+                match &next_cursor {
+                    Some(next) => {
+                        let key = cursor_key(&target.source, &key_indices, next)?;
+                        order_safe(&key).then_some(Bound::Included(key))
+                    }
+                    None => Some(Bound::Unbounded),
+                }
+            };
+            let covers = lower.zip(upper);
             // Conversion and the segment write are CPU and disk work with
             // no await in them; on a multi-thread runtime they run with the
             // worker thread's other tasks handed off, so a chunk being
@@ -960,7 +1006,12 @@ async fn snapshot_table(
                     .iter()
                     .map(StoredRow::estimated_bytes)
                     .sum::<usize>();
-                let outcome = target.store.bulk_ingest_snapshot(stored_rows)?;
+                let outcome = match covers {
+                    Some(covers) => target
+                        .store
+                        .bulk_ingest_snapshot_covering(stored_rows, covers)?,
+                    None => target.store.bulk_ingest_snapshot(stored_rows)?,
+                };
                 Ok::<_, SnapshotError>((outcome, chunk_bytes))
             })?;
             let write_ms = write_started.elapsed().as_millis();
@@ -1021,6 +1072,48 @@ async fn snapshot_table(
         started.elapsed().as_millis()
     );
     Ok(())
+}
+
+/// The store key of a keyless table's row at `offset` in the source's
+/// unordered scan, as `convert_row` assigns it.
+fn append_key(offset: usize) -> Result<PrimaryKey, SnapshotError> {
+    Ok(PrimaryKey::new(vec![KeyPart::UInt64(
+        u64::try_from(offset).unwrap_or(u64::MAX),
+    )])?)
+}
+
+/// Whether a key orders the same in the store as under the source's ORDER
+/// BY. Integer keys do; a string key sorts by its collation at the source and
+/// by its bytes here, so a range bounded by one could take in rows another
+/// chunk of the same copy wrote. Such a chunk declares no range and retires
+/// only byte-identical earlier copies of itself.
+fn order_safe(key: &PrimaryKey) -> bool {
+    key.parts()
+        .iter()
+        .all(|part| matches!(part, KeyPart::Int64(_) | KeyPart::UInt64(_)))
+}
+
+/// The store key a source key cursor names, converted exactly as the
+/// chunk's own rows are.
+fn cursor_key(
+    table: &SourceTable,
+    key_indices: &[usize],
+    cursor: &[MysqlValue],
+) -> Result<PrimaryKey, SnapshotError> {
+    let parts = key_indices
+        .iter()
+        .zip(cursor)
+        .map(|(index, value)| {
+            let column = &table.columns[*index];
+            let value = map_mysql_value(&table.name, column, value.clone())?;
+            key_part(&value).ok_or_else(|| SnapshotError::TypeMapping {
+                table: table.name.clone(),
+                column: column.name.clone(),
+                reason: "key value is NULL or cannot be ordered".to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PrimaryKey::new(parts)?)
 }
 
 /// Runs CPU-bound work from inside an async task without holding up the
