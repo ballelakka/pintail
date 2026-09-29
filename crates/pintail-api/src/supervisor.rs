@@ -905,7 +905,9 @@ fn restore_tables_after_restart(state: &ApiState, metadata: &MetaStore) {
         }
     };
     for database in databases {
-        let Ok(Some(_)) = metadata.snapshot_checkpoint(&database.id) else {
+        // A checkpoint is not a handoff: a first copy cut short holds one
+        // while still 'probed', and its resumed snapshot flips the tables.
+        let Ok(true) = crate::snapshot::has_handed_off(metadata, &database) else {
             continue;
         };
         let Some(mode) = database
@@ -1374,9 +1376,11 @@ mod tests {
     }
 
     /// A database that never handed off has no live state to restore to:
-    /// its interrupted first snapshot resumes as a snapshot, untouched here.
+    /// its interrupted first snapshot resumes as a snapshot, untouched here -
+    /// with no checkpoint yet, and with the one the first copy stores before
+    /// it copies a row.
     #[test]
-    fn boot_leaves_a_database_without_a_checkpoint_alone() {
+    fn boot_leaves_a_database_that_never_handed_off_alone() {
         let directory = tempfile::tempdir().expect("data directory");
         let metadata_path = directory.path().join("pintail-meta.db");
         let state = crate::ApiState::new(
@@ -1405,6 +1409,22 @@ mod tests {
             metadata.tables("db-1").expect("tables")[0].state,
             "pending",
             "pending is what the snapshot's own handoff will flip"
+        );
+        metadata
+            .insert_snapshot_checkpoint_if_absent(
+                "db-1",
+                "filepos",
+                None,
+                Some("mysql-bin.000003"),
+                Some(4),
+                now,
+            )
+            .expect("checkpoint");
+        restore_tables_after_restart(&state, &metadata);
+        assert_eq!(
+            metadata.tables("db-1").expect("tables")[0].state,
+            "pending",
+            "the first copy's checkpoint is not a handoff"
         );
     }
 
