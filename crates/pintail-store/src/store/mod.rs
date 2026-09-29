@@ -1,11 +1,15 @@
 #[cfg(test)]
 mod lifecycle_tests;
 mod scan;
+mod side_index;
 mod snapshot;
 
 pub use scan::{
     ColumnValidity, DecodedColumn, PrewhereRanges, PrewhereSelect, ProjectedColumnChunk,
     ProjectedRow, ProjectedScan, ProjectedScanStream, ProjectedValueChunk, ScanStats,
+};
+pub use side_index::{
+    IndexLookup, IndexProbe, override_side_index, side_index_enabled, side_index_totals,
 };
 pub use snapshot::{BackupArtifacts, BackupSegment, GroupedFoldSpan, TableSnapshot};
 

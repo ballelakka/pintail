@@ -914,6 +914,7 @@ impl TableSnapshot {
             overlay_key: None,
             overlay: None,
             pending: std::collections::VecDeque::new(),
+            index_lookup: None,
         }))
     }
 

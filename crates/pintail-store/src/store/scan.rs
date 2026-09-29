@@ -703,6 +703,9 @@ pub struct ProjectedScanStream {
     /// Chunks an overlay slice produced beyond the one the single-chunk
     /// API could hand out, waiting their turn.
     pub(super) pending: VecDeque<ProjectedColumnChunk>,
+    /// The experimental side-index request the scan's predicates or a join
+    /// gave it; consulted only while the index is switched on.
+    pub(super) index_lookup: Option<super::side_index::IndexLookup>,
 }
 
 pub(super) struct MergedProjectedStream {
@@ -2286,6 +2289,7 @@ impl ProjectedScanStream {
     /// surviving sub-ranges relative to it, and those decode in full at
     /// their absolute positions. Without a selector, or when it keeps
     /// everything, the range decodes whole.
+    #[allow(clippy::too_many_lines)]
     fn decode_range_maybe_filtered(
         &self,
         segment: &segment::SegmentMeta,
@@ -2297,6 +2301,16 @@ impl ProjectedScanStream {
         let Some((predicate_ids, select)) = prewhere.filter(|(ids, _)| !ids.is_empty()) else {
             return self.decode_column_chunk_rows(segment, start_row, end_row, memory_limit);
         };
+        if let Some(chunk) = self.decode_by_side_index(
+            segment,
+            start_row,
+            end_row,
+            memory_limit,
+            predicate_ids,
+            select,
+        )? {
+            return Ok(chunk);
+        }
         let map_projection = |ids: &[u32]| -> Result<Vec<usize>, StoreError> {
             ids.iter()
                 .map(|id| {
@@ -2396,6 +2410,140 @@ impl ProjectedScanStream {
         })
     }
 
+    /// Sets the experimental side-index request (see
+    /// [`super::side_index`]). Callers set it only while the index is on.
+    pub fn set_index_lookup(&mut self, lookup: super::side_index::IndexLookup) {
+        self.index_lookup = Some(lookup);
+    }
+
+    /// The side-index request set so far, if any.
+    #[must_use]
+    pub const fn index_lookup(&self) -> Option<&super::side_index::IndexLookup> {
+        self.index_lookup.as_ref()
+    }
+
+    /// The filter-first decode over only the rows the side index names for
+    /// the scan's lookup: the predicate columns decode for those rows, the
+    /// selector judges them, and the projection decodes for the survivors.
+    /// `None` when the index is off, declines the column, or finds too many
+    /// rows to be worth reading apart.
+    #[allow(clippy::too_many_lines)]
+    fn decode_by_side_index(
+        &self,
+        segment: &segment::SegmentMeta,
+        start_row: u64,
+        end_row: u64,
+        memory_limit: usize,
+        predicate_ids: &[u32],
+        select: PrewhereSelect<'_>,
+    ) -> Result<Option<ProjectedColumnChunk>, StoreError> {
+        let Some(lookup) = self.index_lookup.as_ref() else {
+            return Ok(None);
+        };
+        let (Ok(start), Ok(end)) = (usize::try_from(start_row), usize::try_from(end_row)) else {
+            return Ok(None);
+        };
+        let Some(postings) = super::side_index::postings(
+            &self.snapshot.directory,
+            segment,
+            &self.snapshot.schema,
+            lookup.column_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(candidates) = postings.candidate_ranges(&lookup.probe, start, end) else {
+            return Ok(None);
+        };
+        let map_projection = |ids: &[u32]| -> Result<Vec<usize>, StoreError> {
+            ids.iter()
+                .map(|id| {
+                    self.snapshot
+                        .schema
+                        .columns()
+                        .iter()
+                        .position(|column| column.id() == *id)
+                        .ok_or_else(|| {
+                            StoreError::FormatLimit(format!("unknown projected column id {id}"))
+                        })
+                })
+                .collect()
+        };
+        let scan_memory = AtomicUsize::new(0);
+        let scan_budget = segment::ScanMemoryBudget::new(&scan_memory, memory_limit);
+        let candidate_rows = candidates
+            .iter()
+            .map(std::iter::ExactSizeIterator::len)
+            .sum::<usize>();
+        // Even with no candidates the selector runs, over zero rows: an
+        // overlay part places its memtable rows from what it sees there.
+        let (absolute, exact, mut stats) = {
+            let fetch = segment::read_projected_column_ranges(
+                &self.snapshot.directory,
+                segment,
+                &self.snapshot.schema,
+                &map_projection(predicate_ids)?,
+                &candidates,
+                &scan_budget,
+            )?;
+            let stats = ScanStats {
+                blocks_read: fetch.blocks_read,
+                blocks_pruned: fetch.blocks_pruned,
+                blocks_decoded: fetch.blocks_decoded,
+                ..ScanStats::default()
+            };
+            let selected =
+                select(&fetch.columns, candidate_rows).map_err(StoreError::FormatLimit)?;
+            scan_budget.release(fetch.reserved_bytes);
+            drop(fetch);
+            match selected {
+                Some(PrewhereRanges { ranges, exact }) => (
+                    super::side_index::absolute_ranges(&candidates, &ranges),
+                    exact,
+                    stats,
+                ),
+                // The selector judged nothing: the candidates pass only the
+                // lookup's own column test.
+                None => (candidates, false, stats),
+            }
+        };
+        let fetch = segment::read_projected_column_ranges(
+            &self.snapshot.directory,
+            segment,
+            &self.snapshot.schema,
+            &map_projection(&self.column_ids)?,
+            &absolute,
+            &scan_budget,
+        )?;
+        let retained_bytes = size_of::<ProjectedColumnChunk>()
+            .saturating_add(
+                fetch
+                    .columns
+                    .capacity()
+                    .saturating_mul(size_of::<DecodedColumn>()),
+            )
+            .saturating_add(
+                fetch
+                    .columns
+                    .iter()
+                    .map(DecodedColumn::retained_bytes)
+                    .sum(),
+            );
+        scan_budget.release(fetch.reserved_bytes);
+        scan_budget.reserve(retained_bytes)?;
+        stats.segments_read = usize::from(start_row == 0);
+        stats.blocks_read += fetch.blocks_read;
+        stats.blocks_pruned += fetch.blocks_pruned;
+        stats.blocks_decoded += fetch.blocks_decoded;
+        Ok(Some(ProjectedColumnChunk {
+            prefiltered: exact,
+            columns: fetch.columns,
+            row_count: absolute.iter().map(std::iter::ExactSizeIterator::len).sum(),
+            stats,
+            retained_bytes,
+        }))
+    }
+
     /// Routes one segment through the filter-first path when a predicate
     /// selector applies and the segment decodes as a full direct chunk.
     fn decode_column_chunk_maybe_filtered(
@@ -2409,6 +2557,16 @@ impl ProjectedScanStream {
             && full_direct
             && !predicate_ids.is_empty()
         {
+            if let Some(chunk) = self.decode_by_side_index(
+                &segment,
+                0,
+                segment.row_count,
+                memory_limit,
+                predicate_ids,
+                select,
+            )? {
+                return Ok(chunk);
+            }
             let map_projection = |ids: &[u32]| -> Result<Vec<usize>, StoreError> {
                 ids.iter()
                     .map(|id| {
