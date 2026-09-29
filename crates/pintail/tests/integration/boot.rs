@@ -32,6 +32,58 @@ fn binary_boots_serves_health_and_prints_secrets_only_once() {
     assert!(!restart.contains("PINTAIL_DSN_ENCRYPTION_KEY="));
 }
 
+#[test]
+fn a_second_server_on_one_data_directory_is_refused_and_a_killed_owner_leaves_no_lock() {
+    let data_dir = tempfile::tempdir().expect("temporary data directory");
+    let address = unused_address();
+    let mut owner = ProcessGuard(spawn(data_dir.path(), address));
+    let health = wait_for_health(&mut owner.0, address);
+    assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
+
+    let second = Command::new(env!("CARGO_BIN_EXE_pintail"))
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("--http-bind")
+        .arg(unused_address().to_string())
+        .arg("--wire-bind")
+        .arg("127.0.0.1:0")
+        .env("PINTAIL_DATA_DIR_LOCK_WAIT_SECONDS", "0.5")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run a second pintail");
+    assert!(!second.status.success(), "the second server must not start");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("in use by another pintail process"),
+        "{stderr}"
+    );
+
+    // SIGKILL gives the owner no chance to clean up; the kernel still drops
+    // its lock, so the next boot takes the directory without waiting.
+    owner.0.kill().expect("kill the owner");
+    owner.0.wait().expect("reap the owner");
+    let address = unused_address();
+    let mut next = ProcessGuard(spawn(data_dir.path(), address));
+    let health = wait_for_health(&mut next.0, address);
+    assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
+}
+
+fn spawn(data_dir: &Path, address: SocketAddr) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_pintail"))
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--http-bind")
+        .arg(address.to_string())
+        .arg("--wire-bind")
+        .arg("127.0.0.1:0")
+        .env("PINTAIL_DATA_DIR_LOCK_WAIT_SECONDS", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start pintail")
+}
+
 fn run_until_healthy(data_dir: &Path) -> String {
     let address = unused_address();
     let child = Command::new(env!("CARGO_BIN_EXE_pintail"))

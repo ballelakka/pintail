@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use pintail::{
     config::{AppConfig, Cli},
+    data_lock,
     secrets::{LoadedBootSecrets, generate_secret, load_or_create},
 };
 use pintail_api::{ApiState, router_with_state, spawn_supervisor};
@@ -62,6 +63,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = AppConfig::load(&cli)?;
 
+    // Before anything reads or writes the directory: a second server on the
+    // same volume must never get as far as opening the metadata.
+    let _data_dir_lock =
+        data_lock::acquire(config.data_dir(), data_lock::wait_from_environment()?)?;
     let boot_secrets = load_or_create(config.data_dir())?;
     display_first_boot_secret(&boot_secrets, config.data_dir());
 
