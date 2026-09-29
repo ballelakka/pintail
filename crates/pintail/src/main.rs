@@ -49,9 +49,20 @@ const fn install_console() {}
 // Boot is a sequence, and splitting it to satisfy a line count would put
 // ordering that matters - telemetry before anything that can fail, secrets
 // before the metadata they unlock - behind a function call that hides it.
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    let result = runtime.block_on(run());
+    // Dropping a runtime waits for every blocking task without limit; a
+    // statement still executing on one must not hold the exit open.
+    runtime.shutdown_timeout(pintail::shutdown::BLOCKING_GRACE);
+    result
+}
+
 #[allow(clippy::too_many_lines)]
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     install_console();
     let started = std::time::Instant::now();
     // First, before anything that can fail. Secrets loading, metadata open and
@@ -154,8 +165,13 @@ async fn main() -> Result<()> {
     let shutdown_signal_sender = shutdown.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
+        pintail_log::log_info!(
+            "shutdown: signal received, open work has {}s to finish",
+            pintail::shutdown::GRACE.as_secs()
+        );
         let _ = shutdown_signal_sender.send(());
     });
+    let mut grace_start = shutdown.subscribe();
     let mut http_shutdown = shutdown.subscribe();
     let mut wire_shutdown = shutdown.subscribe();
     let supervisor = spawn_supervisor(api_state.clone(), shutdown.subscribe());
@@ -184,11 +200,26 @@ async fn main() -> Result<()> {
             let _ = wire_shutdown.recv().await;
         },
     );
-    tokio::try_join!(async { http.await.context("HTTP server failed") }, async {
-        wire.await.context("MySQL wire server failed")
-    })?;
-    supervisor.await.context("replication supervisor failed")?;
-    watchdog.await.context("memory watchdog failed")?;
+    let serve = async {
+        tokio::try_join!(async { http.await.context("HTTP server failed") }, async {
+            wire.await.context("MySQL wire server failed")
+        })?;
+        supervisor.await.context("replication supervisor failed")?;
+        watchdog.await.context("memory watchdog failed")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let signalled = async {
+        let _ = grace_start.recv().await;
+    };
+    match pintail::shutdown::finish_within(serve, signalled, pintail::shutdown::GRACE).await {
+        Some(result) => result?,
+        None => pintail_log::log_info!(
+            "shutdown: connections still open after {}s (an event stream or a long request); \
+             closing them",
+            pintail::shutdown::GRACE.as_secs()
+        ),
+    }
+    pintail_log::log_info!("shutdown: complete");
     Ok(())
 }
 
