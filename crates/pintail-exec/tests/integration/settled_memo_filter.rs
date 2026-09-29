@@ -70,10 +70,7 @@ fn fixture() -> Fixture {
                     0 => Value::Null,
                     tier => Value::Int64(signed(tier - 1)),
                 };
-                stored(
-                    id,
-                    vec![Value::UInt64(id), Value::Int64(signed(id)), tier],
-                )
+                stored(id, vec![Value::UInt64(id), Value::Int64(signed(id)), tier])
             })
             .collect(),
     ];
@@ -179,7 +176,10 @@ const PREDICATES: &[&str] = &[
 fn reference(fixture: &Fixture, predicate: &str, grouped: bool) -> Vec<Vec<String>> {
     let predicate = predicate.replace("e.", "x.");
     let (select, group) = if grouped {
-        ("x.bucket, COUNT(*), SUM(x.iid)", "GROUP BY x.bucket ORDER BY x.bucket")
+        (
+            "x.bucket, COUNT(*), SUM(x.iid)",
+            "GROUP BY x.bucket ORDER BY x.bucket",
+        )
     } else {
         ("COUNT(*), SUM(x.iid)", "")
     };
@@ -192,7 +192,10 @@ fn reference(fixture: &Fixture, predicate: &str, grouped: bool) -> Vec<Vec<Strin
 fn sweep(grouped: bool) {
     let fixture = fixture();
     let (select, group) = if grouped {
-        ("i.bucket, COUNT(*), SUM(i.id)", "GROUP BY i.bucket ORDER BY i.bucket")
+        (
+            "i.bucket, COUNT(*), SUM(i.id)",
+            "GROUP BY i.bucket ORDER BY i.bucket",
+        )
     } else {
         ("COUNT(*), SUM(i.id)", "")
     };
@@ -226,12 +229,17 @@ fn predicates_above_an_outer_join_key_the_memo_grouped() {
 fn is_null_then_coalesce_zero_answer_apart() {
     let fixture = fixture();
     let count = |predicate: &str| {
-        fixture.run(&format!("SELECT COUNT(*), SUM(i.id) {JOIN} WHERE {predicate}"))
+        fixture.run(&format!(
+            "SELECT COUNT(*), SUM(i.id) {JOIN} WHERE {predicate}"
+        ))
     };
     let is_null = count("e.tier IS NULL");
     let coalesce = count("COALESCE(e.tier, 0) = 0");
     assert_eq!(is_null, reference(&fixture, "e.tier IS NULL", false));
-    assert_eq!(coalesce, reference(&fixture, "COALESCE(e.tier, 0) = 0", false));
+    assert_eq!(
+        coalesce,
+        reference(&fixture, "COALESCE(e.tier, 0) = 0", false)
+    );
     assert_ne!(is_null, coalesce);
 }
 

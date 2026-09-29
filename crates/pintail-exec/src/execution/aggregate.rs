@@ -2569,14 +2569,13 @@ pub(super) fn build_hash_aggregate(
         None
     } else {
         settled_plan_key(input).and_then(|(directory, generation, scan)| {
-            settled_signature(group_by, aggregates)
-                .map(|signature| {
-                    (
-                        directory,
-                        generation,
-                        format!("p{scan:?};{signature}k{collation:?}{key_collations:?}"),
-                    )
-                })
+            settled_signature(group_by, aggregates).map(|signature| {
+                (
+                    directory,
+                    generation,
+                    format!("p{scan:?};{signature}k{collation:?}{key_collations:?}"),
+                )
+            })
         })
     };
     if std::env::var_os("PINTAIL_AGG_DEBUG").is_some() {
