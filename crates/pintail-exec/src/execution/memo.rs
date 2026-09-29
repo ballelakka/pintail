@@ -40,6 +40,7 @@ use pintail_sql::{BoundExpr, BoundExprKind, BoundQuery, WindowFunction};
 use pintail_types::Value;
 
 use super::MemoryTracker;
+use super::dependent_index::{IndexState, IndexStats};
 
 /// Entries one memo holds at most. Above this the key set is doing no
 /// sharing worth its bookkeeping, and the bound keeps the pathological
@@ -69,6 +70,10 @@ pub(crate) struct DependentMemo {
     cursor: SubquerySlot,
     hits: u64,
     misses: u64,
+    /// Per `EXISTS` slot, the hash index answering it in place of per-row
+    /// executions, once one is planned (`dependent_index`).
+    pub(super) indexes: HashMap<SubquerySlot, IndexState>,
+    pub(super) index_stats: IndexStats,
 }
 
 impl DependentMemo {
@@ -87,7 +92,15 @@ impl DependentMemo {
             cursor: 0,
             hits: 0,
             misses: 0,
+            indexes: HashMap::new(),
+            index_stats: IndexStats::default(),
         }
+    }
+
+    /// Whether `slot`'s body may be answered from anything but a fresh
+    /// execution: the memo's own condition, which the index shares.
+    pub(super) fn memoizable(&self, slot: SubquerySlot) -> bool {
+        self.memoizable.get(slot).copied().unwrap_or(false)
     }
 
     /// Starts a row: subquery slots are handed out again from the first.
@@ -182,10 +195,16 @@ impl DependentMemo {
     pub(crate) fn finish(mut self, memory: &MemoryTracker) -> DependentMemoStats {
         memory.release(self.reserved);
         self.reserved = 0;
+        for state in self.indexes.values_mut() {
+            if let IndexState::Built(index) = state {
+                index.release(memory);
+            }
+        }
         DependentMemoStats {
             hits: self.hits,
             misses: self.misses,
             disabled: self.disabled,
+            index: self.index_stats,
         }
     }
 }
@@ -196,6 +215,7 @@ pub(crate) struct DependentMemoStats {
     pub(super) hits: u64,
     pub(super) misses: u64,
     pub(super) disabled: bool,
+    pub(super) index: IndexStats,
 }
 
 /// Bytes one entry costs: both vectors' headers, every value's inline size
@@ -341,7 +361,7 @@ fn expr_is_volatile(expression: &BoundExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DependentMemo, entry_bytes};
+    use super::{DependentMemo, IndexStats, entry_bytes};
     use crate::execution::MemoryTracker;
     use pintail_types::Value;
 
@@ -360,6 +380,8 @@ mod tests {
             cursor: 0,
             hits: 0,
             misses: 0,
+            indexes: std::collections::HashMap::new(),
+            index_stats: IndexStats::default(),
         };
         memo.insert(&memory, 0, vec![Value::UInt64(1)], &[Value::UInt64(1)]);
         memo.insert(&memory, 0, vec![Value::UInt64(2)], &[Value::UInt64(2)]);
@@ -389,6 +411,8 @@ mod tests {
             cursor: 0,
             hits: 0,
             misses: 0,
+            indexes: std::collections::HashMap::new(),
+            index_stats: IndexStats::default(),
         };
         memo.insert(&memory, 0, vec![Value::Null], &[Value::UInt64(0)]);
         memo.insert(
@@ -421,6 +445,8 @@ mod tests {
             cursor: 0,
             hits: 0,
             misses: 0,
+            indexes: std::collections::HashMap::new(),
+            index_stats: IndexStats::default(),
         };
         let average = Value::DecimalAverage(Box::new(pintail_types::DecimalQuotient {
             label: "0.3333".to_owned(),
@@ -456,6 +482,8 @@ mod tests {
             cursor: 0,
             hits: 0,
             misses: 0,
+            indexes: std::collections::HashMap::new(),
+            index_stats: IndexStats::default(),
         };
         memo.insert(&memory, 0, vec![Value::UInt64(1)], &[Value::UInt64(9)]);
         assert!(memo.entries.is_empty());

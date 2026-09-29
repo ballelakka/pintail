@@ -2,6 +2,7 @@ mod aggregate;
 pub use aggregate::take_fold_phase_timings;
 mod budget;
 mod columnar_sort;
+mod dependent_index;
 mod error;
 pub(crate) mod gather;
 mod join;
@@ -3394,6 +3395,16 @@ fn dependent_subquery_values(
     maximum_rows: Option<usize>,
 ) -> Result<Vec<Value>, ExecError> {
     let slot = memo.next_slot();
+    dependent_subquery_values_at(slot, query, context, memo, maximum_rows)
+}
+
+fn dependent_subquery_values_at(
+    slot: memo::SubquerySlot,
+    query: &BoundQuery,
+    context: &DependentRow<'_>,
+    memo: &mut DependentMemo,
+    maximum_rows: Option<usize>,
+) -> Result<Vec<Value>, ExecError> {
     let mut query = query.clone();
     let mut key = Vec::new();
     substitute_outer_query(
@@ -3438,8 +3449,14 @@ pub(super) fn resolve_dependent_expr_subqueries(
             expression.kind = BoundExprKind::Literal(value);
         }
         BoundExprKind::ExistsSubquery { query, negated } => {
-            let values = dependent_subquery_values(query, context, memo, Some(1))?;
-            expression.kind = BoundExprKind::Literal(Value::Boolean(values.is_empty() == *negated));
+            let slot = memo.next_slot();
+            let found = match dependent_exists_from_index(slot, query, context, memo)? {
+                Some(found) => found,
+                None => {
+                    !dependent_subquery_values_at(slot, query, context, memo, Some(1))?.is_empty()
+                }
+            };
+            expression.kind = BoundExprKind::Literal(Value::Boolean(found != *negated));
             expression.nullable = false;
         }
         BoundExprKind::InSubquery {
@@ -3539,6 +3556,51 @@ pub(super) fn resolve_dependent_expr_subqueries(
         | BoundExprKind::Literal(_) => {}
     }
     Ok(())
+}
+
+/// Answers a dependent `EXISTS` from its slot's hash index when the shape
+/// has one (`dependent_index`), or `None` for the per-row path to answer.
+/// The index is planned on the slot's first row and built once the per-row
+/// path has answered the rows it waits out; every refusal along the way
+/// leaves the per-row path answering, as it did before the index existed.
+fn dependent_exists_from_index(
+    slot: memo::SubquerySlot,
+    query: &BoundQuery,
+    context: &DependentRow<'_>,
+    memo: &mut DependentMemo,
+) -> Result<Option<bool>, ExecError> {
+    use dependent_index::IndexState;
+    if !memo.memoizable(slot) {
+        return Ok(None);
+    }
+    let state = memo
+        .indexes
+        .entry(slot)
+        .or_insert_with(|| dependent_index::plan(query));
+    if let IndexState::Pending { plan, remaining } = state {
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Ok(None);
+        }
+        *state = if let Some(index) = dependent_index::build(plan, context) {
+            memo.index_stats.builds += 1;
+            crate::counters::count(|counters| {
+                counters.dependent_index_builds = counters.dependent_index_builds.saturating_add(1);
+            });
+            IndexState::Built(Box::new(index))
+        } else {
+            memo.index_stats.declines += 1;
+            IndexState::Declined
+        };
+    }
+    let IndexState::Built(index) = state else {
+        return Ok(None);
+    };
+    let found = dependent_index::probe(index, context)?;
+    if found.is_some() {
+        memo.index_stats.probes += 1;
+    }
+    Ok(found)
 }
 
 /// Short-circuiting functions resolve only the branch they take. The memo
@@ -3655,7 +3717,41 @@ pub fn dependent_memo_misses() -> u64 {
     DEPENDENT_MEMO_MISSES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static DEPENDENT_INDEX_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEPENDENT_INDEX_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEPENDENT_INDEX_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Hash indexes built to answer a dependent `EXISTS` in place of per-row
+/// executions, since process start.
+#[must_use]
+pub fn dependent_index_builds() -> u64 {
+    DEPENDENT_INDEX_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Outer rows a dependent `EXISTS` index answered, since process start.
+#[must_use]
+pub fn dependent_index_probes() -> u64 {
+    DEPENDENT_INDEX_PROBES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Index builds that gave up - a refused charge, too many rows, a key that
+/// was not an integer - and left the per-row path answering, since process
+/// start.
+#[must_use]
+pub fn dependent_index_declines() -> u64 {
+    DEPENDENT_INDEX_DECLINES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(super) fn record_dependent_memo(stats: memo::DependentMemoStats) {
+    DEPENDENT_INDEX_BUILDS.fetch_add(stats.index.builds, std::sync::atomic::Ordering::Relaxed);
+    DEPENDENT_INDEX_PROBES.fetch_add(stats.index.probes, std::sync::atomic::Ordering::Relaxed);
+    DEPENDENT_INDEX_DECLINES.fetch_add(stats.index.declines, std::sync::atomic::Ordering::Relaxed);
+    crate::counters::count(|counters| {
+        counters.dependent_index_probes = counters
+            .dependent_index_probes
+            .saturating_add(stats.index.probes);
+    });
     DEPENDENT_MEMO_HITS.fetch_add(stats.hits, std::sync::atomic::Ordering::Relaxed);
     DEPENDENT_MEMO_MISSES.fetch_add(stats.misses, std::sync::atomic::Ordering::Relaxed);
     if stats.disabled {

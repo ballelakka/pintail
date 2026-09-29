@@ -33,6 +33,11 @@ pub struct ExecCounters {
     /// Text sort keys left on the comparator because the query ceiling had
     /// no room to hold weight keys for every row.
     pub sort_keys_unprepared: u64,
+    /// Hash indexes a dependent `EXISTS` built so outer rows look their
+    /// correlation keys up instead of each executing the inner query.
+    pub dependent_index_builds: u64,
+    /// Outer rows a dependent `EXISTS` index answered.
+    pub dependent_index_probes: u64,
 }
 
 thread_local! {
@@ -47,6 +52,8 @@ thread_local! {
             grouped_spans_reused: 0,
             sort_keys_prepared: 0,
             sort_keys_unprepared: 0,
+            dependent_index_builds: 0,
+            dependent_index_probes: 0,
         })
     };
 }

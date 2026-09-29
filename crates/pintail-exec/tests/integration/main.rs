@@ -13,6 +13,7 @@ mod decimal_negative_range;
 mod decimal_scale_widening;
 mod dense_group_kernels;
 mod dependent_aggregate_argument;
+mod dependent_exists_index;
 mod dependent_subquery_ratio;
 mod dictionary_text;
 mod enum_empty_member;
