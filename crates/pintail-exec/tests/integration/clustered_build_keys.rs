@@ -217,6 +217,27 @@ fn a_few_parents_join_exactly_the_children_they_have() {
         ),
         vec![vec![Value::UInt64(count), Value::Int64(sum)]]
     );
+    // The child scan's own tests, left to the Filters above once the join's
+    // keys have chosen a few rows, still decide which of those rows stay.
+    let kept = (1..=CHILDREN)
+        .filter(|id| {
+            child_parent(*id).is_some_and(|parent| PICKED.contains(&parent))
+                && child_amount(*id) > 10
+                && id.to_string().contains('7')
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fixture.run(
+            "SELECT COUNT(*), COUNT(c.id), SUM(c.amount) FROM parent p LEFT JOIN child c \
+             ON c.parent_id = p.id AND c.amount > 10 AND c.note LIKE 'child-%7%-with%' \
+             WHERE p.id IN (7, 500, 993)"
+        ),
+        vec![vec![
+            Value::UInt64(kept.len() as u64),
+            Value::UInt64(kept.len() as u64),
+            Value::Int64(kept.iter().map(|id| child_amount(*id)).sum())
+        ]]
+    );
     // A parent with no children keeps its row in a left join, and joins
     // nothing in an inner one.
     let childless = fixture.run(

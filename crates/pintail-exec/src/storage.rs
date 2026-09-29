@@ -2101,18 +2101,15 @@ fn membership_mask(
     Some(mask)
 }
 
-/// Evaluates the compiled predicates over one chunk's predicate columns and
-/// returns the surviving row ranges (coalesced), or `None` when the chunk
-/// cannot or need not be restricted.
-fn prewhere_ranges(
+/// The rows the scan's own filter-first predicates keep in one chunk, and
+/// whether they could be answered from the decoded columns at all. A spec
+/// with no predicates of its own answers with no mask.
+fn predicate_mask(
     spec: &PrewhereSpec,
     columns: &[DecodedColumn],
     row_count: usize,
     exact_ranges: bool,
-) -> Result<Option<pintail_store::PrewhereRanges>, String> {
-    /// Runs separated by fewer than this many rows merge, so near-adjacent
-    /// survivors decode as one block-friendly region.
-    const COALESCE_GAP: usize = 1024;
+) -> Result<(bool, Option<crate::batch::SelectionMask>), String> {
     let packed = exact_ranges
         .then(|| {
             spec.predicates
@@ -2161,7 +2158,7 @@ fn prewhere_ranges(
                 Some(mask) => mask,
                 None => match predicate.evaluate_quiet_mask(&batch) {
                     Some(mask) => mask,
-                    None => return Ok(None),
+                    None => return Ok((false, None)),
                 },
             };
             match &mut combined {
@@ -2172,12 +2169,55 @@ fn prewhere_ranges(
             }
         }
     }
+    Ok((true, combined))
+}
+
+/// The rows a join's keys, pushed into the scan as a span or a set, leave
+/// in one chunk; `None` when no join narrowed the scan.
+fn runtime_mask(
+    spec: &PrewhereSpec,
+    columns: &[DecodedColumn],
+    row_count: usize,
+) -> Result<Option<crate::batch::SelectionMask>, String> {
+    let mut combined = None;
     if let Some(range) = spec.runtime_range
         && let Some(mask) = runtime_range_mask(range, columns, row_count)
     {
-        combined = Some(intersect_masks(combined, mask)?);
+        combined = Some(mask);
     }
-    let Some(mask) = with_membership(spec, columns, row_count, combined)? else {
+    with_membership(spec, columns, row_count, combined)
+}
+
+/// Evaluates the compiled predicates over one chunk's predicate columns and
+/// returns the surviving row ranges (coalesced), or `None` when the chunk
+/// cannot or need not be restricted.
+fn prewhere_ranges(
+    spec: &PrewhereSpec,
+    columns: &[DecodedColumn],
+    row_count: usize,
+    exact_ranges: bool,
+) -> Result<Option<pintail_store::PrewhereRanges>, String> {
+    /// Runs separated by fewer than this many rows merge, so near-adjacent
+    /// survivors decode as one block-friendly region.
+    const COALESCE_GAP: usize = 1024;
+    // A join's keys that already left a few rows in the chunk decide the
+    // decode alone: testing the scan's own predicates over every row costs
+    // more than the Filters above testing them over the few left.
+    const SPARSE_RUNTIME: usize = 16;
+    let runtime = runtime_mask(spec, columns, row_count)?;
+    let sparse = runtime
+        .as_ref()
+        .is_some_and(|mask| mask.count().saturating_mul(SPARSE_RUNTIME) <= row_count);
+    let (predicates_applied, predicates) = if sparse {
+        (false, None)
+    } else {
+        predicate_mask(spec, columns, row_count, exact_ranges)?
+    };
+    let combined = match (predicates, runtime) {
+        (Some(mask), Some(runtime)) => Some(intersect_masks(Some(mask), runtime)?),
+        (mask, runtime) => mask.or(runtime),
+    };
+    let Some(mask) = combined else {
         return Ok(None);
     };
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
@@ -2218,7 +2258,7 @@ fn prewhere_ranges(
     }
     Ok(Some(pintail_store::PrewhereRanges {
         ranges,
-        exact: !coalesced && spec.complete && !spec.predicates.is_empty(),
+        exact: !coalesced && spec.complete && !spec.predicates.is_empty() && predicates_applied,
     }))
 }
 
