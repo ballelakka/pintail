@@ -145,6 +145,17 @@ pub(crate) fn record_statement_warning(warning: ConversionWarning) {
     });
 }
 
+/// Runs `work` and answers its output only when it raised no conversion
+/// warning. Whatever it raised is dropped, and the warnings the statement
+/// held before are left as they were.
+pub(crate) fn without_new_warnings<T>(work: impl FnOnce() -> T) -> Option<T> {
+    let earlier = take_session_conversion_warnings();
+    let output = work();
+    let (_, raised) = take_session_conversion_warnings();
+    SESSION_CONVERSION_WARNINGS.with(|warnings| *warnings.borrow_mut() = earlier);
+    (raised == 0).then_some(output)
+}
+
 /// The warnings one piece of work raised on a pool thread. The statement's
 /// diagnostics live on the thread that runs it, so work handed to the pool
 /// carries what it raised back for [`WorkerWarnings::replay`] to record.

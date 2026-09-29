@@ -9,6 +9,7 @@ mod computed_aggregate_arguments;
 mod conditional_count_windows;
 mod constant_predicate_folds;
 mod correlated_self_join;
+mod date_literal_fold;
 mod date_part_grouping;
 mod decimal_average_exactness;
 mod decimal_internal_digits;

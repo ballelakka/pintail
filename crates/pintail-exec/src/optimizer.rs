@@ -1808,6 +1808,28 @@ fn evaluate_constant(expr: &BoundExpr) -> Option<Value> {
                 .evaluate(&crate::RecordBatch::new(1, Vec::new()).ok()?, 0)
                 .ok()
         }
+        // DATE of a literal names one day for the whole statement. Left
+        // unfolded it kept an enclosing interval and the comparison above
+        // it off the scan's bounds, and re-read the text for every row. A
+        // literal it cannot read warns, and that warning belongs to the
+        // execution, so only a quiet evaluation folds.
+        BoundExprKind::Scalar {
+            function: ScalarFunction::Date,
+            args,
+        } if args
+            .iter()
+            .all(|arg| matches!(arg.kind, BoundExprKind::Literal(_))) =>
+        {
+            let collation = crate::collation::Collation::from_mysql_name(
+                pintail_sql::session_default_collation(),
+            )
+            .unwrap_or_default();
+            let compiled = crate::expression::CompiledExpr::compile(expr, &[], collation).ok()?;
+            let batch = crate::RecordBatch::new(1, Vec::new()).ok()?;
+            crate::execution::without_new_warnings(|| compiled.evaluate(&batch, 0).ok())
+                .flatten()
+                .filter(|value| !matches!(value, Value::Null))
+        }
         BoundExprKind::PreparedIn { .. }
         | BoundExprKind::Column(_)
         | BoundExprKind::GroupKey(_)
