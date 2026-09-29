@@ -105,6 +105,9 @@ pub fn spawn(
                     ));
                 }
             }
+            for database_id in first_snapshots_never_handed_off(&metadata) {
+                resume.entry(database_id).or_insert(false);
+            }
         }
         for (database_id, force) in resume {
             // A database already replicating lost one table's copy, not its
@@ -157,6 +160,24 @@ pub fn spawn(
             }
         }
     })
+}
+
+/// Databases whose first snapshot captured its position but never handed
+/// off, with no table left mid-copy for the interrupted-copy sweep to find:
+/// their tables all read complete, so nothing else would ever start the
+/// stream. Resuming one copies nothing already complete and hands off from
+/// the original position.
+fn first_snapshots_never_handed_off(metadata: &MetaStore) -> Vec<String> {
+    metadata
+        .databases()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|database| {
+            matches!(database.state.as_str(), "created" | "probed")
+                && matches!(metadata.snapshot_checkpoint(&database.id), Ok(Some(_)))
+        })
+        .map(|database| database.id)
+        .collect()
 }
 
 fn supervise_once(state: &ApiState) {
@@ -949,8 +970,48 @@ fn restore_tables_after_restart(state: &ApiState, metadata: &MetaStore) {
 
 #[cfg(test)]
 mod tests {
-    use super::{eligible, open_targets, restore_tables_after_restart};
+    use super::{
+        eligible, first_snapshots_never_handed_off, open_targets, restore_tables_after_restart,
+    };
     use pintail_meta::{DatabaseRecord, MetaStore};
+
+    /// A first copy that stored its position and finished every table but
+    /// never handed off is resumed at restart; one that handed off, or never
+    /// captured a position, is left alone.
+    #[test]
+    fn a_first_snapshot_that_never_handed_off_is_resumed_at_restart() {
+        let directory = tempfile::tempdir().expect("data directory");
+        let metadata =
+            MetaStore::open(&directory.path().join("pintail-meta.db")).expect("metadata");
+        let now = "2026-09-14T00:00:00Z";
+        for id in ["stranded", "live", "fresh"] {
+            metadata
+                .upsert_database(id, id, b"secret", now)
+                .expect("database");
+            metadata
+                .update_database_probe(id, "{}", "cdc", now)
+                .expect("probe");
+        }
+        for id in ["stranded", "live"] {
+            metadata
+                .insert_snapshot_checkpoint_if_absent(
+                    id,
+                    "filepos",
+                    None,
+                    Some("mysql-bin.000003"),
+                    Some(4),
+                    now,
+                )
+                .expect("checkpoint");
+        }
+        metadata
+            .set_database_replication_state("live", "cdc", now)
+            .expect("handoff");
+        assert_eq!(
+            first_snapshots_never_handed_off(&metadata),
+            vec!["stranded".to_owned()]
+        );
+    }
 
     /// Change capture matches table names regardless of case, so once the
     /// source holds two tables whose names differ only in case, neither can
