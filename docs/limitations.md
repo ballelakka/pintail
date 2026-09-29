@@ -246,6 +246,14 @@ stays readable as a list of things to fix.
   exact-decimal comparisons use a common partition to preserve coercion
   semantics. A correlated external set is rebuilt for each uncached outer
   tuple. One value and its comparison scratch must fit in the query budget.
+- `SUM` and `AVG` over a decimal quotient (`AVG((a + b + c) / 3)`) can
+  differ from MySQL in the last digits. MySQL's answer depends on its plan:
+  a grouping it streams in index order folds each quotient at full internal
+  precision, while a grouping through a temporary table first stores each
+  quotient at the division's result scale (dividend scale plus
+  `div_precision_increment`). Pintail always folds the stored quotient, the
+  temporary-table answer, so a query MySQL happens to answer by streaming
+  can differ from it from the fifth decimal place on.
 - A grace join partition that cannot be reduced by hashing replays its
   build rows for each probe row: what a quarter of the ceiling holds is
   read from the file once, and the rest is re-read per probe. This can
