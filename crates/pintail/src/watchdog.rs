@@ -1,4 +1,9 @@
-//! Once-per-second cooperative cancellation under process or query-budget pressure.
+//! Once-per-second cooperative cancellation under process memory pressure.
+//!
+//! Only resident memory picks a victim. A full query budget is contention
+//! the budget resolves itself - queries wait for releases, and the youngest
+//! holder gives way when all of them wait - so cancelling the largest query
+//! there only threw away the work closest to finishing.
 use pintail_exec::{cancel_query_under_memory_pressure, shared_memory_budget};
 use std::time::{Duration, Instant};
 
@@ -41,11 +46,9 @@ pub fn spawn(mut shutdown: tokio::sync::broadcast::Receiver<()>) -> tokio::task:
                 _ = ticks.tick() => {
                     let resident = tokio::task::spawn_blocking(resident_bytes).await.ok().flatten();
                     let budget = shared_memory_budget();
-                    // Short-circuit: at most one victim per tick, even when
-                    // both the process and operator budgets are under pressure.
+                    // At most one victim per tick.
                     let victim = cadence.try_cancel(Instant::now(), || {
                         resident.and_then(|used| cancel_query_under_memory_pressure(used, process_limit))
-                            .or_else(|| cancel_query_under_memory_pressure(budget.used(), budget.limit()))
                     });
                     if let Some(bytes) = victim {
                         pintail_log::log_info!("memory.watchdog cancelled one query: tracked_bytes={bytes} resident_bytes={resident:?} process_limit={process_limit} query_budget_used={} query_budget_limit={}", budget.used(), budget.limit());

@@ -18,8 +18,19 @@
 //! silently stop them spilling at exactly the moment memory is scarcest.
 //! The reported `scope` distinguishes the two ceilings for a reader without
 //! changing what operators match on.
+//!
+//! A full budget is contention, not a verdict on the query that found it
+//! full. Refusing on the spot turned a burst of identical reports into a
+//! burst of failures, each arriving query tripping over memory the others
+//! were about to give back. [`MemoryBudget::reserve_patiently`] waits for a
+//! release instead, and hands the error back only when waiting cannot help:
+//! the request is larger than the whole budget, the caller is interrupted,
+//! patience runs out, or every query holding memory is itself waiting - a
+//! standstill only a refusal breaks.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use super::ExecError;
 
@@ -49,7 +60,16 @@ impl MemoryScope {
 pub struct MemoryBudget {
     limit: AtomicUsize,
     used: AtomicUsize,
+    /// Reservations currently waiting for a release; a release takes the
+    /// lock and wakes them only when there are any.
+    waiters: AtomicUsize,
+    waiting: Mutex<()>,
+    released: Condvar,
 }
+
+/// How long one wait for a release lasts before the waiter looks again at
+/// its interruption and at whether it is the one that must yield.
+const WAIT_SLICE: Duration = Duration::from_millis(20);
 
 impl MemoryBudget {
     /// A budget of `limit` bytes. Zero is unbounded, so an operator can
@@ -60,6 +80,9 @@ impl MemoryBudget {
         Self {
             limit: AtomicUsize::new(limit),
             used: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
+            waiting: Mutex::new(()),
+            released: Condvar::new(),
         }
     }
 
@@ -121,6 +144,67 @@ impl MemoryBudget {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(bytes))
             });
+        if self.waiters.load(Ordering::Acquire) > 0 {
+            let _held = self
+                .waiting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.released.notify_all();
+        }
+    }
+
+    /// Takes `bytes`, waiting for other reservations to be released when the
+    /// budget is full.
+    ///
+    /// `interrupted` is consulted between waits and ends the wait with its
+    /// error. `must_yield` says the caller is the one that has to give way -
+    /// every holder is waiting and nothing will be released - and ends the
+    /// wait with the budget's own refusal, which a spilling operator answers
+    /// by going to disk and anything else by failing and releasing what it
+    /// held. `patience` bounds the whole wait.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::MemoryLimitExceeded`] with server scope when the request
+    /// can never fit, when the caller must yield or when patience runs out;
+    /// whatever `interrupted` returns when it interrupts.
+    pub fn reserve_patiently(
+        &self,
+        bytes: usize,
+        patience: Duration,
+        interrupted: impl Fn() -> Result<(), ExecError>,
+        must_yield: impl Fn() -> bool,
+    ) -> Result<(), ExecError> {
+        let refused = match self.reserve(bytes) {
+            Ok(()) => return Ok(()),
+            Err(refused) => refused,
+        };
+        if bytes > self.limit() {
+            return Err(refused);
+        }
+        let started = Instant::now();
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        let outcome = loop {
+            if let Err(interruption) = interrupted() {
+                break Err(interruption);
+            }
+            match self.reserve(bytes) {
+                Ok(()) => break Ok(()),
+                Err(refused) if started.elapsed() >= patience || must_yield() => {
+                    break Err(refused);
+                }
+                Err(_) => {}
+            }
+            let held = self
+                .waiting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A release between the refusal above and this wait wakes no
+            // one; the slice bounds how long that can go unnoticed.
+            let _ = self.released.wait_timeout(held, WAIT_SLICE);
+        };
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+        outcome
     }
 
     /// Whether `bytes` would fit without taking them.
@@ -132,8 +216,67 @@ impl MemoryBudget {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use super::{MemoryBudget, MemoryScope};
     use crate::ExecError;
+
+    const PATIENT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn a_full_budget_waits_for_a_release_instead_of_refusing() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        budget.reserve(80).expect("the first query fits");
+        let releaser = {
+            let budget = Arc::clone(&budget);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                budget.release(80);
+            })
+        };
+        budget
+            .reserve_patiently(40, PATIENT, || Ok(()), || false)
+            .expect("the release makes room");
+        releaser.join().expect("releaser");
+        assert_eq!(budget.used(), 40);
+    }
+
+    #[test]
+    fn waiting_ends_with_the_refusal_when_waiting_cannot_help() {
+        let budget = MemoryBudget::new(100);
+        budget.reserve(80).expect("fits");
+        let started = Instant::now();
+        // Larger than the whole budget: no release could ever make room.
+        assert!(matches!(
+            budget.reserve_patiently(101, PATIENT, || Ok(()), || false),
+            Err(ExecError::MemoryLimitExceeded {
+                scope: MemoryScope::Server,
+                ..
+            })
+        ));
+        // Every holder is waiting: this caller is the one to give way.
+        assert!(matches!(
+            budget.reserve_patiently(40, PATIENT, || Ok(()), || true),
+            Err(ExecError::MemoryLimitExceeded { .. })
+        ));
+        // Interrupted while waiting: the interruption, not the refusal.
+        assert_eq!(
+            budget.reserve_patiently(40, PATIENT, || Err(ExecError::QueryCancelled), || false),
+            Err(ExecError::QueryCancelled)
+        );
+        // Patience spent.
+        assert!(
+            budget
+                .reserve_patiently(40, Duration::from_millis(30), || Ok(()), || false)
+                .is_err()
+        );
+        assert!(
+            started.elapsed() < PATIENT,
+            "no refusal waited out its patience"
+        );
+        assert_eq!(budget.used(), 80, "no refused wait was charged");
+    }
 
     #[test]
     fn reservations_accumulate_and_release_symmetrically() {

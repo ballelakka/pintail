@@ -239,6 +239,10 @@ pub fn init_shared_memory_budget(limit: usize) {
     shared_memory_budget().set_limit(limit);
 }
 
+/// The longest one reservation waits on a full process-wide budget before
+/// it is refused. A query's own deadline, when shorter, ends it sooner.
+const SHARED_MEMORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The process-wide budget, unbounded when startup configured none.
 #[must_use]
 pub fn shared_memory_budget() -> &'static MemoryBudget {
@@ -2065,7 +2069,7 @@ impl MemoryTracker {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 if self.charges_shared {
-                    if let Err(error) = shared_memory_budget().reserve(bytes) {
+                    if let Err(error) = self.reserve_shared(bytes) {
                         // The query ceiling already accepted these bytes. Give
                         // them back before reporting, or a refused reservation
                         // permanently shrinks this query's own allowance.
@@ -2087,6 +2091,30 @@ impl MemoryTracker {
                 scope: MemoryScope::Query,
             }),
         }
+    }
+
+    /// Takes `bytes` from the process-wide budget, waiting for other
+    /// queries to release memory when it is full (see
+    /// [`MemoryBudget::reserve_patiently`]). A rayon worker never waits: it
+    /// may be the thread another query needs in order to finish and release,
+    /// so it keeps the immediate refusal.
+    fn reserve_shared(&self, bytes: usize) -> Result<(), ExecError> {
+        let budget = shared_memory_budget();
+        let Some(cancellation) = &self.cancellation else {
+            return budget.reserve(bytes);
+        };
+        if rayon::current_thread_index().is_some() {
+            return budget.reserve(bytes);
+        }
+        cancellation.set_waiting(true);
+        let outcome = budget.reserve_patiently(
+            bytes,
+            SHARED_MEMORY_PATIENCE,
+            || self.check_interruption(),
+            || cancellation.must_yield(),
+        );
+        cancellation.set_waiting(false);
+        outcome
     }
 
     fn release_local(&self, bytes: usize) {

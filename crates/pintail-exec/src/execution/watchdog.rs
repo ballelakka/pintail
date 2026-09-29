@@ -1,13 +1,17 @@
 //! Query lifetime and aggregate reservation accounting for pressure cancellation.
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 #[derive(Debug, Default)]
 struct QueryState {
     cancelled: AtomicBool,
     bytes: AtomicUsize,
+    /// Blocked waiting for the shared budget to release memory.
+    waiting: AtomicBool,
+    /// Registration order: a larger number is a younger query.
+    sequence: u64,
 }
 
 /// Cooperative cancellation shared by all trackers belonging to one query.
@@ -46,6 +50,18 @@ impl ExecutionCancellation {
     pub(super) fn release(&self, bytes: usize) {
         self.state.bytes.fetch_sub(bytes, Ordering::Relaxed);
     }
+
+    /// Marks the query as blocked on the shared budget, or no longer.
+    pub(super) fn set_waiting(&self, waiting: bool) {
+        self.state.waiting.store(waiting, Ordering::Release);
+    }
+
+    /// Whether this query must give way on a full shared budget: every
+    /// live query holding memory is waiting for some to be released, so none
+    /// will be, and this is the youngest of them.
+    pub(super) fn must_yield(&self) -> bool {
+        registry().must_yield(&self.state)
+    }
 }
 
 #[derive(Default)]
@@ -53,7 +69,11 @@ struct Registry(Mutex<Vec<Weak<QueryState>>>);
 
 impl Registry {
     fn register(&self) -> ExecutionCancellation {
-        let state = Arc::new(QueryState::default());
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let state = Arc::new(QueryState {
+            sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            ..QueryState::default()
+        });
         let mut entries = self
             .0
             .lock()
@@ -61,6 +81,29 @@ impl Registry {
         entries.retain(|entry| entry.strong_count() > 0);
         entries.push(Arc::downgrade(&state));
         ExecutionCancellation { state }
+    }
+
+    /// The standstill test behind [`ExecutionCancellation::must_yield`]. A
+    /// query holding nothing never yields - refusing it frees nothing - and
+    /// with no holder at all the budget is held by nothing that will release
+    /// it, so every waiter yields.
+    fn must_yield(&self, state: &Arc<QueryState>) -> bool {
+        let entries = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut youngest: Option<u64> = None;
+        for holder in entries.iter().filter_map(Weak::upgrade) {
+            if holder.cancelled.load(Ordering::Acquire) || holder.bytes.load(Ordering::Relaxed) == 0
+            {
+                continue;
+            }
+            if !holder.waiting.load(Ordering::Acquire) {
+                return false;
+            }
+            youngest = youngest.max(Some(holder.sequence));
+        }
+        youngest.is_none_or(|youngest| youngest == state.sequence)
     }
 
     fn cancel_under_pressure(&self, used: usize, limit: usize) -> Option<usize> {
@@ -128,6 +171,29 @@ mod tests {
         );
         assert_eq!(registry.cancel_under_pressure(950, 1000), Some(100));
         assert_eq!(registry.cancel_under_pressure(950, 1000), None);
+    }
+
+    #[test]
+    fn only_the_youngest_holder_yields_and_only_when_every_holder_waits() {
+        let registry = Registry::default();
+        let older = registry.register();
+        let younger = registry.register();
+        let idle = registry.register();
+        older.reserve(100);
+        younger.reserve(50);
+        idle.set_waiting(true);
+        younger.set_waiting(true);
+        // The older query still runs and will release: nobody yields.
+        assert!(!registry.must_yield(&younger.state));
+        older.set_waiting(true);
+        // A standstill: the youngest holder gives way, the older waits on,
+        // and a query holding nothing never yields (refusing it frees nothing).
+        assert!(registry.must_yield(&younger.state));
+        assert!(!registry.must_yield(&older.state));
+        assert!(!registry.must_yield(&idle.state));
+        // Once the younger is gone, the older is the youngest holder left.
+        younger.cancel();
+        assert!(registry.must_yield(&older.state));
     }
 
     #[test]
