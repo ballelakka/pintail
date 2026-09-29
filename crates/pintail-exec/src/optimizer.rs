@@ -220,7 +220,7 @@ fn sort_scan_prefix(
 fn prune_derived_columns(plan: &mut LogicalPlan) {
     loop {
         let mut required = BTreeSet::new();
-        collect_plan_columns(plan, &mut required, true);
+        collect_columns(plan, &mut required, true, true);
         if !trim_derived_columns(plan, &required, false) {
             break;
         }
@@ -2060,10 +2060,26 @@ fn collect_plan_columns(
     required: &mut BTreeSet<ColumnKey>,
     scan_predicates: bool,
 ) {
+    collect_columns(plan, required, scan_predicates, false);
+}
+
+/// [`collect_plan_columns`]; `readers_only` leaves out what a derived table's
+/// select list passes through unchanged under its own name. A nested join
+/// bound as a derived table keeps its tables' names, so each of its columns
+/// is produced by a reference to the very column it names, which is no
+/// reader of it. Only the derived-column trim may ask this: the scan pruning
+/// must still see every column a kept select list reads.
+#[allow(clippy::too_many_lines)] // exhaustive plan-node recursion reads best unsplit
+fn collect_columns(
+    plan: &LogicalPlan,
+    required: &mut BTreeSet<ColumnKey>,
+    scan_predicates: bool,
+    readers_only: bool,
+) {
     match plan {
         LogicalPlan::Recursive { anchor, member, .. } => {
-            collect_plan_columns(anchor, required, scan_predicates);
-            collect_plan_columns(member, required, scan_predicates);
+            collect_columns(anchor, required, scan_predicates, readers_only);
+            collect_columns(member, required, scan_predicates, readers_only);
         }
         LogicalPlan::Scan(scan) => {
             for predicate in scan.predicates.iter().filter(|_| scan_predicates) {
@@ -2072,12 +2088,12 @@ fn collect_plan_columns(
         }
         LogicalPlan::CrossJoin { inputs } | LogicalPlan::UnionAll { inputs } => {
             for input in inputs {
-                collect_plan_columns(input, required, scan_predicates);
+                collect_columns(input, required, scan_predicates, readers_only);
             }
         }
         LogicalPlan::SetOp { left, right, .. } => {
-            collect_plan_columns(left, required, scan_predicates);
-            collect_plan_columns(right, required, scan_predicates);
+            collect_columns(left, required, scan_predicates, readers_only);
+            collect_columns(right, required, scan_predicates, readers_only);
         }
         LogicalPlan::Join {
             left,
@@ -2085,15 +2101,15 @@ fn collect_plan_columns(
             condition,
             ..
         } => {
-            collect_plan_columns(left, required, scan_predicates);
-            collect_plan_columns(right, required, scan_predicates);
+            collect_columns(left, required, scan_predicates, readers_only);
+            collect_columns(right, required, scan_predicates, readers_only);
             if let Some(condition) = condition {
                 collect_expr_columns(condition, required);
             }
         }
         LogicalPlan::Filter { input, predicate } => {
             collect_expr_columns(predicate, required);
-            collect_plan_columns(input, required, scan_predicates);
+            collect_columns(input, required, scan_predicates, readers_only);
         }
         LogicalPlan::Window { input, windows, .. } => {
             for window in windows {
@@ -2127,13 +2143,13 @@ fn collect_plan_columns(
                     collect_expr_columns(&key.expr, required);
                 }
             }
-            collect_plan_columns(input, required, scan_predicates);
+            collect_columns(input, required, scan_predicates, readers_only);
         }
         LogicalPlan::Project { input, expressions } => {
             for expression in expressions {
                 collect_expr_columns(&expression.expr, required);
             }
-            collect_plan_columns(input, required, scan_predicates);
+            collect_columns(input, required, scan_predicates, readers_only);
         }
         LogicalPlan::Aggregate {
             input,
@@ -2151,13 +2167,29 @@ fn collect_plan_columns(
                     collect_expr_columns(key, required);
                 }
             }
-            collect_plan_columns(input, required, scan_predicates);
+            collect_columns(input, required, scan_predicates, readers_only);
         }
-        LogicalPlan::Derived { input, .. }
-        | LogicalPlan::Distinct { input, .. }
+        LogicalPlan::Derived { input, columns } => match input.as_ref() {
+            LogicalPlan::Project {
+                input: source,
+                expressions,
+            } if readers_only && expressions.len() == columns.len() => {
+                for (column, expression) in columns.iter().zip(expressions) {
+                    if !matches!(
+                        &expression.expr.kind,
+                        BoundExprKind::Column(passed) if column_key(passed) == column_key(column)
+                    ) {
+                        collect_expr_columns(&expression.expr, required);
+                    }
+                }
+                collect_columns(source, required, scan_predicates, readers_only);
+            }
+            _ => collect_columns(input, required, scan_predicates, readers_only),
+        },
+        LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => {
-            collect_plan_columns(input, required, scan_predicates);
+            collect_columns(input, required, scan_predicates, readers_only);
         }
         LogicalPlan::Empty | LogicalPlan::OneRow => {}
     }
@@ -3082,6 +3114,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["id", "shout"]
         );
+    }
+
+    /// A LEFT join whose ON holds a correlated IN widens its right input
+    /// into a nested join bound as a derived table under the right table's
+    /// own name. Its columns pass through unchanged, and one nothing reads
+    /// must still leave the right table's scan.
+    #[test]
+    fn prunes_the_widened_right_input_of_an_outer_join() {
+        fn projected(plan: &LogicalPlan, table: &str, found: &mut Vec<Vec<u32>>) {
+            match plan {
+                LogicalPlan::Scan(scan) if scan.table.table_name == table => {
+                    found.push(scan.projected_column_ids.clone());
+                }
+                LogicalPlan::Join { left, right, .. } => {
+                    projected(left, table, found);
+                    projected(right, table, found);
+                }
+                LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Project { input, .. }
+                | LogicalPlan::Aggregate { input, .. }
+                | LogicalPlan::Distinct { input, .. }
+                | LogicalPlan::Derived { input, .. } => projected(input, table, found),
+                _ => {}
+            }
+        }
+        let plan = optimized(
+            "SELECT u.id, COUNT(e.id) FROM users u LEFT JOIN events e ON e.id = u.id \
+             AND e.id IN (SELECT s.id FROM singleton s WHERE s.name = u.name) GROUP BY u.id",
+        );
+        let mut found = Vec::new();
+        projected(&plan, "events", &mut found);
+        assert_eq!(found, [vec![1]]);
     }
 
     /// A derived table that groups is materialized, and every expression of
