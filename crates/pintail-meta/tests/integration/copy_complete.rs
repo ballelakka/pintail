@@ -309,6 +309,45 @@ fn a_failed_job_hands_its_incomplete_table_to_the_automatic_resync() {
     let _ = &mut store;
 }
 
+/// A failed first snapshot leaves the database in 'error', which the
+/// supervisor still schedules. Its next successful cycle must not hand the
+/// half-copied table back as streaming - it goes to the automatic resync.
+#[test]
+fn a_cycle_after_a_failed_job_quarantines_the_incomplete_table() {
+    let (_directory, store) = store_with_database();
+    let now = "2026-09-05T00:00:00Z";
+    store
+        .update_database_probe("db-1", "{}", "cdc", now)
+        .expect("probe");
+    for name in ["done", "half"] {
+        store
+            .upsert_snapshot_table("db-1", name, Some("[\"id\"]"), Some("[\"id\"]"))
+            .expect("register");
+    }
+    store
+        .complete_snapshot_table("db-1", "done")
+        .expect("copy completes");
+    store
+        .fail_database_job("db-1", "the copy of half failed", now)
+        .expect("job fails");
+    store
+        .set_database_replication_state("db-1", "cdc", now)
+        .expect("cycle completes");
+    assert_eq!(table_state(&store, "done"), ("streaming".to_owned(), true));
+    assert_eq!(
+        table_state(&store, "half"),
+        ("needs_resync".to_owned(), false)
+    );
+    assert_eq!(
+        store
+            .tables_needing_auto_resync_under("db-1", false)
+            .expect("candidates")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["half".to_owned()]
+    );
+}
+
 #[test]
 fn only_an_errored_database_leaves_its_error_state() {
     let (_directory, store) = store_with_database();

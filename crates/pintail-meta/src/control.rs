@@ -1223,6 +1223,18 @@ impl MetaStore {
                 .commit()
                 .context("failed to commit replication-state update");
         }
+        // A failed job or cycle marks every table 'error', the half-copied
+        // ones with the rest. Lifted below they answered as healthy with a
+        // fraction of their rows, and nothing repaired them: the automatic
+        // resync only looks at needs_resync, and only a restart flagged them.
+        transaction
+            .execute(
+                "UPDATE tables SET state = 'needs_resync', \
+                   last_error = COALESCE(last_error, 'the copy did not complete') \
+                 WHERE db_id = ?1 AND state = 'error' AND copy_complete = 0",
+                [id],
+            )
+            .context("failed to flag incomplete tables for resync")?;
         transaction
             .execute(
                 // 'snapshotting' is deliberately NOT lifted here: only the
