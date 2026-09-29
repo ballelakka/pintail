@@ -3412,6 +3412,21 @@ fn date_part_key_source(
         else {
             return None;
         };
+        // Only the parts the scatter can read straight off packed units. A
+        // calendar-topology part (DAYOFWEEK, WEEK, QUARTER, ...) has no
+        // units reading, so admitting it here failed every non-empty input
+        // with "lost its packed units" instead of taking the general path.
+        if !matches!(
+            part,
+            DatePart::Year
+                | DatePart::Month
+                | DatePart::Day
+                | DatePart::Hour
+                | DatePart::Minute
+                | DatePart::Second
+        ) {
+            return None;
+        }
         let [CompiledExpr::Column(column)] = args.as_slice() else {
             return None;
         };
