@@ -408,11 +408,7 @@ async fn run_snapshot_job(
     // whose copy never reached its end - a restart's leftovers - and any
     // table the source added since; walking the complete ones re-read the
     // whole source and turned them all pending while it did.
-    let handed_off = !force
-        && metadata
-            .snapshot_checkpoint(database_id)
-            .map_err(display)?
-            .is_some();
+    let handed_off = !force && has_handed_off(&metadata, &database).map_err(display)?;
     let sources = if handed_off {
         let incomplete = metadata
             .tables_without_complete_copy(database_id)
@@ -574,6 +570,31 @@ async fn run_snapshot_job(
         format!("snapshot run {run_id} completed with {rows} rows"),
     ));
     Ok((rows, bytes.load(Ordering::Relaxed), mode, failed))
+}
+
+/// Whether a database finished its first snapshot and handed off to
+/// replication.
+///
+/// The stored checkpoint alone does not say so: the first snapshot persists
+/// its position as soon as it captures it, so that a copy cut short by a
+/// restart resumes against the same position. A database whose first copy
+/// was interrupted therefore holds a checkpoint while still 'probed' - and
+/// reading that as "already replicating" finished the resumed copy table by
+/// table without ever handing off, leaving the database outside the
+/// supervisor's schedule with every table reporting streaming and no change
+/// ever applied. Only a lifecycle state past onboarding means the handoff
+/// happened.
+pub(crate) fn has_handed_off(
+    metadata: &MetaStore,
+    database: &DatabaseRecord,
+) -> anyhow::Result<bool> {
+    if matches!(
+        database.state.as_str(),
+        "created" | "probed" | "snapshotting"
+    ) {
+        return Ok(false);
+    }
+    Ok(metadata.snapshot_checkpoint(&database.id)?.is_some())
 }
 
 /// Up to a dozen names, then a count of the rest.
@@ -994,7 +1015,7 @@ fn display(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fence_table_after_copy, summarize_names};
+    use super::{fence_table_after_copy, has_handed_off, summarize_names};
     use pintail_meta::MetaStore;
     use pintail_snapshot::SnapshotPosition;
 
@@ -1056,6 +1077,43 @@ mod tests {
         )
         .expect("a polling database has no stream to fence against");
         assert_eq!(fence(&metadata), None);
+    }
+
+    #[test]
+    fn an_interrupted_first_copy_has_not_handed_off() {
+        let directory = tempfile::tempdir().expect("metadata directory");
+        let metadata = MetaStore::open(&directory.path().join("pintail-meta.db")).expect("open");
+        metadata
+            .upsert_database("db-1", "app", b"mysql://source", "2026-07-30T00:00:00Z")
+            .expect("register database");
+        metadata
+            .update_database_probe("db-1", "{}", "cdc", "2026-07-30T00:00:01Z")
+            .expect("probe");
+        let database = |metadata: &MetaStore| {
+            metadata
+                .database("db-1")
+                .expect("read database")
+                .expect("database")
+        };
+        // The first copy persists its position before any table is done.
+        metadata
+            .insert_snapshot_checkpoint_if_absent(
+                "db-1",
+                "filepos",
+                None,
+                Some("mysql-bin.000001"),
+                Some(4),
+                "2026-07-30T00:00:02Z",
+            )
+            .expect("checkpoint");
+        assert!(
+            !has_handed_off(&metadata, &database(&metadata)).expect("judged"),
+            "a checkpoint captured by an unfinished first copy is not a handoff"
+        );
+        metadata
+            .set_database_replication_state("db-1", "cdc", "2026-07-30T00:00:03Z")
+            .expect("handoff");
+        assert!(has_handed_off(&metadata, &database(&metadata)).expect("judged"));
     }
 
     #[test]

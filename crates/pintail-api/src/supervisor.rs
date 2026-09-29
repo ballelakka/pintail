@@ -112,7 +112,8 @@ pub fn spawn(
             // rest of the database stays live meanwhile.
             if !force
                 && let Ok(metadata) = state.metadata()
-                && let Ok(Some(_)) = metadata.snapshot_checkpoint(&database_id)
+                && let Ok(Some(database)) = metadata.database(&database_id)
+                && let Ok(true) = crate::snapshot::has_handed_off(&metadata, &database)
             {
                 state.publish(ApiEvent::database(
                     "resync.resumed",
