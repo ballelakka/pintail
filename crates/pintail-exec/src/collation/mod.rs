@@ -164,6 +164,12 @@ pub fn latin1_sort_key(text: &str, binary: bool) -> Vec<u8> {
 /// against a live server, and implementing something more sensible here would
 /// be a parity bug rather than an improvement.
 fn general_ci_weight(character: char) -> u16 {
+    // The table's only ASCII entries fold a-z onto A-Z, and ASCII is most of
+    // what is compared: answered here, it skips a search of the whole table
+    // per character.
+    if character.is_ascii() {
+        return u16::from(u8::try_from(character).unwrap_or(0).to_ascii_uppercase());
+    }
     let code_point = character as u32;
     let Ok(bmp) = u16::try_from(code_point) else {
         return 0xfffd;
@@ -455,6 +461,17 @@ mod tests {
     fn ascii_case_folds() {
         assert_eq!(compare_general_ci("student", "STUDENT"), Ordering::Equal);
         assert_eq!(general_ci_sort_key("a"), general_ci_sort_key("A"));
+    }
+
+    #[test]
+    fn ascii_weighs_as_the_table_says() {
+        for character in (0_u8..0x80).map(char::from) {
+            let point = u16::from(u8::try_from(character).expect("ascii"));
+            let tabled = super::GENERAL_CI_EXCEPTIONS
+                .binary_search_by_key(&point, |(point, _)| *point)
+                .map_or(point, |index| super::GENERAL_CI_EXCEPTIONS[index].1);
+            assert_eq!(general_ci_weight(character), tabled, "{character:?}");
+        }
     }
 
     #[test]
