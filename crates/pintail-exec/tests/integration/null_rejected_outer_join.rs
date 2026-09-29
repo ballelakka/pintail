@@ -1,8 +1,9 @@
 //! A WHERE conjunct that no null-extended row can pass turns the LEFT join
 //! producing that row into an inner join, so the conjunct filters the
-//! joined relation itself instead of the fanned-out chain above it. Each
-//! answer here is the one the chain gives with the predicate applied last;
-//! the predicates that a null-extended row can pass keep their LEFT joins.
+//! joined relation itself instead of the fanned-out chain above it, and an
+//! EXISTS test runs below the joins it does not read. Each answer here is
+//! the one the chain gives with the predicate applied last; the predicates
+//! that a null-extended row can pass keep their LEFT joins.
 //!
 //! The measurement is `#[ignore]`d:
 //! `cargo test --profile recovery -p pintail-exec --test integration null_rejected_outer_join::
@@ -333,7 +334,43 @@ fn a_semi_join_rejects_the_null_extended_links_it_compares() {
          WHERE x.sid IN (SELECT q.step FROM marks q) GROUP BY x.mid ORDER BY x.mid"
     ));
     assert!(!reference.is_empty());
+    assert_eq!(
+        outermost_join(&fixture.optimized(&sql)),
+        Some(BoundJoinKind::Left),
+        "the test moves below the joins that fan out past the step it reads"
+    );
     assert_eq!(fixture.run(&sql), reference);
+}
+
+fn outermost_join(plan: &LogicalPlan) -> Option<BoundJoinKind> {
+    match plan {
+        LogicalPlan::Join { kind, .. } => Some(*kind),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => outermost_join(input),
+        _ => None,
+    }
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_a_semi_join_under_a_fan_out() {
+    let fixture = fixture(40_000, 2_000, 60);
+    let sql = format!(
+        "{SELECT} {CHAIN} WHERE EXISTS (SELECT 1 FROM marks q WHERE q.step = s.id AND q.id < 20) \
+         {GROUP}"
+    );
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let rows = fixture.run(&sql);
+        println!(
+            "semi join: {} groups in {:?}",
+            rows.len(),
+            started.elapsed()
+        );
+    }
 }
 
 #[test]

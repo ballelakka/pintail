@@ -39,7 +39,8 @@ impl Optimizer {
         for _ in 0..2 {
             plan = propagate_join_constants(plan);
         }
-        let plan = replace_metadata_counts(plan);
+        let mut plan = replace_metadata_counts(plan);
+        sink_semi_joins(&mut plan);
         let plan = reorder_cross_joins(plan);
         let plan = push_aggregates_through_identity_joins(plan);
         let mut plan = plan;
@@ -135,6 +136,106 @@ fn push_top_k_below_left_joins(plan: &mut LogicalPlan) {
         | LogicalPlan::Limit { input, .. } => push_top_k_below_left_joins(input),
         LogicalPlan::Empty | LogicalPlan::OneRow | LogicalPlan::Scan(_) => {}
     }
+}
+
+/// Moves a semi join down a join chain to the lowest join whose left input
+/// holds every relation its condition reads.
+///
+/// `EXISTS (SELECT 1 FROM s WHERE s.k = b.k)` over `a JOIN b LEFT JOIN c
+/// LEFT JOIN d` binds as a semi join above the whole chain, so every row the
+/// joins to `c` and `d` fan out to is built before the test drops it. The
+/// test reads only `b`, and neither an inner join nor a LEFT join changes
+/// the `b` values of the rows it emits from a surviving row, so testing the
+/// `a JOIN b` rows first keeps exactly the same output rows and lets the
+/// fan-out multiply only the rows that pass.
+fn sink_semi_joins(plan: &mut LogicalPlan) {
+    match plan {
+        LogicalPlan::CrossJoin { inputs } | LogicalPlan::UnionAll { inputs } => {
+            inputs.iter_mut().for_each(sink_semi_joins);
+        }
+        LogicalPlan::SetOp { left, right, .. } | LogicalPlan::Join { left, right, .. } => {
+            sink_semi_joins(left);
+            sink_semi_joins(right);
+        }
+        LogicalPlan::Recursive { anchor, member, .. } => {
+            sink_semi_joins(anchor);
+            sink_semi_joins(member);
+        }
+        LogicalPlan::Derived { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Limit { input, .. } => sink_semi_joins(input),
+        LogicalPlan::Empty | LogicalPlan::OneRow | LogicalPlan::Scan(_) => {}
+    }
+    sink_semi_join(plan);
+}
+
+fn sink_semi_join(plan: &mut LogicalPlan) {
+    let LogicalPlan::Join {
+        left,
+        right,
+        kind: BoundJoinKind::Semi,
+        condition: Some(condition),
+    } = plan
+    else {
+        return;
+    };
+    let LogicalPlan::Join {
+        left: kept,
+        right: passed,
+        kind: BoundJoinKind::Inner | BoundJoinKind::Left | BoundJoinKind::Cross,
+        ..
+    } = left.as_ref()
+    else {
+        return;
+    };
+    let mut columns = BTreeSet::new();
+    collect_expr_columns(condition, &mut columns);
+    if expression_contains_subquery(condition)
+        || columns.is_empty()
+        || !columns.iter().all(|column| {
+            let table = (column.0, column.1, column.2.clone());
+            (contains_table(kept, &table) || contains_table(right, &table))
+                && !contains_table(passed, &table)
+        })
+    {
+        return;
+    }
+    let LogicalPlan::Join {
+        left: semi_left,
+        right: semi_right,
+        condition: semi_condition,
+        ..
+    } = std::mem::replace(plan, LogicalPlan::Empty)
+    else {
+        unreachable!("matched a join above");
+    };
+    let LogicalPlan::Join {
+        left: kept,
+        right: passed,
+        kind,
+        condition: passed_condition,
+    } = *semi_left
+    else {
+        unreachable!("matched a join above");
+    };
+    let mut sunk = LogicalPlan::Join {
+        left: kept,
+        right: semi_right,
+        kind: BoundJoinKind::Semi,
+        condition: semi_condition,
+    };
+    sink_semi_join(&mut sunk);
+    *plan = LogicalPlan::Join {
+        left: Box::new(sunk),
+        right: passed,
+        kind,
+        condition: passed_condition,
+    };
 }
 
 /// The scan's first `rows` rows under `keys`, when every key column is one
