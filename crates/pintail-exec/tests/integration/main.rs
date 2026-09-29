@@ -24,6 +24,7 @@ mod group_by_functional_dependency;
 mod group_by_rollup;
 mod grouped_fold;
 mod grouped_fold_spans;
+mod high_cardinality_grouping;
 mod integer_cast_saturation;
 mod join_condition_subquery;
 mod join_frees_its_build;

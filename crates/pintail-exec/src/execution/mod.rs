@@ -3990,6 +3990,44 @@ impl PullOperator {
         key_mode: JoinKeyMode,
         keys: std::sync::Arc<std::collections::HashSet<JoinHashKey>>,
     ) {
+        // Filtering beneath an operator that keeps or drops each row whole,
+        // or each group whole, removes the same output rows as filtering
+        // above it, and saves the work in between: a grouped build side is
+        // aggregated from the rows that can match rather than from the
+        // whole table.
+        if let Some(position) = key.column_index() {
+            match self {
+                Self::Profiled { input, .. }
+                | Self::Filter { input, .. }
+                | Self::KeyFilter { input, .. } => {
+                    input.restrict_build_keys(key, key_mode, keys);
+                    return;
+                }
+                Self::Project { input, expressions } => {
+                    if let Some(inner) = expressions
+                        .get(position)
+                        .and_then(|(expression, _)| expression.column_index())
+                    {
+                        input.restrict_build_keys(CompiledExpr::Column(inner), key_mode, keys);
+                        return;
+                    }
+                }
+                // Only an integer key: grouping and the join then agree on
+                // equality exactly. A text group keeps whichever spelling it
+                // saw first, so a filter below it could change which
+                // spelling the join is shown.
+                Self::HashAggregate {
+                    input, group_by, ..
+                } if matches!(key_mode.form, KeyForm::Integer) => {
+                    if let Some(inner) = group_by.get(position).and_then(CompiledExpr::column_index)
+                    {
+                        input.restrict_build_keys(CompiledExpr::Column(inner), key_mode, keys);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(position) = key.column_index()
             && let Some((minimum, maximum)) = join::integer_key_span(&keys)
         {
