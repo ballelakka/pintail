@@ -40,6 +40,7 @@ mod snapshot;
 mod state;
 mod storage;
 mod supervisor;
+mod upstream;
 mod workspaces;
 
 use axum::{
@@ -252,6 +253,7 @@ pub fn router() -> Router {
 }
 
 /// Builds the authenticated HTTP application.
+#[allow(clippy::too_many_lines)]
 pub fn router_with_state(state: ApiState) -> Router {
     let protected = Router::new()
         .route("/session", get(session))
@@ -285,6 +287,10 @@ pub fn router_with_state(state: ApiState) -> Router {
         .route("/databases/{id}/probe", get(probe_database))
         .route("/databases/{id}/mode", post(set_mode))
         .route("/databases/{id}/status", get(database_status))
+        .route(
+            "/databases/{id}/upstream-tables",
+            get(upstream::list).post(upstream::add),
+        )
         .route(
             "/databases/{id}/backup-config",
             get(get_backup_config).put(put_backup_config),

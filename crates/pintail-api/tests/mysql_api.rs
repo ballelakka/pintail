@@ -537,6 +537,235 @@ async fn a_snapshot_on_a_live_database_copies_only_the_incomplete_table() {
     assert_eq!(nothing_rows, 0);
 }
 
+/// The upstream-tables view names a table the catalog lost as missing and
+/// one outside the include list as not included; adding the latter copies
+/// both, the supervisor repairs a lost row on its own, and a table the
+/// source drops reads as dropped upstream.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the configured Docker host and mysql:8.4 image"]
+#[allow(clippy::too_many_lines)]
+async fn upstream_tables_report_drift_and_add_tables_to_the_mirror() {
+    let mysql = MysqlContainer::start().unwrap_or_else(|error| panic!("{error}"));
+    mysql
+        .query_batch(
+            "CREATE USER IF NOT EXISTS 'pintail'@'%' IDENTIFIED BY 'pintail';\
+             GRANT SELECT, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'pintail'@'%';\
+             CREATE TABLE events (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+               name VARCHAR(255) NULL) ENGINE=InnoDB;\
+             CREATE TABLE notes (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+               body VARCHAR(255) NULL) ENGINE=InnoDB;\
+             CREATE TABLE extras (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+               label VARCHAR(255) NULL) ENGINE=InnoDB;\
+             INSERT INTO events (name) VALUES ('launch'), ('land');\
+             INSERT INTO notes (body) VALUES ('first');\
+             INSERT INTO extras (label) VALUES ('one'), ('two'), ('three');",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    let data = tempfile::tempdir().expect("API data directory");
+    let metadata_path = data.path().join("pintail-meta.db");
+    let state = pintail_api::ApiState::new(
+        data.path(),
+        &metadata_path,
+        b"test-jwt-secret-with-enough-entropy",
+        &"42".repeat(32),
+    )
+    .expect("configured API state");
+    let app = pintail_api::router_with_state(state.clone());
+    let setup = json_response(
+        request(
+            &app,
+            Method::POST,
+            "/api/auth/setup",
+            None,
+            Some(json!({"email": "admin@example.com", "password": "correct horse battery"})),
+        )
+        .await,
+    )
+    .await;
+    let authorization = format!("Bearer {}", setup["token"].as_str().expect("setup token"));
+    let created = json_response(
+        request(
+            &app,
+            Method::POST,
+            "/api/databases",
+            Some(&authorization),
+            Some(json!({
+                "name": "analytics",
+                "dsn": mysql.dsn(),
+                "mode": "polling",
+                "include_tables": ["events", "notes"],
+            })),
+        )
+        .await,
+    )
+    .await;
+    let database_id = created["id"].as_str().expect("database ID").to_owned();
+    assert_eq!(
+        request(
+            &app,
+            Method::GET,
+            &format!("/api/databases/{database_id}/probe"),
+            Some(&authorization),
+            None,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let snapshot = json_response(
+        request(
+            &app,
+            Method::POST,
+            &format!("/api/databases/{database_id}/snapshot"),
+            Some(&authorization),
+            Some(json!({"force": false})),
+        )
+        .await,
+    )
+    .await;
+    let run = snapshot["run_id"].as_str().expect("run").to_owned();
+    wait_for_run(&app, &authorization, &database_id, &run, "completed").await;
+    wait_for_database_state(data.path(), &database_id, "polling").await;
+
+    let uri = format!("/api/databases/{database_id}/upstream-tables");
+    let statuses = |view: &Value| {
+        view["tables"]
+            .as_array()
+            .expect("tables")
+            .iter()
+            .map(|table| {
+                (
+                    table["name"].as_str().expect("name").to_owned(),
+                    table["status"].as_str().expect("status").to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let pair = |name: &str, status: &str| (name.to_owned(), status.to_owned());
+    let view =
+        json_response(request(&app, Method::GET, &uri, Some(&authorization), None).await).await;
+    assert_eq!(
+        statuses(&view),
+        vec![
+            pair("events", "mirrored"),
+            pair("extras", "not-included"),
+            pair("notes", "mirrored"),
+        ]
+    );
+    assert_eq!(view["include_all"], false);
+    assert!(view["tables"][1]["estimated_rows"].is_u64());
+
+    // A catalog that lost an included table's row.
+    MetaStore::open(&metadata_path)
+        .expect("metadata")
+        .remove_table(&database_id, "notes")
+        .expect("catalog row removed");
+    let view =
+        json_response(request(&app, Method::GET, &uri, Some(&authorization), None).await).await;
+    assert_eq!(statuses(&view)[2], pair("notes", "missing"));
+    assert_eq!(view["counts"]["missing"], 1);
+
+    let unknown = request(
+        &app,
+        Method::POST,
+        &uri,
+        Some(&authorization),
+        Some(json!({"tables": ["no_such_table"]})),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+
+    let added = request(
+        &app,
+        Method::POST,
+        &uri,
+        Some(&authorization),
+        Some(json!({"tables": ["EXTRAS"]})),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::ACCEPTED);
+    let added = json_response(added).await;
+    assert_eq!(added["added_to_include"], json!(["extras"]));
+    let added_run = added["run_id"].as_str().expect("added run").to_owned();
+    wait_for_run(&app, &authorization, &database_id, &added_run, "completed").await;
+    let view =
+        json_response(request(&app, Method::GET, &uri, Some(&authorization), None).await).await;
+    assert_eq!(
+        statuses(&view),
+        vec![
+            pair("events", "mirrored"),
+            pair("extras", "mirrored"),
+            pair("notes", "mirrored"),
+        ],
+        "the snapshot copied the added table and the missing one"
+    );
+    let database = json_response(
+        request(
+            &app,
+            Method::GET,
+            &format!("/api/databases/{database_id}"),
+            Some(&authorization),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        database["include_tables"],
+        json!(["events", "notes", "extras"])
+    );
+    let counted = request(
+        &app,
+        Method::POST,
+        "/api/query",
+        Some(&authorization),
+        Some(json!({"db": database_id, "sql": "SELECT COUNT(*) FROM extras"})),
+    )
+    .await;
+    assert_eq!(counted.status(), StatusCode::OK);
+    assert_eq!(json_response(counted).await["rows"], json!([[3]]));
+
+    // Lost again, the supervisor notices and repairs it on its own.
+    MetaStore::open(&metadata_path)
+        .expect("metadata")
+        .remove_table(&database_id, "notes")
+        .expect("catalog row removed");
+    let (shutdown, _) = tokio::sync::broadcast::channel(1);
+    let supervisor = pintail_api::spawn_supervisor(state, shutdown.subscribe());
+    let mut repaired = false;
+    for _ in 0..600 {
+        let tables = MetaStore::open(&metadata_path)
+            .expect("metadata")
+            .tables(&database_id)
+            .expect("tables");
+        if tables
+            .iter()
+            .any(|table| table.name == "notes" && table.copy_complete)
+        {
+            repaired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        repaired,
+        "the supervisor did not repair the lost catalog row"
+    );
+    let _ = shutdown.send(());
+    tokio::time::timeout(Duration::from_secs(30), supervisor)
+        .await
+        .expect("supervisor shutdown timeout")
+        .expect("supervisor task");
+
+    mysql
+        .query_batch("DROP TABLE extras;")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let view =
+        json_response(request(&app, Method::GET, &uri, Some(&authorization), None).await).await;
+    assert_eq!(statuses(&view)[1], pair("extras", "dropped-upstream"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the configured Docker host and mysql:8.4 image"]
 #[allow(clippy::too_many_lines)]

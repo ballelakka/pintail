@@ -356,6 +356,10 @@ async fn supervise_database(state: ApiState, database: DatabaseRecord) {
     // and losing the claim to another claimant in the window costs one
     // cycle, not correctness.
     crate::controls::auto_resync_quarantined(&state, &database.id);
+    // Included tables the catalog lost are never recreated by the stream,
+    // which only adopts tables it sees created; the same non-forced snapshot
+    // an operator would start copies them, on a gap so it cannot loop.
+    crate::upstream::repair_catalog_drift(&state, &database.id);
     if let Err(error) = start_scheduled_if_due(&state, &database.id) {
         state.publish(ApiEvent::database(
             "backup.schedule.error",

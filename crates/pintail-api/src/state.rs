@@ -68,6 +68,10 @@ struct ApiStateInner {
     /// revoked key stops working on its next request rather than at the
     /// entry's next natural eviction.
     api_key_cache: Mutex<HashMap<[u8; 32], CachedApiKey>>,
+    /// When the supervisor last started a catalog repair per database, so a
+    /// repair that cannot succeed is retried on a gap rather than every
+    /// cadence (`upstream::repair_catalog_drift`).
+    catalog_repairs: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 #[derive(Clone)]
@@ -164,6 +168,7 @@ impl ApiState {
                 metrics: RuntimeMetrics::default(),
                 replica_engine,
                 api_key_cache: Mutex::new(HashMap::new()),
+                catalog_repairs: Mutex::new(HashMap::new()),
             })),
             wire_bind: None,
             query_memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
@@ -497,6 +502,17 @@ impl ApiState {
                 )))
             }
         }
+    }
+
+    /// Runs `action` over the per-database catalog-repair clock; `None` when
+    /// the API is unconfigured or the lock is poisoned.
+    pub(crate) fn with_catalog_repairs<T>(
+        &self,
+        action: impl FnOnce(&mut HashMap<String, std::time::Instant>) -> T,
+    ) -> Option<T> {
+        let inner = self.inner.as_ref()?;
+        let mut repairs = inner.catalog_repairs.lock().ok()?;
+        Some(action(&mut repairs))
     }
 
     pub(crate) fn release_job(&self, database_id: &str) {

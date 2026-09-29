@@ -155,7 +155,9 @@ fn render(state: &ApiState) -> anyhow::Result<String> {
          # HELP pintail_backup_runs Backup runs by terminal or active status.\n\
          # TYPE pintail_backup_runs gauge\n\
          # HELP pintail_restored_data_age_seconds Age of the restored backup manifest in seconds.\n\
-         # TYPE pintail_restored_data_age_seconds gauge\n",
+         # TYPE pintail_restored_data_age_seconds gauge\n\
+         # HELP pintail_catalog_missing_tables Included source tables absent from the catalog.\n\
+         # TYPE pintail_catalog_missing_tables gauge\n",
     );
     let now = Utc::now();
     for database in &databases {
@@ -213,6 +215,13 @@ fn render(state: &ApiState) -> anyhow::Result<String> {
                 output,
                 "pintail_table_paused{{database=\"{database_id}\",table=\"{table_name}\"}} {}",
                 u8::from(table.paused.is_some())
+            );
+        }
+        if database.kind != "local" {
+            let missing = crate::upstream::stored_drift(&metadata, database)?.len();
+            let _ = writeln!(
+                output,
+                "pintail_catalog_missing_tables{{database=\"{database_id}\"}} {missing}"
             );
         }
         let dlq = metadata.dlq_records(Some(&database.id), 1_000_000)?.len();

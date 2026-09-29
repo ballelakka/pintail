@@ -1146,3 +1146,176 @@ async fn storage_reports_both_volumes_and_refuses_an_anonymous_caller() {
         storage["system"]["total_bytes"]
     );
 }
+
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    authorization: Option<&str>,
+    body: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(authorization) = authorization {
+        builder = builder.header(header::AUTHORIZATION, authorization);
+    }
+    let body = match body {
+        Some(body) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(body.to_owned())
+        }
+        None => Body::empty(),
+    };
+    app.clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap()
+}
+
+/// The upstream-tables routes answer only an authenticated operator, never
+/// reach for a source a local database does not have, and refuse a request
+/// they cannot act on before touching the source or the selection.
+#[tokio::test]
+async fn upstream_tables_routes_refuse_what_they_cannot_act_on() {
+    let data = tempfile::tempdir().expect("API data directory");
+    let app = pintail_api::router_with_state(configured_state(data.path()));
+    let authorization = format!("Bearer {}", setup_admin(&app).await);
+    let database = create_database(&app, &authorization, "app").await;
+    let database_id = database["id"].as_str().expect("database ID");
+    let uri = format!("/api/databases/{database_id}/upstream-tables");
+
+    assert_eq!(
+        call(&app, "GET", &uri, None, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, "POST", &uri, None, Some(r#"{"tables":["events"]}"#))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            "/api/databases/db_missing/upstream-tables",
+            Some(&authorization),
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let empty = call(
+        &app,
+        "POST",
+        &uri,
+        Some(&authorization),
+        Some(r#"{"tables":["  "]}"#),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+    let local = call(
+        &app,
+        "POST",
+        "/api/databases/local",
+        Some(&authorization),
+        Some(r#"{"name":"scratch"}"#),
+    )
+    .await;
+    assert_eq!(local.status(), StatusCode::CREATED);
+    let local_id = json_response(local).await["id"]
+        .as_str()
+        .expect("local ID")
+        .to_owned();
+    let local_uri = format!("/api/databases/{local_id}/upstream-tables");
+    let refused = call(&app, "GET", &local_uri, Some(&authorization), None).await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            &local_uri,
+            Some(&authorization),
+            Some(r#"{"tables":["events"]}"#)
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+
+    // A paused database is refused before the selection changes.
+    let paused = call(
+        &app,
+        "POST",
+        &format!("/api/databases/{database_id}/mode"),
+        Some(&authorization),
+        Some(r#"{"mode":"paused"}"#),
+    )
+    .await;
+    assert_eq!(paused.status(), StatusCode::OK);
+    let refused = call(
+        &app,
+        "POST",
+        &uri,
+        Some(&authorization),
+        Some(r#"{"tables":["events"]}"#),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_response(refused).await,
+        serde_json::json!({"error": "resume the database before adding tables"})
+    );
+}
+
+/// A catalog that lost an included table's row is counted where an operator
+/// already looks: the metrics endpoint, one gauge per replicated database.
+#[tokio::test]
+async fn metrics_count_included_tables_missing_from_the_catalog() {
+    let data = tempfile::tempdir().expect("API data directory");
+    let app = pintail_api::router_with_state(configured_state(data.path()));
+    let authorization = format!("Bearer {}", setup_admin(&app).await);
+    let database = create_database(&app, &authorization, "drifted").await;
+    let database_id = database["id"].as_str().expect("database ID").to_owned();
+    seed_mirrored_table(data.path(), &database_id, "drifted");
+
+    let gauge = |metrics: &str| {
+        metrics
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "pintail_catalog_missing_tables{{database=\"{database_id}\"}}"
+                ))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    let scrape = || async {
+        let body = call(&app, "GET", "/metrics", None, None)
+            .await
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    };
+    assert_eq!(gauge(&scrape().await).as_deref(), Some("0"));
+
+    // The source gains a second table in the stored probe that the catalog
+    // never recorded: the shape a metadata recovery that lost rows leaves.
+    let mut second = test_source_table();
+    second.name = "notes".to_owned();
+    let mut report = test_probe_report("drifted", test_source_table());
+    report.tables.push(second);
+    pintail_meta::MetaStore::open(&data.path().join("pintail-meta.db"))
+        .unwrap()
+        .refresh_database_probe_json(
+            &database_id,
+            &serde_json::to_string(&report).unwrap(),
+            "2026-07-30T00:00:02Z",
+        )
+        .unwrap();
+    assert_eq!(gauge(&scrape().await).as_deref(), Some("1"));
+}
