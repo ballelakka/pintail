@@ -285,3 +285,53 @@ fn measure_a_fanning_join_chain_under_an_aggregate() {
         );
     }
 }
+
+/// The chain with the residual spelled without COALESCE: a probe row with no
+/// start date keeps the sessions on or after the literal, any other the
+/// sessions on or after its date.
+const GROUPED_EXPANDED: &str = "SELECT m.team, m.id, COUNT(DISTINCT st.id), \
+     COUNT(DISTINCT se.id), \
+     SUM(CASE WHEN mk.id IS NOT NULL AND mk.present = 1 THEN 1 ELSE 0 END), COUNT(*) \
+     FROM members m \
+     LEFT JOIN steps st ON st.team = m.team \
+     LEFT JOIN sessions se ON se.step = st.id \
+       AND (se.held >= m.since OR (m.since IS NULL AND se.held >= '1900-01-01 00:00:00')) \
+     LEFT JOIN marks mk ON mk.session = se.id AND mk.member = m.id \
+     GROUP BY m.team, m.id ORDER BY m.id";
+
+/// A DATETIME compared with `COALESCE(datetime, 'literal')` compares as a
+/// DATETIME, whether the literal is a date or a datetime, and a residual
+/// reading two of the joined columns answers as one reading them all.
+#[test]
+fn a_datetime_coalesce_residual_answers_as_its_expanded_form() {
+    let fixture = Fixture::new(6_000);
+    let expanded = fixture.run(GROUPED_EXPANDED);
+    assert!(expanded.len() >= 6_000, "{}", expanded.len());
+    assert!(fixture.run(GROUPED) == expanded, "a date literal");
+    let datetime_literal = GROUPED.replace("'1900-01-01'", "'1900-01-01 00:00:00'");
+    assert!(
+        fixture.run(&datetime_literal) == expanded,
+        "a datetime literal"
+    );
+    // A literal after every session keeps only the probe rows with a date.
+    let late = fixture.run(
+        "SELECT COUNT(*) FROM members m JOIN sessions se ON se.step = m.team \
+         AND se.held >= COALESCE(m.since, '2099-01-01')",
+    );
+    let dated = fixture.run(
+        "SELECT COUNT(*) FROM members m JOIN sessions se ON se.step = m.team \
+         AND se.held >= m.since",
+    );
+    assert_eq!(late, dated);
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_a_datetime_coalesce_residual() {
+    let fixture = Fixture::new(200_000);
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let rows = fixture.run(GROUPED).len();
+        println!("{rows} rows in {:?}", started.elapsed());
+    }
+}

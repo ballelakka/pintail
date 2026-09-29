@@ -7041,6 +7041,17 @@ const COMMON_TEMPORAL: DataType = DataType::DateTime64 { fsp: 6 };
 /// written a DATE never equalled the DATETIME at its midnight. Both are read
 /// as DATETIME(6), whose fixed-width text orders as time does.
 fn unify_temporal_operands(left: BoundExpr, right: BoundExpr) -> (BoundExpr, BoundExpr) {
+    if matches!(left.data_type, Some(DataType::DateTime64 { .. }))
+        && let Some(right) = datetime_coalesce(&right)
+    {
+        return datetime_pair(left, right);
+    }
+    if matches!(right.data_type, Some(DataType::DateTime64 { .. }))
+        && let Some(left) = datetime_coalesce(&left)
+    {
+        let (right, left) = datetime_pair(right, left);
+        return (left, right);
+    }
     let text_column =
         |expr: &BoundExpr| is_plain_text(expr) && matches!(expr.kind, BoundExprKind::Column(_));
     if is_temporal(left.data_type) && text_column(&right) {
@@ -7063,6 +7074,112 @@ fn unify_temporal_operands(left: BoundExpr, right: BoundExpr) -> (BoundExpr, Bou
     } else {
         (left, right)
     }
+}
+
+/// Two DATETIME operands read at one type: as they are where the types
+/// already agree, else both as DATETIME(6).
+fn datetime_pair(left: BoundExpr, right: BoundExpr) -> (BoundExpr, BoundExpr) {
+    if left.data_type == right.data_type {
+        (left, right)
+    } else {
+        (as_common_temporal(left), as_common_temporal(right))
+    }
+}
+
+/// `COALESCE(datetime, 'literal')` typed as the DATETIME it holds, for a
+/// comparison with a DATETIME.
+///
+/// `MySQL` types the COALESCE as text, and compares that text with the
+/// DATETIME as a DATETIME - so each row's value was spelled out and read
+/// back, and here compared as text under the collation, per row and per
+/// join candidate. The text of a DATETIME reads back as that DATETIME, and
+/// a literal that is a valid calendar datetime reads as its canonical
+/// spelling, so the COALESCE of the DATETIMEs and that spelling compares
+/// exactly as the text does. Any other shape - another argument type, or a
+/// literal other than a valid date or whole-second datetime in its plain
+/// spelling - is left as written.
+fn datetime_coalesce(expr: &BoundExpr) -> Option<BoundExpr> {
+    let BoundExprKind::Scalar {
+        function: ScalarFunction::Coalesce,
+        args,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    if expr.data_type != Some(DataType::Utf8) {
+        return None;
+    }
+    let datetime = |argument: &BoundExpr| -> Option<BoundExpr> {
+        if matches!(argument.data_type, Some(DataType::DateTime64 { .. })) {
+            return Some(argument.clone());
+        }
+        match &argument.kind {
+            BoundExprKind::Scalar {
+                function: ScalarFunction::Cast(DataType::Utf8),
+                args,
+            } if matches!(args[0].data_type, Some(DataType::DateTime64 { .. })) => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        }
+    };
+    let mut target = None;
+    for argument in args {
+        if let Some(argument) = datetime(argument) {
+            match target {
+                None => target = argument.data_type,
+                Some(seen) if Some(seen) != argument.data_type => target = Some(COMMON_TEMPORAL),
+                Some(_) => {}
+            }
+        }
+    }
+    let target = target?;
+    let DataType::DateTime64 { fsp } = target else {
+        return None;
+    };
+    let mut rewritten = Vec::with_capacity(args.len());
+    for argument in args {
+        if let Some(argument) = datetime(argument) {
+            rewritten.push(if argument.data_type == Some(target) {
+                argument
+            } else {
+                as_common_temporal(argument)
+            });
+            continue;
+        }
+        let BoundExprKind::Literal(value) = &argument.kind else {
+            return None;
+        };
+        match value {
+            Value::Null => rewritten.push(argument.clone()),
+            Value::Utf8(text) => {
+                let parsed = TemporalLiteral::parse(text)?;
+                // Only the plain spellings, `YYYY-MM-DD` and
+                // `YYYY-MM-DD HH:MM:SS`, of a valid day.
+                let plain = *text == parsed.canonical(false, 0)
+                    || (*text == parsed.canonical(true, 0) && text.len() == 10);
+                if !plain || !parsed.is_valid() || parsed.day == 0 || parsed.month == 0 {
+                    return None;
+                }
+                rewritten.push(BoundExpr {
+                    kind: BoundExprKind::Literal(Value::Utf8(
+                        parsed.canonical(false, usize::from(fsp)),
+                    )),
+                    data_type: Some(DataType::Utf8),
+                    nullable: false,
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(BoundExpr {
+        kind: BoundExprKind::Scalar {
+            function: ScalarFunction::Coalesce,
+            args: rewritten,
+        },
+        data_type: Some(target),
+        nullable: expr.nullable,
+    })
 }
 
 /// A text column compared with a calendar value is parsed as DATETIME.
