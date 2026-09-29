@@ -1655,6 +1655,15 @@ fn build_prewhere_spec(
         // The predicate layout must be available in the projection.
         return None;
     }
+    // The predicates name their columns under the relation the query gave
+    // the table, and compiling matches that name: a layout under the bare
+    // table name failed to compile for every aliased table, and the scan
+    // silently decoded every projected column of every row.
+    let relation_name = scan
+        .predicates
+        .iter()
+        .find_map(predicate_relation_name)
+        .unwrap_or_else(|| scan.table.table_name.clone());
     let mut layout = Vec::with_capacity(predicate_ids.len());
     let mut data_types = Vec::with_capacity(predicate_ids.len());
     let mut enum_labels = Vec::with_capacity(predicate_ids.len());
@@ -1669,7 +1678,7 @@ fn build_prewhere_spec(
             database_id: scan.table.database_id,
             table_id: scan.table.table_id,
             column_id: *id,
-            relation_name: scan.table.table_name.clone(),
+            relation_name: relation_name.clone(),
             name: column.name().to_owned(),
             data_type: column.data_type(),
             nullable: column.is_nullable(),
@@ -1719,6 +1728,22 @@ fn build_prewhere_spec(
         set_members,
         collation,
     })
+}
+
+/// The relation name the first column a predicate reads is bound under.
+fn predicate_relation_name(expr: &BoundExpr) -> Option<String> {
+    match &expr.kind {
+        BoundExprKind::Column(column) => Some(column.relation_name.clone()),
+        BoundExprKind::PreparedIn { expr, .. }
+        | BoundExprKind::Unary { expr, .. }
+        | BoundExprKind::IsNull { expr, .. }
+        | BoundExprKind::InSubquery { expr, .. } => predicate_relation_name(expr),
+        BoundExprKind::Binary { left, right, .. } => {
+            predicate_relation_name(left).or_else(|| predicate_relation_name(right))
+        }
+        BoundExprKind::Scalar { args, .. } => args.iter().find_map(predicate_relation_name),
+        _ => None,
+    }
 }
 
 fn collect_predicate_columns(expr: &BoundExpr, ids: &mut Vec<u32>) {
