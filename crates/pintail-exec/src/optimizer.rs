@@ -41,6 +41,7 @@ impl Optimizer {
         }
         let mut plan = replace_metadata_counts(plan);
         sink_semi_joins(&mut plan);
+        nest_outer_join_bridges(&mut plan);
         let plan = reorder_cross_joins(plan);
         let plan = push_aggregates_through_identity_joins(plan);
         let mut plan = plan;
@@ -236,6 +237,403 @@ fn sink_semi_join(plan: &mut LogicalPlan) {
         kind,
         condition: passed_condition,
     };
+}
+
+/// Joins a LEFT-joined relation to the relations it is reached through
+/// before joining the result to the preserved side, when only duplicate-
+/// and NULL-insensitive aggregates read it.
+///
+/// `a LEFT JOIN b ON b.k = a.k LEFT JOIN c ON c.b = b.id AND c.a = a.id`
+/// grouped by `a` builds a row for every `b` of every `a`, null-extended
+/// wherever no `c` matches, though `b` serves only to reach `c`. When every
+/// aggregate is `COUNT(DISTINCT ...)`, `MIN` or `MAX` of a value that is NULL
+/// whenever `c` is, the null-extended rows add nothing but the group itself,
+/// which `a` keeps anyway, and repeated `c` rows add nothing at all. So
+/// `a LEFT JOIN (b JOIN c ON c.b = b.id) ON b.k = a.k AND c.a = a.id` gives
+/// every group the same values while building only the rows that reach a
+/// `c`. Each bridging relation must be one that a matched `c` cannot exist
+/// without (a condition further along compares its columns), no grouping
+/// key, aggregate or later join may read it, and the joins after `c` must
+/// be LEFT joins.
+fn nest_outer_join_bridges(plan: &mut LogicalPlan) {
+    match plan {
+        LogicalPlan::CrossJoin { inputs } | LogicalPlan::UnionAll { inputs } => {
+            inputs.iter_mut().for_each(nest_outer_join_bridges);
+        }
+        LogicalPlan::SetOp { left, right, .. } | LogicalPlan::Join { left, right, .. } => {
+            nest_outer_join_bridges(left);
+            nest_outer_join_bridges(right);
+        }
+        LogicalPlan::Recursive { anchor, member, .. } => {
+            nest_outer_join_bridges(anchor);
+            nest_outer_join_bridges(member);
+        }
+        LogicalPlan::Derived { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Limit { input, .. } => nest_outer_join_bridges(input),
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            nest_outer_join_bridges(input);
+            if let Some((bridge, target)) = outer_join_bridge(input, group_by, aggregates) {
+                let joined = std::mem::replace(input.as_mut(), LogicalPlan::Empty);
+                **input = nest_bridge(joined, bridge, target);
+            }
+        }
+        LogicalPlan::Empty | LogicalPlan::OneRow | LogicalPlan::Scan(_) => {}
+    }
+}
+
+/// One join of a left-deep chain: its kind, right input and condition.
+type SpineJoin<'a> = (BoundJoinKind, &'a LogicalPlan, Option<&'a BoundExpr>);
+
+/// A left-deep join chain as its first input and each join above it.
+fn join_spine(plan: &LogicalPlan) -> (&LogicalPlan, Vec<SpineJoin<'_>>) {
+    let mut joins = Vec::new();
+    let mut spine = plan;
+    while let LogicalPlan::Join {
+        left,
+        right,
+        kind,
+        condition,
+    } = spine
+    {
+        joins.push((*kind, right.as_ref(), condition.as_ref()));
+        spine = left;
+    }
+    joins.reverse();
+    (spine, joins)
+}
+
+fn plan_tables(plan: &LogicalPlan, out: &mut BTreeSet<TableKey>) {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            out.insert(table_key(&scan.table));
+        }
+        LogicalPlan::Derived { input, columns } => {
+            out.extend(columns.iter().map(column_table_key));
+            plan_tables(input, out);
+        }
+        LogicalPlan::CrossJoin { inputs } | LogicalPlan::UnionAll { inputs } => {
+            for input in inputs {
+                plan_tables(input, out);
+            }
+        }
+        LogicalPlan::SetOp { left, right, .. } | LogicalPlan::Join { left, right, .. } => {
+            plan_tables(left, out);
+            plan_tables(right, out);
+        }
+        LogicalPlan::Recursive { anchor, member, .. } => {
+            plan_tables(anchor, out);
+            plan_tables(member, out);
+        }
+        LogicalPlan::Window { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => plan_tables(input, out),
+        LogicalPlan::Empty | LogicalPlan::OneRow => {}
+    }
+}
+
+/// Whether `expr` is NULL whenever every relation in `tables` is.
+fn null_when(expr: &BoundExpr, tables: &BTreeSet<TableKey>) -> bool {
+    match &expr.kind {
+        BoundExprKind::Literal(Value::Null) => true,
+        BoundExprKind::Column(column) => {
+            !column.outer && tables.contains(&column_table_key(column))
+        }
+        BoundExprKind::Unary { expr, .. } => null_when(expr, tables),
+        BoundExprKind::Binary { op, left, right } => match op {
+            BinaryOp::And | BinaryOp::Or => null_when(left, tables) && null_when(right, tables),
+            _ => null_when(left, tables) || null_when(right, tables),
+        },
+        // CASE WHEN .. THEN v [ELSE w] END: NULL when every result is.
+        BoundExprKind::Scalar {
+            function: ScalarFunction::If,
+            args,
+        } => args.len() == 3 && null_when(&args[1], tables) && null_when(&args[2], tables),
+        BoundExprKind::Scalar {
+            function: ScalarFunction::Cast(_),
+            args,
+        } => args.first().is_some_and(|arg| null_when(arg, tables)),
+        _ => false,
+    }
+}
+
+/// The first bridging join and the target join's positions in the chain,
+/// when the aggregate above it admits nesting the bridge.
+#[allow(clippy::too_many_lines)] // one validate pass over the chain, in order
+fn outer_join_bridge(
+    input: &LogicalPlan,
+    group_by: &[BoundExpr],
+    aggregates: &[BoundAggregate],
+) -> Option<(usize, usize)> {
+    if aggregates.is_empty()
+        || !aggregates.iter().all(|aggregate| {
+            aggregate.order_within.is_empty()
+                && aggregate.separator.is_none()
+                && aggregate.expr.is_some()
+                && match aggregate.function {
+                    AggregateFunction::Count => aggregate.distinct,
+                    // Text extremes pick one spelling among values that
+                    // compare equal, and arrival order decides which.
+                    AggregateFunction::Minimum | AggregateFunction::Maximum => matches!(
+                        aggregate.expr.as_ref().and_then(|expr| expr.data_type),
+                        Some(
+                            DataType::Int8
+                                | DataType::Int16
+                                | DataType::Int32
+                                | DataType::Int64
+                                | DataType::UInt8
+                                | DataType::UInt16
+                                | DataType::UInt32
+                                | DataType::UInt64
+                                | DataType::Decimal { .. }
+                                | DataType::Date32
+                                | DataType::DateTime64 { .. }
+                        )
+                    ),
+                    _ => false,
+                }
+        })
+    {
+        return None;
+    }
+    let (_, joins) = join_spine(input);
+    let tables = joins
+        .iter()
+        .map(|(_, right, _)| {
+            let mut tables = BTreeSet::new();
+            plan_tables(right, &mut tables);
+            tables
+        })
+        .collect::<Vec<_>>();
+    let mut grouped = BTreeSet::new();
+    for expr in group_by {
+        grouped.extend(referenced_tables(expr));
+    }
+    for target in (1..joins.len()).rev() {
+        if joins[target..]
+            .iter()
+            .any(|(kind, _, _)| *kind != BoundJoinKind::Left)
+        {
+            break;
+        }
+        // The target and every later join a missing target row
+        // null-extends: aggregates must be NULL on all of those rows.
+        let mut nulled = tables[target].clone();
+        for (index, (_, _, condition)) in joins.iter().enumerate().skip(target + 1) {
+            if condition.is_some_and(|condition| {
+                conjuncts_of(condition)
+                    .into_iter()
+                    .any(|conjunct| !null_rejected_tables(conjunct).is_disjoint(&nulled))
+            }) {
+                nulled.extend(tables[index].iter().cloned());
+            }
+        }
+        if !aggregates.iter().all(|aggregate| {
+            aggregate
+                .expr
+                .as_ref()
+                .is_some_and(|expr| null_when(expr, &nulled))
+        }) {
+            continue;
+        }
+        let mut read_outside = grouped.clone();
+        for aggregate in aggregates {
+            read_outside.extend(aggregate.expr.iter().flat_map(referenced_tables));
+        }
+        for (_, _, condition) in &joins[target + 1..] {
+            read_outside.extend(
+                condition
+                    .iter()
+                    .flat_map(|condition| referenced_tables(condition)),
+            );
+        }
+        // A bridging relation joins the nest only through its whole key, so
+        // the nest holds at most one row per target row: a relation that
+        // matched many nest rows would multiply the nest instead of pruning
+        // the chain.
+        let mut bridge = target;
+        let mut reached = tables[target].clone();
+        while bridge > 0 {
+            let index = bridge - 1;
+            if joins[index].0 != BoundJoinKind::Left
+                || !read_outside.is_disjoint(&tables[index])
+                || !joins[bridge..=target].iter().any(|(_, _, condition)| {
+                    condition.is_some_and(|condition| {
+                        keyed_from(joins[index].1, &conjuncts_of(condition), &reached)
+                    })
+                })
+            {
+                break;
+            }
+            bridge = index;
+            reached.extend(tables[index].iter().cloned());
+        }
+        // A grouping key read from the nest or after it would group the
+        // null-extended rows the nest no longer builds.
+        if bridge == target
+            || tables[bridge..]
+                .iter()
+                .any(|tables| !tables.is_disjoint(&grouped))
+            || joins[bridge..=target].iter().any(|(_, _, condition)| {
+                condition.is_none_or(|condition| {
+                    expression_contains_subquery(condition) || is_volatile(condition)
+                })
+            })
+        {
+            continue;
+        }
+        // Each nested join past the first needs a condition of its own
+        // inside the nest, or it would become a Cartesian product there.
+        let mut inside = tables[bridge].clone();
+        let mut linked = true;
+        for index in bridge + 1..=target {
+            inside.extend(tables[index].iter().cloned());
+            linked &= joins[index].2.is_some_and(|condition| {
+                conjuncts_of(condition).into_iter().any(|conjunct| {
+                    let read = referenced_tables(conjunct);
+                    read.is_subset(&inside) && !read.is_disjoint(&tables[index])
+                })
+            });
+        }
+        if !linked {
+            continue;
+        }
+        // The target must be keyed on the preserved side too, or nesting
+        // only moves the fan-out inside.
+        let keyed = joins[target].2.is_some_and(|condition| {
+            conjuncts_of(condition).into_iter().any(|conjunct| {
+                let read = referenced_tables(conjunct);
+                !read.is_disjoint(&tables[target]) && !read.is_subset(&reached)
+            })
+        });
+        if keyed {
+            return Some((bridge, target));
+        }
+    }
+    None
+}
+
+/// Whether `conjuncts` equate every key column of the relation `plan`
+/// scans with a column of the relations in `from`.
+fn keyed_from(plan: &LogicalPlan, conjuncts: &[&BoundExpr], from: &BTreeSet<TableKey>) -> bool {
+    let mut scanned = plan;
+    while let LogicalPlan::Project { input, .. } | LogicalPlan::Filter { input, .. } = scanned {
+        scanned = input;
+    }
+    let LogicalPlan::Scan(scan) = scanned else {
+        return false;
+    };
+    let table = table_key(&scan.table);
+    let keys = &scan.table.key_column_ids;
+    !keys.is_empty()
+        && keys.iter().all(|key| {
+            conjuncts.iter().any(|conjunct| {
+                let BoundExprKind::Binary {
+                    op: BinaryOp::Equal,
+                    left,
+                    right,
+                } = &conjunct.kind
+                else {
+                    return false;
+                };
+                let (BoundExprKind::Column(left), BoundExprKind::Column(right)) =
+                    (&left.kind, &right.kind)
+                else {
+                    return false;
+                };
+                [(left, right), (right, left)].iter().any(|(own, other)| {
+                    !own.outer
+                        && !other.outer
+                        && column_table_key(own) == table
+                        && own.column_id == *key
+                        && from.contains(&column_table_key(other))
+                })
+            })
+        })
+}
+
+fn nest_bridge(plan: LogicalPlan, bridge: usize, target: usize) -> LogicalPlan {
+    let mut joins = Vec::new();
+    let mut spine = plan;
+    while let LogicalPlan::Join {
+        left,
+        right,
+        kind,
+        condition,
+    } = spine
+    {
+        joins.push((kind, *right, condition));
+        spine = *left;
+    }
+    joins.reverse();
+    let mut rest = joins.split_off(target + 1);
+    let nested_joins = joins.split_off(bridge);
+    let mut preserved = spine;
+    for (kind, right, condition) in joins {
+        preserved = LogicalPlan::Join {
+            left: Box::new(preserved),
+            right: Box::new(right),
+            kind,
+            condition,
+        };
+    }
+    let mut reached = BTreeSet::new();
+    let mut outer = Vec::new();
+    let mut nested: Option<LogicalPlan> = None;
+    for (_, right, condition) in nested_joins {
+        plan_tables(&right, &mut reached);
+        let mut inner = Vec::new();
+        for conjunct in condition.map(split_conjunction).unwrap_or_default() {
+            if referenced_tables(&conjunct).is_subset(&reached) {
+                inner.push(conjunct);
+            } else {
+                outer.push(conjunct);
+            }
+        }
+        let inner = inner.into_iter().reduce(and_expr);
+        nested = Some(match nested {
+            None => match inner {
+                None => right,
+                Some(predicate) => LogicalPlan::Filter {
+                    input: Box::new(right),
+                    predicate,
+                },
+            },
+            Some(left) => LogicalPlan::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                kind: BoundJoinKind::Inner,
+                condition: inner,
+            },
+        });
+    }
+    let mut plan = LogicalPlan::Join {
+        left: Box::new(preserved),
+        right: Box::new(nested.expect("the bridge holds at least two joins")),
+        kind: BoundJoinKind::Left,
+        condition: outer.into_iter().reduce(and_expr),
+    };
+    for (kind, right, condition) in rest.drain(..) {
+        plan = LogicalPlan::Join {
+            left: Box::new(plan),
+            right: Box::new(right),
+            kind,
+            condition,
+        };
+    }
+    plan
 }
 
 /// The scan's first `rows` rows under `keys`, when every key column is one

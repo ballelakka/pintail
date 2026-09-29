@@ -3,11 +3,14 @@
 //! joined relation itself instead of the fanned-out chain above it, and an
 //! EXISTS test runs below the joins it does not read. Each answer here is
 //! the one the chain gives with the predicate applied last; the predicates
-//! that a null-extended row can pass keep their LEFT joins.
+//! that a null-extended row can pass keep their LEFT joins. Distinct-only
+//! aggregates over a LEFT join reached through a keyed bridge join the
+//! bridge to it first, and answer as the chain written out does.
 //!
-//! The measurement is `#[ignore]`d:
-//! `cargo test --profile recovery -p pintail-exec --test integration null_rejected_outer_join::
-//! -- --ignored --nocapture`.
+//! The measurements are `#[ignore]`d, and a repeat answers from the settled
+//! memo unless it is off:
+//! `PINTAIL_DISABLE_SETTLED_MEMO=1 cargo test --profile recovery -p pintail-exec
+//! --test integration null_rejected_outer_join:: -- --ignored --nocapture`.
 
 use pintail_catalog::{
     CatalogSnapshot, DatabaseEntry, DatabaseId, TableEntry, TableId, TableStatistics,
@@ -389,6 +392,110 @@ fn measure_a_filtered_fan_out() {
         println!(
             "{} groups: whole chain then filter {whole:?}, filter first {:?}",
             rows.len(),
+            started.elapsed()
+        );
+    }
+}
+
+fn nested_left_joins(plan: &LogicalPlan) -> usize {
+    match plan {
+        LogicalPlan::Join {
+            left, right, kind, ..
+        } => {
+            usize::from(
+                *kind == BoundJoinKind::Left && matches!(right.as_ref(), LogicalPlan::Join { .. }),
+            ) + nested_left_joins(left)
+                + nested_left_joins(right)
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Derived { input, .. } => nested_left_joins(input),
+        _ => 0,
+    }
+}
+
+#[test]
+fn distinct_aggregates_join_the_bridge_before_the_preserved_side() {
+    let fixture = fixture(300, 20, 4);
+    let chain = "FROM members m LEFT JOIN teams t ON t.id = m.team \
+                 LEFT JOIN steps s ON s.plan = t.plan \
+                 LEFT JOIN marks k ON k.step = s.id AND k.member = m.id AND k.id > m.since";
+    let bridged = "FROM members m LEFT JOIN teams t ON t.id = m.team \
+                   LEFT JOIN orgs o ON o.id = t.org \
+                   LEFT JOIN steps s ON s.plan = t.plan \
+                   LEFT JOIN marks k ON k.step = s.id AND k.member = m.id \
+                   LEFT JOIN marks j ON j.id = k.id + 1";
+    for (from, select, nested) in [
+        (
+            chain,
+            "COUNT(DISTINCT k.id), MIN(k.step), MAX(k.id), \
+             COUNT(DISTINCT CASE WHEN k.step > 3 THEN k.id END)",
+            1,
+        ),
+        (
+            bridged,
+            "COUNT(DISTINCT k.id), COUNT(DISTINCT j.member), MAX(o.tier)",
+            0,
+        ),
+        (bridged, "COUNT(DISTINCT k.id), COUNT(DISTINCT j.member)", 1),
+        // Rows count: every null-extended row is one.
+        (chain, "COUNT(DISTINCT k.id), COUNT(*)", 0),
+        // A value present on null-extended rows.
+        (chain, "COUNT(DISTINCT COALESCE(k.id, 0))", 0),
+        // The bridge read by the aggregate.
+        (chain, "COUNT(DISTINCT k.id), MAX(s.id)", 0),
+        (chain, "SUM(k.id)", 0),
+    ] {
+        let sql = format!("SELECT m.id, {select} {from} GROUP BY m.id ORDER BY m.id");
+        // Grouped by a value of the nest, a missing match is its own group.
+        let by_target = format!("SELECT m.id, k.step, {select} {from} GROUP BY m.id, k.step");
+        assert_eq!(
+            nested_left_joins(&fixture.optimized(&by_target)),
+            0,
+            "{select}"
+        );
+        assert_eq!(
+            nested_left_joins(&fixture.optimized(&sql)),
+            nested,
+            "{select}"
+        );
+        // COUNT(*) reads every row, so the same query with it added keeps
+        // the chain as written.
+        let reference = fixture
+            .run(&format!(
+                "SELECT m.id, {select}, COUNT(*) {from} GROUP BY m.id ORDER BY m.id"
+            ))
+            .into_iter()
+            .map(|mut row| {
+                row.pop();
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reference.len(), 300, "{select}");
+        assert_eq!(fixture.run(&sql), reference, "{select}");
+    }
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_a_nested_bridge() {
+    let fixture = fixture(40_000, 2_000, 60);
+    let from = "FROM members m LEFT JOIN teams t ON t.id = m.team \
+                LEFT JOIN steps s ON s.plan = t.plan \
+                LEFT JOIN marks k ON k.step = s.id AND k.member = m.id";
+    let nested = format!("SELECT m.id, COUNT(DISTINCT k.id) {from} GROUP BY m.id");
+    let chained = format!("SELECT m.id, COUNT(DISTINCT k.id), COUNT(*) {from} GROUP BY m.id");
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let rows = fixture.run(&chained).len();
+        let whole = started.elapsed();
+        let started = std::time::Instant::now();
+        assert_eq!(fixture.run(&nested).len(), rows);
+        println!(
+            "{rows} groups: chain as written {whole:?}, bridge nested {:?}",
             started.elapsed()
         );
     }
