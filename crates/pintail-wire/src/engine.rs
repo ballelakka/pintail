@@ -473,7 +473,12 @@ impl ReplicaEngine {
             let table = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
-            if is_directory && let Some(generation) = pintail_store::published_generation(&table) {
+            // A table no writer here has opened since the process started
+            // is leased on first sight, so it is walked once, not per query.
+            if is_directory
+                && let Some(generation) = pintail_store::published_generation(&table)
+                    .or_else(|| pintail_store::lease_unwritten_table(&table))
+            {
                 stamp.tables.insert(name, TableStamp::Published(generation));
                 continue;
             }

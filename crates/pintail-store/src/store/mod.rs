@@ -35,7 +35,7 @@ enum AppendKeyPolicy {
     Generate,
     Preserve,
 }
-const WRITER_LOCK_FILE: &str = ".writer.lock";
+pub(crate) const WRITER_LOCK_FILE: &str = ".writer.lock";
 const DEFAULT_MEMTABLE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_BLOCK_ROWS: usize = 16 * 1024;
 const DEFAULT_COMPACTION_FAN_IN: usize = 4;
