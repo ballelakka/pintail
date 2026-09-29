@@ -345,6 +345,29 @@ fn a_semi_join_rejects_the_null_extended_links_it_compares() {
     assert_eq!(fixture.run(&sql), reference);
 }
 
+#[test]
+fn a_predicate_on_a_table_a_derived_table_rescans_keeps_its_left_join() {
+    // Unaliased, the outer `teams` and the one the grouped derived table
+    // joins inside share a name; the WHERE reads only the outer one, so
+    // teams without a counted member keep their null-extended row.
+    let fixture = fixture(300, 20, 4);
+    let query = |from: &str, outer: &str| {
+        format!(
+            "SELECT COUNT(*), COUNT(c.n), SUM(c.n) FROM {from} \
+             LEFT JOIN (SELECT members.team, COUNT(*) AS n FROM members \
+               JOIN teams ON teams.id = members.team \
+               WHERE teams.plan > 2 AND members.id < 10 GROUP BY members.team) AS c \
+             ON c.team = {outer}.id \
+             WHERE {outer}.plan > 2"
+        )
+    };
+    let sql = query("teams", "teams");
+    let reference = fixture.run(&query("teams AS u", "u"));
+    assert_eq!(left_joins(&fixture.optimized(&sql)), 1);
+    assert_ne!(reference[0][0], reference[0][1], "some teams match nothing");
+    assert_eq!(fixture.run(&sql), reference);
+}
+
 fn outermost_join(plan: &LogicalPlan) -> Option<BoundJoinKind> {
     match plan {
         LogicalPlan::Join { kind, .. } => Some(*kind),

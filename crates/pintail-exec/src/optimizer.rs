@@ -311,14 +311,19 @@ fn join_spine(plan: &LogicalPlan) -> (&LogicalPlan, Vec<SpineJoin<'_>>) {
     (spine, joins)
 }
 
+/// The relations whose columns an expression above `plan` can read.
+///
+/// A derived table exposes only its own columns: the relations inside it
+/// are out of reach, and one that shares a name with a relation outside,
+/// as an unaliased table does when a derived table scans it again, is a
+/// different relation instance under the same key.
 fn plan_tables(plan: &LogicalPlan, out: &mut BTreeSet<TableKey>) {
     match plan {
         LogicalPlan::Scan(scan) => {
             out.insert(table_key(&scan.table));
         }
-        LogicalPlan::Derived { input, columns } => {
+        LogicalPlan::Derived { columns, .. } => {
             out.extend(columns.iter().map(column_table_key));
-            plan_tables(input, out);
         }
         LogicalPlan::CrossJoin { inputs } | LogicalPlan::UnionAll { inputs } => {
             for input in inputs {
@@ -2036,9 +2041,15 @@ fn reject_null_extension(plan: &mut LogicalPlan, rejected: &BTreeSet<TableKey>) 
             kind,
             condition,
         } => {
-            if *kind == BoundJoinKind::Left
-                && rejected.iter().any(|table| contains_table(right, table))
-            {
+            // Only a relation the predicate can read counts: a derived
+            // table's inner scan of a same-named table is not the one the
+            // predicate compares.
+            let exposed = || {
+                let mut tables = BTreeSet::new();
+                plan_tables(right, &mut tables);
+                tables
+            };
+            if *kind == BoundJoinKind::Left && !exposed().is_disjoint(rejected) {
                 *kind = BoundJoinKind::Inner;
                 if let Some(condition) = condition {
                     for conjunct in conjuncts_of(condition) {
