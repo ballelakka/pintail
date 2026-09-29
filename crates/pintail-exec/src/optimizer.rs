@@ -1433,14 +1433,35 @@ fn push_predicates(plan: LogicalPlan) -> LogicalPlan {
             right,
             kind,
             condition,
-        } => LogicalPlan::Join {
-            left: Box::new(push_predicates(*left)),
-            right: Box::new(push_predicates(*right)),
-            kind,
-            condition,
-        },
+        } => {
+            let mut left = push_predicates(*left);
+            let mut right = push_predicates(*right);
+            // An inner or semi join's condition drops every row it cannot
+            // match, which includes the null-extended rows of an outer join
+            // below it whose columns the condition compares.
+            if matches!(kind, BoundJoinKind::Inner | BoundJoinKind::Semi)
+                && let Some(condition) = &condition
+            {
+                for conjunct in conjuncts_of(condition) {
+                    let rejected = null_rejected_tables(conjunct);
+                    reject_null_extension(&mut left, &rejected);
+                    if kind == BoundJoinKind::Inner {
+                        reject_null_extension(&mut right, &rejected);
+                    }
+                }
+            }
+            LogicalPlan::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                kind,
+                condition,
+            }
+        }
         LogicalPlan::Filter { input, predicate } => {
             let mut input = push_predicates(*input);
+            for conjunct in conjuncts_of(&predicate) {
+                reject_null_extension(&mut input, &null_rejected_tables(conjunct));
+            }
             let mut residual = Vec::new();
             for conjunct in split_conjunction(predicate) {
                 if !push_conjunct(&mut input, &conjunct) {
@@ -1493,6 +1514,127 @@ fn push_predicates(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(push_predicates(*input)),
             limit,
         },
+    }
+}
+
+/// Turns a LEFT join into an inner one when a predicate above it rejects
+/// the null-extended rows it adds.
+///
+/// A WHERE conjunct such as `r.k = 5` is never true for a row whose `r`
+/// columns are all NULL, so a LEFT join producing `r` keeps no row the
+/// inner join would not, and the conjunct may then sink into `r` itself
+/// instead of waiting above every join the chain fans out through. The
+/// converted join's own condition rejects nulls in turn: `r.a = l.a` drops
+/// the rows where an outer join further down null-extended `l`.
+fn reject_null_extension(plan: &mut LogicalPlan, rejected: &BTreeSet<TableKey>) {
+    if rejected.is_empty() {
+        return;
+    }
+    match plan {
+        LogicalPlan::Join {
+            left,
+            right,
+            kind,
+            condition,
+        } => {
+            if *kind == BoundJoinKind::Left
+                && rejected.iter().any(|table| contains_table(right, table))
+            {
+                *kind = BoundJoinKind::Inner;
+                if let Some(condition) = condition {
+                    for conjunct in conjuncts_of(condition) {
+                        let implied = null_rejected_tables(conjunct);
+                        reject_null_extension(left, &implied);
+                        reject_null_extension(right, &implied);
+                    }
+                }
+            }
+            reject_null_extension(left, rejected);
+            if matches!(kind, BoundJoinKind::Inner | BoundJoinKind::Cross) {
+                reject_null_extension(right, rejected);
+            }
+        }
+        LogicalPlan::CrossJoin { inputs } => {
+            for input in inputs {
+                reject_null_extension(input, rejected);
+            }
+        }
+        LogicalPlan::Filter { input, .. } => reject_null_extension(input, rejected),
+        _ => {}
+    }
+}
+
+/// The relations whose all-NULL row makes `predicate` NULL or false.
+fn null_rejected_tables(predicate: &BoundExpr) -> BTreeSet<TableKey> {
+    match &predicate.kind {
+        BoundExprKind::Binary { op, left, right } => match op {
+            BinaryOp::And => {
+                let mut tables = null_rejected_tables(left);
+                tables.extend(null_rejected_tables(right));
+                tables
+            }
+            BinaryOp::Or => null_rejected_tables(left)
+                .intersection(&null_rejected_tables(right))
+                .cloned()
+                .collect(),
+            BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::Less
+            | BinaryOp::LessOrEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterOrEqual => {
+                let mut tables = null_propagating_tables(left);
+                tables.extend(null_propagating_tables(right));
+                tables
+            }
+            _ => BTreeSet::new(),
+        },
+        BoundExprKind::IsNull {
+            expr,
+            negated: true,
+        }
+        // `NULL NOT IN (<empty set>)` is true, so only the positive test.
+        | BoundExprKind::PreparedIn {
+            expr,
+            negated: false,
+            ..
+        } => null_propagating_tables(expr),
+        BoundExprKind::Scalar {
+            function:
+                ScalarFunction::Like { .. }
+                | ScalarFunction::InList { .. }
+                | ScalarFunction::Between { .. },
+            args,
+        } => args.first().map_or_else(BTreeSet::new, null_propagating_tables),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// The relations whose all-NULL row makes `expr` evaluate to NULL.
+fn null_propagating_tables(expr: &BoundExpr) -> BTreeSet<TableKey> {
+    match &expr.kind {
+        BoundExprKind::Column(column) if !column.outer => {
+            BTreeSet::from([column_table_key(column)])
+        }
+        BoundExprKind::Unary { expr, .. } => null_propagating_tables(expr),
+        BoundExprKind::Binary { op, left, right } => match op {
+            BinaryOp::And | BinaryOp::Or => null_propagating_tables(left)
+                .intersection(&null_propagating_tables(right))
+                .cloned()
+                .collect(),
+            _ => {
+                let mut tables = null_propagating_tables(left);
+                tables.extend(null_propagating_tables(right));
+                tables
+            }
+        },
+        BoundExprKind::Scalar {
+            function: ScalarFunction::Cast(_),
+            args,
+        } => args
+            .first()
+            .map_or_else(BTreeSet::new, null_propagating_tables),
+        _ => BTreeSet::new(),
     }
 }
 
@@ -3234,10 +3376,12 @@ mod tests {
 
     #[test]
     fn keeps_right_side_where_predicates_above_left_joins() {
+        // A null-extended row can pass `IS NULL`: the join stays LEFT and
+        // the predicate above it.
         let input = project_input(optimized(
             "SELECT events.name FROM events \
              LEFT JOIN users ON events.id = users.id \
-             WHERE users.name = 'selected'",
+             WHERE users.name IS NULL",
         ));
         let LogicalPlan::Filter { input, .. } = input else {
             panic!("right-side WHERE must remain above left join");
@@ -3249,6 +3393,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_null_rejecting_where_turns_the_left_join_inner_and_sinks() {
+        let input = project_input(optimized(
+            "SELECT events.name FROM events \
+             LEFT JOIN users ON events.id = users.id \
+             WHERE users.name = 'selected'",
+        ));
+        let LogicalPlan::Join {
+            kind: pintail_sql::BoundJoinKind::Inner,
+            right,
+            ..
+        } = input
+        else {
+            panic!("a null-rejecting WHERE makes the left join inner: {input:?}");
+        };
+        let mut right = *right;
+        while let LogicalPlan::Project { input, .. } = right {
+            right = *input;
+        }
+        let LogicalPlan::Scan(scan) = right else {
+            panic!("the predicate sinks into the joined scan");
+        };
+        assert_eq!(scan.predicates.len(), 1);
     }
 
     #[test]

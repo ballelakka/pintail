@@ -52,6 +52,7 @@ mod multi_core;
 mod mutated_scan_cost;
 mod mysql_scalar_parity;
 mod no_unsigned_subtraction;
+mod null_rejected_outer_join;
 mod null_safe_join;
 mod out_of_range_diagnostics;
 mod packed_predicate_kernels;
