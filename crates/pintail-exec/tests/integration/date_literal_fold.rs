@@ -158,9 +158,9 @@ fn a_literal_date_cannot_read_still_warns_when_the_statement_runs() {
 fn measure_a_literal_date_range() {
     let fixture = Fixture::new(65_536, 16);
     for sql in [
-        "SELECT COUNT(*) FROM readings \
+        "SELECT SUM(id) FROM readings \
          WHERE logged >= DATE_SUB(DATE('2026-02-28 15:00:00'), INTERVAL 30 DAY)",
-        "SELECT COUNT(*) FROM readings WHERE logged >= '2026-01-29'",
+        "SELECT SUM(id) FROM readings WHERE logged >= '2026-01-29'",
     ] {
         let _ = fixture.run(sql);
         let started = Instant::now();

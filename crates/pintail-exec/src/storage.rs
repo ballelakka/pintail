@@ -1615,8 +1615,12 @@ fn sma_column_bounds(predicates: &[BoundExpr]) -> Vec<pintail_store::ColumnBound
             (BoundDomain::Temporal(NativeUnits::Date), Value::Utf8(text)) => {
                 pintail_types::parse_date_days(text).map(i128::from)
             }
+            // A DATE value - DATE(...), CURDATE() or an interval over one -
+            // compares with a DATETIME column as its midnight.
             (BoundDomain::Temporal(NativeUnits::DateTime { .. }), Value::Utf8(text)) => {
-                pintail_types::parse_datetime_micros(text).map(i128::from)
+                pintail_types::parse_datetime_micros(text)
+                    .or_else(|| pintail_types::parse_date_days(text)?.checked_mul(86_400_000_000))
+                    .map(i128::from)
             }
             _ => None,
         }
@@ -1679,6 +1683,17 @@ fn sma_column_bounds(predicates: &[BoundExpr]) -> Vec<pintail_store::ColumnBound
                     BinaryOp::Equal => apply(column, Some(units), Some(units)),
                     BinaryOp::Less => apply(column, None, Some(units - 1)),
                     BinaryOp::LessOrEqual => apply(column, None, Some(units)),
+                    // Past a bare day only its midnight is certain to be
+                    // excluded, and only when the text reads as a
+                    // DATETIME; the bound keeps midnight either way.
+                    BinaryOp::Greater
+                        if matches!(
+                            domain,
+                            BoundDomain::Temporal(NativeUnits::DateTime { .. })
+                        ) && matches!(literal, Value::Utf8(text) if text.len() == 10) =>
+                    {
+                        apply(column, Some(units), None);
+                    }
                     BinaryOp::Greater => apply(column, Some(units + 1), None),
                     BinaryOp::GreaterOrEqual => apply(column, Some(units), None),
                     _ => {}
