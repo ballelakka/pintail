@@ -793,6 +793,8 @@ impl PhysicalPlanner {
                 let primary = pairs.next().ok_or(ExecError::UnsupportedJoinCondition)?;
                 let (left_key, right_key) = (primary.left, primary.right);
                 let pairs = pairs.map(|key| (key.left, key.right)).collect();
+                let (left, left_filter) = scan_filtered(left, left_filter);
+                let (right, right_filter) = scan_filtered(right, right_filter);
                 let probe_estimate = left.estimated_rows();
                 let build_estimate = right.estimated_rows();
                 let left_input = filtered(Self::plan(*left, collation)?, left_filter);
@@ -1018,6 +1020,54 @@ fn filtered(input: PhysicalPlan, predicate: Option<BoundExpr>) -> PhysicalPlan {
             predicate,
         },
     }
+}
+
+/// Moves an ON clause's one-input conjuncts into that input's scan, when
+/// the input is a table scan (or the payload trim over one), and returns
+/// what could not move. A scan evaluates its predicates over packed
+/// columns and skips the rows they reject before building any row; the
+/// same conjunct left above it in a Filter is evaluated row by row over
+/// everything the scan produced. Filtering a join input by a conjunct of
+/// its own means the same thing in either place, for every join kind that
+/// splits one off.
+fn scan_filtered(
+    mut input: Box<LogicalPlan>,
+    predicate: Option<BoundExpr>,
+) -> (Box<LogicalPlan>, Option<BoundExpr>) {
+    let Some(predicate) = predicate else {
+        return (input, None);
+    };
+    let tables = logical_tables(&input);
+    let scan = match input.as_mut() {
+        LogicalPlan::Project { input, .. } => match input.as_mut() {
+            LogicalPlan::Scan(scan) => Some(scan),
+            _ => None,
+        },
+        LogicalPlan::Scan(scan) => Some(scan),
+        _ => None,
+    };
+    // A bounded scan stops after its limit, so a predicate added to it
+    // would apply after rows it should have skipped were counted. A
+    // recursive working table replays deltas that never see storage
+    // predicates.
+    let Some(scan) = scan.filter(|scan| {
+        scan.limit.is_none()
+            && !(scan.table.database_id == pintail_catalog::DatabaseId::new(u64::MAX)
+                && scan.table.input.is_none())
+    }) else {
+        return (input, Some(predicate));
+    };
+    let mut conjuncts = Vec::new();
+    and_conjuncts(&predicate, &mut conjuncts);
+    let mut kept = Vec::new();
+    for conjunct in conjuncts {
+        if expression_has_subquery(&conjunct) || !expression_belongs_to(&conjunct, &tables) {
+            kept.push(conjunct);
+        } else {
+            scan.predicates.push(conjunct);
+        }
+    }
+    (input, and_all(kept))
 }
 
 fn logically_filtered(input: Box<LogicalPlan>, predicate: Option<BoundExpr>) -> Box<LogicalPlan> {

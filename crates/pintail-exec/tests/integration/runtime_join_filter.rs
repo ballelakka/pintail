@@ -314,3 +314,150 @@ fn a_probe_side_past_the_read_ahead_takes_the_whole_build() {
         "an unfiltered build of every fact must spill at this ceiling"
     );
 }
+
+/// The same group-3 probe, joined to a second copy of the dimensions
+/// first. The probe side is then a join, whose plan estimate multiplies
+/// its inputs: two thousand squared, far past the facts. Read ahead, it
+/// holds fifty rows, and those still filter the facts' build.
+const JOINED_PROBE_LEFT: &str = "SELECT COUNT(*), COUNT(f.id), SUM(f.amount) FROM dim d \
+     JOIN dim d2 ON d2.id = d.id \
+     LEFT JOIN fact f ON f.dim_id = d.id WHERE d.grp = 3";
+
+#[test]
+fn a_probe_side_that_is_a_join_filters_the_build_by_the_rows_it_holds() {
+    let fixture = Fixture::new();
+    let (matched_rows, sum, dims_with_facts) = expected_group_3();
+    let dims_in_group = (1..=DIMS).filter(|id| id % 40 == 3).count() as u64;
+    let unmatched = dims_in_group - dims_with_facts;
+    let (rows, metrics) = fixture.run(JOINED_PROBE_LEFT, TIGHT);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::UInt64(matched_rows + unmatched),
+            Value::UInt64(matched_rows),
+            Value::Int64(sum)
+        ]]
+    );
+    assert_eq!(metrics.files, 0, "the filtered build fits without spilling");
+
+    let (rows, metrics) = fixture.run(
+        "SELECT COUNT(*), SUM(f.amount) FROM dim d JOIN dim d2 ON d2.id = d.id \
+         JOIN fact f ON f.dim_id = d2.id WHERE d.grp = 3",
+        TIGHT,
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::UInt64(matched_rows), Value::Int64(sum)]]
+    );
+    assert_eq!(metrics.files, 0);
+
+    // A joined probe with nothing in it leaves nothing to build.
+    let (rows, metrics) = fixture.run(
+        "SELECT COUNT(*), COUNT(f.id) FROM dim d JOIN dim d2 ON d2.id = d.id \
+         LEFT JOIN fact f ON f.dim_id = d.id WHERE d.grp = 99",
+        TIGHT,
+    );
+    assert_eq!(rows, vec![vec![Value::UInt64(0), Value::UInt64(0)]]);
+    assert_eq!(metrics.files, 0);
+
+    // Every dimension joined to itself is a probe side the read-ahead
+    // holds, too near the facts' size to filter them by; the answer is
+    // the plain count either way.
+    let all_matched = (1..=FACTS)
+        .filter(|fact| fact_dim(*fact).is_some_and(|dim| dim <= DIMS))
+        .count() as u64;
+    let unmatched_dims = (1..=DIMS).count() as u64
+        - (1..=FACTS)
+            .filter_map(fact_dim)
+            .filter(|dim| *dim <= DIMS)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u64;
+    let (rows, _) = fixture.run(
+        "SELECT COUNT(*), COUNT(f.id) FROM dim d JOIN dim d2 ON d2.id = d.id \
+         LEFT JOIN fact f ON f.dim_id = d.id",
+        ROOMY,
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::UInt64(all_matched + unmatched_dims),
+            Value::UInt64(all_matched)
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_a_joined_probe_filtering_the_build() {
+    let fixture = Fixture::new();
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let _ = fixture.run(JOINED_PROBE_LEFT, ROOMY);
+        eprintln!(
+            "joined probe, left join: {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// An ON clause's conjuncts on the build input alone are evaluated by its
+/// scan. Whether the join is inner or left, and whether the conjunct
+/// compares, tests for NULL or matches text, the rows are the ones the
+/// whole ON clause selects; a left join still keeps every probe row.
+#[test]
+fn an_on_clause_conjunct_of_one_input_filters_it_in_its_scan() {
+    let fixture = Fixture::new();
+    let keep =
+        |fact: u64| fact_amount(fact) > 50 && format!("fact-{fact:07}").starts_with("fact-001");
+    let group_3 = |fact: u64| fact_dim(fact).is_some_and(|dim| dim <= DIMS && dim % 40 == 3);
+    let (count, sum) = (1..=FACTS)
+        .filter(|fact| group_3(*fact) && keep(*fact))
+        .fold((0_u64, 0_i64), |(count, sum), fact| {
+            (count + 1, sum + fact_amount(fact))
+        });
+    let (rows, _) = fixture.run(
+        "SELECT COUNT(*), SUM(f.amount) FROM dim d JOIN fact f ON f.dim_id = d.id \
+         AND f.amount > 50 AND f.note LIKE 'fact-001%' AND f.dim_id IS NOT NULL \
+         WHERE d.grp = 3",
+        ROOMY,
+    );
+    assert_eq!(rows, vec![vec![Value::UInt64(count), Value::Int64(sum)]]);
+
+    let dims_in_group = (1..=DIMS).filter(|id| id % 40 == 3).count() as u64;
+    let dims_matched = (1..=FACTS)
+        .filter(|fact| group_3(*fact) && keep(*fact))
+        .filter_map(fact_dim)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64;
+    let (rows, _) = fixture.run(
+        "SELECT COUNT(*), COUNT(f.id) FROM dim d LEFT JOIN fact f ON f.dim_id = d.id \
+         AND f.amount > 50 AND f.note LIKE 'fact-001%' AND d.name <> '' \
+         WHERE d.grp = 3",
+        ROOMY,
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::UInt64(count + dims_in_group - dims_matched),
+            Value::UInt64(count)
+        ]]
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_an_on_clause_conjunct_filtering_the_build() {
+    let fixture = Fixture::new();
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let _ = fixture.run(
+            "SELECT COUNT(*), SUM(f.amount) FROM dim d JOIN fact f ON f.dim_id = d.id \
+             AND f.note LIKE 'fact-001%' AND f.amount > 50",
+            ROOMY,
+        );
+        eprintln!(
+            "on-clause conjunct, inner join: {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
