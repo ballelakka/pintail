@@ -1,5 +1,6 @@
 mod dependency;
 mod function;
+mod keyed_branch;
 mod outer_aggregate;
 mod pre_aggregate;
 mod rollup;
@@ -259,6 +260,9 @@ impl<'catalog> Binder<'catalog> {
         )?;
         bound.limit = query.limit_clause.as_ref().map(bind_limit).transpose()?;
         let bound = pre_aggregate::apply(bound, |table, relation, input| {
+            self.bind_derived_table(table, relation, &[], input)
+        });
+        let bound = keyed_branch::apply(bound, |table, relation, input| {
             self.bind_derived_table(table, relation, &[], input)
         });
         Ok(bound)

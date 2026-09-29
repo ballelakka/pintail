@@ -22,6 +22,7 @@ mod dictionary_text;
 mod distinct_grouping;
 mod enum_empty_member;
 mod enum_ordinal;
+mod fanout_join_aggregates;
 mod filter_kernels;
 mod filter_once_cost;
 mod general_ci_parity;

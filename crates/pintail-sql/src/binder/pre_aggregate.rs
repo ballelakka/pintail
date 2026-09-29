@@ -114,7 +114,7 @@ fn target(query: &BoundQuery) -> Option<BoundTable> {
     Some(target.clone())
 }
 
-fn table_rows(table: &BoundTable) -> u64 {
+pub(super) fn table_rows(table: &BoundTable) -> u64 {
     table.row_count.or(table.estimated_rows).unwrap_or(0)
 }
 
@@ -143,7 +143,7 @@ fn foldable(aggregate: &BoundAggregate) -> bool {
 
 /// Types whose equal values are the same value: grouping by them never
 /// merges spellings a comparison could still tell apart.
-fn by_value(data_type: Option<DataType>) -> bool {
+pub(super) fn by_value(data_type: Option<DataType>) -> bool {
     matches!(
         data_type,
         Some(
@@ -163,7 +163,7 @@ fn by_value(data_type: Option<DataType>) -> bool {
     )
 }
 
-fn owns(table: &BoundTable, column: &BoundColumn) -> bool {
+pub(super) fn owns(table: &BoundTable, column: &BoundColumn) -> bool {
     !column.outer
         && table.database_id == column.database_id
         && table.table_id == column.table_id
@@ -172,7 +172,7 @@ fn owns(table: &BoundTable, column: &BoundColumn) -> bool {
             .eq_ignore_ascii_case(&column.relation_name)
 }
 
-fn same_relation(left: &BoundTable, right: &BoundTable) -> bool {
+pub(super) fn same_relation(left: &BoundTable, right: &BoundTable) -> bool {
     left.database_id == right.database_id
         && left.table_id == right.table_id
         && left
@@ -182,7 +182,7 @@ fn same_relation(left: &BoundTable, right: &BoundTable) -> bool {
 
 /// Collects the columns `expr` reads. False when it holds anything this
 /// rewrite does not look inside - a subquery or a prepared set.
-fn columns_of(expr: &BoundExpr, out: &mut Vec<BoundColumn>) -> bool {
+pub(super) fn columns_of(expr: &BoundExpr, out: &mut Vec<BoundColumn>) -> bool {
     match &expr.kind {
         BoundExprKind::Column(column) => {
             out.push(column.clone());
@@ -202,7 +202,7 @@ fn columns_of(expr: &BoundExpr, out: &mut Vec<BoundColumn>) -> bool {
 
 /// Whether `expr` reads nothing but grouping slots, aggregate slots and
 /// constants - what a projection or HAVING may hold above the fold.
-fn reads_only_slots(expr: &BoundExpr) -> bool {
+pub(super) fn reads_only_slots(expr: &BoundExpr) -> bool {
     match &expr.kind {
         BoundExprKind::GroupKey(_) | BoundExprKind::Aggregate(_) | BoundExprKind::Literal(_) => {
             true
@@ -218,7 +218,7 @@ fn reads_only_slots(expr: &BoundExpr) -> bool {
     }
 }
 
-fn conjuncts(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
+pub(super) fn conjuncts(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
     match expr.kind {
         BoundExprKind::Binary {
             op: BinaryOp::And,
@@ -233,7 +233,7 @@ fn conjuncts(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
 }
 
 /// Replaces every read of a folded column with the derived table's column.
-fn rebind(
+pub(super) fn rebind(
     expr: &mut BoundExpr,
     target: &BoundTable,
     grouped: &[BoundColumn],
