@@ -15,6 +15,7 @@ mod dense_group_kernels;
 mod dependent_aggregate_argument;
 mod dependent_exists_index;
 mod dependent_subquery_ratio;
+mod dependent_text_scalar_index;
 mod dictionary_text;
 mod distinct_grouping;
 mod enum_empty_member;

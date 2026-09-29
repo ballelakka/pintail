@@ -462,8 +462,8 @@ fn a_residual_text_comparison_keeps_its_semantics() {
 }
 
 #[test]
-fn a_text_only_correlation_falls_back_to_the_per_row_path() {
-    // No integer equality: the index declines and the per-row path answers.
+fn a_text_only_correlation_keys_by_its_collation() {
+    // A text equality is a key too, under the collation it compiles to.
     // Visits 1 and 7 carry tag 'a', which leaves 1 and 5 carry; visit 2's
     // 'b' is on leave 3.
     let sql = "SELECT v.id, CASE WHEN EXISTS (SELECT 1 FROM leaves l WHERE l.tag = v.tag) \
@@ -473,7 +473,7 @@ fn a_text_only_correlation_falls_back_to_the_per_row_path() {
         .map(|id| (id, u8::from(matches!(id, 1 | 2 | 7))))
         .collect::<Vec<_>>();
     assert_eq!(pairs(&rows), expected(&answers));
-    assert_eq!((builds, probes), (0, 0), "text keys never build an index");
+    assert_eq!((builds, probes), (1, 10));
 }
 
 #[test]

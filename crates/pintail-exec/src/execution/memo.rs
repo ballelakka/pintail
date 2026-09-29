@@ -70,7 +70,7 @@ pub(crate) struct DependentMemo {
     cursor: SubquerySlot,
     hits: u64,
     misses: u64,
-    /// Per `EXISTS` slot, the hash index answering it in place of per-row
+    /// Per subquery slot, the hash index answering it in place of per-row
     /// executions, once one is planned (`dependent_index`).
     pub(super) indexes: HashMap<SubquerySlot, IndexState>,
     pub(super) index_stats: IndexStats,

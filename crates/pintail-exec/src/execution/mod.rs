@@ -3383,21 +3383,11 @@ pub(super) struct DependentRow<'a> {
     pub(super) collation: Collation,
 }
 
-/// Answers one subquery for the current row: from the memo when the
+/// Answers the subquery at `slot` for the current row: from the memo when the
 /// substituted outer tuple has been seen, otherwise by executing it and
 /// recording the answer. `maximum_rows` is the same early stop the
 /// un-memoized path used, so a cached answer is exactly what a fresh one
 /// would have been.
-fn dependent_subquery_values(
-    query: &BoundQuery,
-    context: &DependentRow<'_>,
-    memo: &mut DependentMemo,
-    maximum_rows: Option<usize>,
-) -> Result<Vec<Value>, ExecError> {
-    let slot = memo.next_slot();
-    dependent_subquery_values_at(slot, query, context, memo, maximum_rows)
-}
-
 fn dependent_subquery_values_at(
     slot: memo::SubquerySlot,
     query: &BoundQuery,
@@ -3439,19 +3429,36 @@ pub(super) fn resolve_dependent_expr_subqueries(
     context.memory.check_interruption()?;
     match &mut expression.kind {
         BoundExprKind::ScalarSubquery(query) => {
-            let values = dependent_subquery_values(query, context, memo, Some(2))?;
-            let value = match values.as_slice() {
-                [] => Value::Null,
-                [value] => value.clone(),
-                _ => return Err(ExecError::ScalarSubqueryRows { rows: values.len() }),
+            let slot = memo.next_slot();
+            let value = if let Some(value) = dependent_answer_from_index(
+                slot,
+                query,
+                dependent_index::SubqueryForm::Scalar,
+                context,
+                memo,
+            )? {
+                value
+            } else {
+                let values = dependent_subquery_values_at(slot, query, context, memo, Some(2))?;
+                match values.as_slice() {
+                    [] => Value::Null,
+                    [value] => value.clone(),
+                    _ => return Err(ExecError::ScalarSubqueryRows { rows: values.len() }),
+                }
             };
             expression.nullable = matches!(value, Value::Null);
             expression.kind = BoundExprKind::Literal(value);
         }
         BoundExprKind::ExistsSubquery { query, negated } => {
             let slot = memo.next_slot();
-            let found = match dependent_exists_from_index(slot, query, context, memo)? {
-                Some(found) => found,
+            let found = match dependent_answer_from_index(
+                slot,
+                query,
+                dependent_index::SubqueryForm::Exists,
+                context,
+                memo,
+            )? {
+                Some(found) => predicate_truth(&found)?,
                 None => {
                     !dependent_subquery_values_at(slot, query, context, memo, Some(1))?.is_empty()
                 }
@@ -3558,17 +3565,19 @@ pub(super) fn resolve_dependent_expr_subqueries(
     Ok(())
 }
 
-/// Answers a dependent `EXISTS` from its slot's hash index when the shape
-/// has one (`dependent_index`), or `None` for the per-row path to answer.
-/// The index is planned on the slot's first row and built once the per-row
+/// Answers a dependent `EXISTS` (as a boolean) or scalar subquery (as its
+/// value) from its slot's hash index when the shape has one
+/// (`dependent_index`), or `None` for the per-row path to answer. The
+/// index is planned on the slot's first row and built once the per-row
 /// path has answered the rows it waits out; every refusal along the way
 /// leaves the per-row path answering, as it did before the index existed.
-fn dependent_exists_from_index(
+fn dependent_answer_from_index(
     slot: memo::SubquerySlot,
     query: &BoundQuery,
+    form: dependent_index::SubqueryForm,
     context: &DependentRow<'_>,
     memo: &mut DependentMemo,
-) -> Result<Option<bool>, ExecError> {
+) -> Result<Option<Value>, ExecError> {
     use dependent_index::IndexState;
     if !memo.memoizable(slot) {
         return Ok(None);
@@ -3576,7 +3585,7 @@ fn dependent_exists_from_index(
     let state = memo
         .indexes
         .entry(slot)
-        .or_insert_with(|| dependent_index::plan(query));
+        .or_insert_with(|| dependent_index::plan(query, form));
     if let IndexState::Pending { plan, remaining } = state {
         if *remaining > 0 {
             *remaining -= 1;
@@ -3596,7 +3605,7 @@ fn dependent_exists_from_index(
     let IndexState::Built(index) = state else {
         return Ok(None);
     };
-    let found = dependent_index::probe(index, context)?;
+    let found = dependent_index::answer(index, context)?;
     if found.is_some() {
         memo.index_stats.probes += 1;
     }
@@ -3722,14 +3731,14 @@ static DEPENDENT_INDEX_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic:
 static DEPENDENT_INDEX_DECLINES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Hash indexes built to answer a dependent `EXISTS` in place of per-row
-/// executions, since process start.
+/// Hash indexes built to answer a dependent `EXISTS` or scalar subquery in
+/// place of per-row executions, since process start.
 #[must_use]
 pub fn dependent_index_builds() -> u64 {
     DEPENDENT_INDEX_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Outer rows a dependent `EXISTS` index answered, since process start.
+/// Outer rows a dependent subquery index answered, since process start.
 #[must_use]
 pub fn dependent_index_probes() -> u64 {
     DEPENDENT_INDEX_PROBES.load(std::sync::atomic::Ordering::Relaxed)
