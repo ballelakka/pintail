@@ -3776,11 +3776,12 @@ pub(super) fn execute_nested_loop_join(
             sorted.sort_by(|(left, left_row), (right, right_row)| {
                 left.cmp(right).then(left_row.cmp(right_row))
             });
-            let bytes = sorted
-                .len()
-                .saturating_mul(std::mem::size_of::<(RangeValue, usize)>());
+            let bytes = sorted.len().saturating_mul(
+                std::mem::size_of::<(RangeValue, usize)>() + std::mem::size_of::<usize>(),
+            );
             memory.reserve(bytes)?;
             keys_reserved = keys_reserved.saturating_add(bytes);
+            index.rows = sorted.iter().map(|(_, row)| *row).collect();
             index.sorted = sorted;
         }
     }
@@ -3827,13 +3828,29 @@ pub(super) fn execute_nested_loop_join(
                         .and_then(|key| buckets.get(&key))
                         .map_or(&[][..], Vec::as_slice),
                 ),
-                (None, None)
-                    if range_index.as_ref().map_or(Ok(false), |index| {
-                        index.candidates(&left_batch, row, &mut range_candidates)
-                    })? =>
-                {
-                    Some(range_candidates.as_slice())
-                }
+                (None, None) => match &range_index {
+                    Some(index) => match index.span(&left_batch, row)? {
+                        // One match decides a semi or anti join, so any order
+                        // will do and the span is read where it lies.
+                        Some((lo, hi))
+                            if matches!(kind, BoundJoinKind::Semi | BoundJoinKind::Anti) =>
+                        {
+                            Some(index.rows.get(lo..hi).unwrap_or(&[]))
+                        }
+                        // Every other kind emits pairs in the right input's
+                        // order, so the span is copied and put back in it.
+                        Some((lo, hi)) => {
+                            range_candidates.clear();
+                            if let Some(span) = index.rows.get(lo..hi) {
+                                range_candidates.extend_from_slice(span);
+                                range_candidates.sort_unstable();
+                            }
+                            Some(range_candidates.as_slice())
+                        }
+                        None => None,
+                    },
+                    None => None,
+                },
                 _ => None,
             };
             let mut replay = match bucket {
@@ -4066,6 +4083,10 @@ struct RangeIndex {
     right: CompiledExpr,
     /// `(value, right row)` in value order; NULL values are left out.
     sorted: Vec<(RangeValue, usize)>,
+    /// The right rows of `sorted`, in the same order: a semi or anti join
+    /// needs only one match, so it reads a span of these in place rather
+    /// than copying the span and sorting it back into input order.
+    rows: Vec<usize>,
 }
 
 impl RangeIndex {
@@ -4102,27 +4123,25 @@ impl RangeIndex {
             bounds,
             right: CompiledExpr::compile(&first.right, right_columns, collation)?,
             sorted: Vec::new(),
+            rows: Vec::new(),
         }))
     }
 
     /// The right rows a left row's bounds reach, in right-input order;
     /// `None` when a bound's value is not one the domain reads, so every
     /// row is tested instead.
-    fn candidates(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-        out: &mut Vec<usize>,
-    ) -> Result<bool, ExecError> {
+    /// The span of `sorted` (and `rows`) the left row's bounds reach; an
+    /// empty span for a NULL bound, `None` when a bound falls outside the
+    /// domain and the row must test every pair.
+    fn span(&self, batch: &RecordBatch, row: usize) -> Result<Option<(usize, usize)>, ExecError> {
         use pintail_sql::BinaryOp;
-        out.clear();
         let (mut lo, mut hi) = (0, self.sorted.len());
         for (op, left) in &self.bounds {
             let Ok(value) = self.domain.value(left.evaluate(batch, row)?) else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(value) = value else {
-                return Ok(true);
+                return Ok(Some((0, 0)));
             };
             let position = |strict: bool| {
                 self.sorted.partition_point(|(right, _)| {
@@ -4137,14 +4156,10 @@ impl RangeIndex {
                 // value > right: before the first right value at or above it.
                 BinaryOp::Greater => hi = hi.min(position(true)),
                 BinaryOp::GreaterOrEqual => hi = hi.min(position(false)),
-                _ => return Ok(false),
+                _ => return Ok(None),
             }
         }
-        if lo < hi {
-            out.extend(self.sorted[lo..hi].iter().map(|(_, index)| *index));
-            out.sort_unstable();
-        }
-        Ok(true)
+        Ok(Some((lo, hi.max(lo))))
     }
 }
 
