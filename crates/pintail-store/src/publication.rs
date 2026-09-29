@@ -35,7 +35,7 @@ use std::{
     },
 };
 
-use crate::StoreError;
+use crate::{StoreError, store::WRITER_LOCK_FILE};
 
 /// Leases one process keeps at most. Each is an open file; past this the
 /// least recently released goes, and its table is walked until a writer
@@ -89,6 +89,57 @@ pub fn published_generation(directory: &Path) -> Option<u64> {
         .get(directory)
         .filter(|entry| entry.writers > 0 || entry.lease.is_some())
         .map(|entry| entry.generation)
+}
+
+/// Proves the table at `directory` current for a reader when no writer in
+/// this process has opened it yet, by taking the lease its writer would
+/// have left: the generation that answer carries then holds until a writer
+/// here adopts the lease and changes the files.
+///
+/// Leases used to come only from a closed writer, so after a restart every
+/// table replication had not yet written was walked on every query - a
+/// `stat` per file of every such table, which on a replica of a hundred
+/// quiet tables was most of what a trivial query cost.
+///
+/// Only a process that retains writer locks leases, and only a table whose
+/// lock file is already there and free: a reader creates no file, and a
+/// lock another process or writer holds answers `None`, which sends the
+/// caller to the files as before. `directory` is spelled as for
+/// [`published_generation`].
+#[must_use]
+pub fn lease_unwritten_table(directory: &Path) -> Option<u64> {
+    if !RETAIN_LOCKS.load(Ordering::Relaxed) {
+        return None;
+    }
+    lease_unwritten(directory)
+}
+
+fn lease_unwritten(directory: &Path) -> Option<u64> {
+    // Held across the lock attempt, so a writer's claim either sees the
+    // lease or takes the lock first and makes this attempt fail.
+    let mut registry = registry();
+    if let Some(entry) = registry.get(directory) {
+        return (entry.writers > 0 || entry.lease.is_some()).then_some(entry.generation);
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join(WRITER_LOCK_FILE))
+        .ok()?;
+    fs2::FileExt::try_lock_exclusive(&lock).ok()?;
+    let generation = next_generation();
+    registry.insert(
+        directory.to_path_buf(),
+        Entry {
+            writers: 0,
+            generation,
+            lease: Some((lock, generation)),
+        },
+    );
+    evict_leases(&mut registry);
+    registry
+        .get(directory)
+        .and_then(|entry| entry.lease.as_ref().map(|_| entry.generation))
 }
 
 /// Records a change made to table files without their writer: a directory
@@ -151,7 +202,32 @@ impl Publisher {
                 }
             }
         }
-        let locked = lock()?;
+        let locked = match lock() {
+            Ok(locked) => locked,
+            // A reader may have leased the table between the look above and
+            // the lock; the lease is registered before its lock is let go
+            // of anywhere, so it is there to adopt by now.
+            Err(error) => {
+                let mut registry = registry();
+                let Some(entry) = registry.get_mut(directory.as_ref()) else {
+                    return Err(error);
+                };
+                let Some((leased, _)) = entry.lease.take() else {
+                    return Err(error);
+                };
+                if !same_file(&leased, lock_path) {
+                    if entry.writers == 0 {
+                        registry.remove(directory.as_ref());
+                    }
+                    return Err(error);
+                }
+                entry.writers += 1;
+                return Ok(Self {
+                    directory,
+                    lock: Some(leased),
+                });
+            }
+        };
         let mut registry = registry();
         let entry = registry.entry(directory.to_path_buf()).or_default();
         entry.writers += 1;
@@ -320,6 +396,42 @@ mod tests {
         let second = claim(scratch.path());
         assert!(published_generation(scratch.path()).expect("registered") > before);
         drop(second);
+    }
+
+    #[test]
+    fn a_reader_leases_a_free_table_and_its_writer_adopts_the_lease() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let directory = scratch.path();
+        assert_eq!(lease_unwritten(directory), None, "no lock file, no lease");
+        let lock_path = directory.join(WRITER_LOCK_FILE);
+        let held = File::create(&lock_path).expect("lock file");
+        fs2::FileExt::try_lock_exclusive(&held).expect("held elsewhere");
+        assert_eq!(
+            lease_unwritten(directory),
+            None,
+            "a held lock is not leased"
+        );
+        fs2::FileExt::unlock(&held).expect("release");
+
+        let leased = lease_unwritten(directory).expect("leased");
+        assert_eq!(published_generation(directory), Some(leased));
+        assert_eq!(lease_unwritten(directory), Some(leased), "one lease");
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&held).is_err(),
+            "the lease holds the table's lock"
+        );
+        let writer = Publisher::claim(directory, &lock_path, || {
+            Err(StoreError::io(
+                "lock",
+                std::io::ErrorKind::WouldBlock.into(),
+            ))
+        })
+        .expect("the writer adopts the lease");
+        assert_eq!(published_generation(directory), Some(leased));
+        drop(writer.publishing());
+        assert!(published_generation(directory).expect("published") > leased);
+        drop(writer);
+        assert_eq!(published_generation(directory), None);
     }
 
     #[test]
