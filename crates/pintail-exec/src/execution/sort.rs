@@ -9,8 +9,8 @@ use pintail_sql::BoundOrderKey;
 use pintail_types::{DataType, Value};
 
 use super::{
-    ExecError, MaterializedRows, MemoryTracker, PullOperator, batch_row, columnar_sort,
-    compare_decimal_text, estimated_batch_row_bytes, estimated_record_batch_bytes,
+    CompiledExpr, ExecError, MaterializedRows, MemoryTracker, PullOperator, batch_row,
+    columnar_sort, compare_decimal_text, estimated_batch_row_bytes, estimated_record_batch_bytes,
     estimated_row_payload_bytes, next_materialized_batch, reserve_vec_elements, rows_to_columns,
 };
 use crate::{DEFAULT_BATCH_ROWS, RecordBatch, expression::compare_utf8_mysql, spill};
@@ -349,7 +349,32 @@ pub(super) fn build_distinct(
                 }),
         })
         .collect::<Vec<_>>();
-    let sorted = build_sort(input, &keys, None, None, memory, collation)?;
+    // Grouped first where grouping and DISTINCT agree on which rows are the
+    // same, so the sort orders the distinct rows rather than every input
+    // row: a column of a few hundred values over millions of rows sorted
+    // all of them, under its collation, to keep one of each. A group keeps
+    // the row it saw first, which is also the row the stable sort would
+    // have put first among its equals, so the answer does not change.
+    let sorted = if let Some(key_collations) = groupable_distinct(column_types, &keys, collation) {
+        let width = column_types.len();
+        let uniform = key_collations
+            .iter()
+            .all(|key| *key == key_collations[0])
+            .then(|| key_collations.first().copied().unwrap_or(collation));
+        let mut grouped = PullOperator::HashAggregate {
+            input: Box::new(std::mem::replace(input, PullOperator::Empty)),
+            input_width: width,
+            group_by: (0..width).map(CompiledExpr::Column).collect(),
+            aggregates: Vec::new(),
+            column_types: column_types.to_vec(),
+            state: None,
+            collation: uniform.unwrap_or(collation),
+            key_collations,
+        };
+        build_sort(&mut grouped, &keys, None, None, memory, collation)?
+    } else {
+        build_sort(input, &keys, None, None, memory, collation)?
+    };
     Ok(DistinctRows {
         sorted,
         keys,
@@ -357,6 +382,44 @@ pub(super) fn build_distinct(
         last: None,
         last_reserved: 0,
     })
+}
+
+/// Each column's grouping collation, when every column is of a type whose
+/// grouping equality is exactly DISTINCT's: integers, dates and times, and
+/// text under a real collation. Floats, decimals, JSON, binary strings and
+/// enumerations keep the sort alone.
+fn groupable_distinct(
+    column_types: &[DataType],
+    keys: &[BoundOrderKey],
+    collation: Collation,
+) -> Option<Vec<Collation>> {
+    if column_types.is_empty() {
+        return None;
+    }
+    column_types
+        .iter()
+        .zip(keys)
+        .map(|(data_type, key)| match data_type {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+            | DataType::DateTime64 { .. }
+            | DataType::Year => Some(collation),
+            DataType::Utf8 => match key.collation {
+                Some(pintail_sql::JSON_TEXT_COLLATION) => None,
+                Some(name) => Collation::from_mysql_name(name),
+                None => Some(collation),
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 pub(super) fn build_sort(
