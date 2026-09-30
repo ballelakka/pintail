@@ -119,6 +119,25 @@ oversized candidate is deferred rather than materialized opportunistically;
 queries remain correct through merge-on-read while the operator observes the
 resulting segment shape and maintenance metrics.
 
+A secondary side index answers equality and IN filters, and join key sets,
+on integer columns other than the table key, whose values scatter across
+every block so zone maps prune nothing. Per segment it holds the column's
+non-NULL values sorted with their row positions; a scan that knows the only
+values its rows can hold asks it for their rows and decodes only those, and
+the scan's own predicates, the memtable overlay and tombstones still decide
+every row, so the index chooses candidates and never answers. A probe
+naming more than a quarter of a slice's rows declines and the slice scans
+as before. Column choice is automatic: a scan builds postings the first
+time it probes a column, and a column the index was used on gets a
+postings section written by the table's next flush and compaction (segment
+format 6), so a restart loads rather than rebuilds them.
+`PINTAIL_SECONDARY_INDEX_COLUMNS` (comma-separated column names) persists
+named columns from the first flush. Built and loaded postings share one
+least-recently-used cache bounded by `PINTAIL_SECONDARY_INDEX_CACHE_MB`
+(default 256); `PINTAIL_SECONDARY_INDEX=0` turns the index off. Rows still
+in the memtable are scanned as before, and only integer columns are
+indexed.
+
 The byte-level format and crash ordering are specified in
 [`format.md`](format.md).
 

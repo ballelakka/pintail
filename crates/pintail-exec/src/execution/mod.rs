@@ -51,7 +51,7 @@ use std::{
 
 const HASH_ENTRY_OVERHEAD: usize = 3 * size_of::<usize>();
 
-/// Most join keys handed to the experimental side index as an exact set.
+/// Most join keys handed to the side index as an exact set.
 const INDEX_KEY_SET_VALUES: usize = 4_096;
 
 /// Experimental: which join kinds read their probe side ahead whatever the
@@ -5409,7 +5409,7 @@ fn build_operator_inner(
             build_estimate,
             residual,
         } => {
-            // With the experimental side index on, a build side restricted
+            // With the side index on, a build side restricted
             // to the probe's keys is read through the index, so the read-
             // ahead is worth trying whatever the estimates say: it stays
             // bounded, and a probe side past its caps streams as before.

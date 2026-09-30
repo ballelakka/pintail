@@ -703,7 +703,7 @@ pub struct ProjectedScanStream {
     /// Chunks an overlay slice produced beyond the one the single-chunk
     /// API could hand out, waiting their turn.
     pub(super) pending: VecDeque<ProjectedColumnChunk>,
-    /// The experimental side-index request the scan's predicates or a join
+    /// The side-index request the scan's predicates or a join
     /// gave it; consulted only while the index is switched on.
     pub(super) index_lookup: Option<super::side_index::IndexLookup>,
 }
@@ -2410,7 +2410,7 @@ impl ProjectedScanStream {
         })
     }
 
-    /// Sets the experimental side-index request (see
+    /// Sets the side-index request (see
     /// [`super::side_index`]). Callers set it only while the index is on.
     pub fn set_index_lookup(&mut self, lookup: super::side_index::IndexLookup) {
         self.index_lookup = Some(lookup);

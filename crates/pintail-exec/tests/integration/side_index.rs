@@ -1,4 +1,4 @@
-//! The experimental side index (`PINTAIL_SECONDARY_INDEX=1`) must never
+//! The side index (on unless `PINTAIL_SECONDARY_INDEX=0`) must never
 //! change an answer. A filter on a scattered non-key column is answered with
 //! the index on and off, from a fresh snapshot, with changes still in the
 //! memtable (rows moved into and out of the filtered value, deleted and

@@ -1,12 +1,13 @@
-//! Experimental secondary side index for one integer column of a segment.
+//! Secondary side index for one integer column of a segment.
 //!
-//! Off unless `PINTAIL_SECONDARY_INDEX=1`. A filter on a column that is not
+//! On unless `PINTAIL_SECONDARY_INDEX=0`. A filter on a column that is not
 //! the table's key, whose values scatter across the whole segment, touches
 //! nearly every block, so block extremes skip nothing and the filter-first
 //! scan decodes and tests every row of its predicate columns. The side index
 //! holds the column's `(value, row)` pairs sorted by value, built lazily the
-//! first time a scan asks for it and cached for the life of the immutable
-//! segment file. A scan that knows the only values its rows can hold (an
+//! first time a scan asks for it (or loaded from the postings section a
+//! flush or compaction wrote) and cached, bounded and evictable, while the
+//! segment file lives. A scan that knows the only values its rows can hold (an
 //! equality, an IN list, a join's key set) asks it for their rows and hands
 //! the filter-first decode those rows alone; the scan's own predicates still
 //! decide every row, so the index only chooses which rows are looked at.
@@ -36,7 +37,8 @@ thread_local! {
     static THREAD_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether the experimental side index is on: the process environment, or
+/// Whether the side index is on: the process environment (on unless
+/// `PINTAIL_SECONDARY_INDEX=0`), or
 /// the calling thread's override. Only the thread that plans a scan asks;
 /// the decode follows whatever lookup the scan was given.
 #[must_use]
@@ -46,7 +48,7 @@ pub fn side_index_enabled() -> bool {
         .with(std::cell::Cell::get)
         .unwrap_or_else(|| {
             *ENABLED.get_or_init(|| {
-                std::env::var("PINTAIL_SECONDARY_INDEX").is_ok_and(|value| value == "1")
+                !std::env::var("PINTAIL_SECONDARY_INDEX").is_ok_and(|value| value.trim() == "0")
             })
         })
 }
@@ -584,7 +586,7 @@ fn record_build(
     totals.0 += postings.rows.len();
     totals.1 += postings.heap_bytes();
     totals.2 += elapsed.as_micros();
-    pintail_log::log_info!(
+    pintail_log::log_debug!(
         "side index built file={} column={column_id} entries={} bytes={} build_us={} total_entries={} total_bytes={} total_build_us={}",
         meta.file_name,
         postings.rows.len(),
