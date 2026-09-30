@@ -729,6 +729,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "lz4_flex",
+ "pintail-catalog",
  "pintail-failpoint",
  "pintail-log",
  "pintail-types",
