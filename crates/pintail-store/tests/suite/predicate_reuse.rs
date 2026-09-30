@@ -209,6 +209,7 @@ fn a_predicate_column_that_is_also_projected_decodes_once() {
         if mode == 3 {
             stream.set_index_lookup(pintail_store::IndexLookup {
                 column_id: 1,
+                key: pintail_store::IndexKey::Integer,
                 probe: pintail_store::IndexProbe::Values(
                     (0..count)
                         .filter(|id| kept_id(*id))
