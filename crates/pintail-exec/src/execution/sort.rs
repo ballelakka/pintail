@@ -32,6 +32,15 @@ pub(super) enum SortedRows {
 }
 
 impl SortedRows {
+    /// Rows a limited sort kept, when it holds them as a count it knows.
+    pub(super) fn known_len(&self) -> Option<usize> {
+        match self {
+            Self::Memory(rows) if rows.spilled.is_none() => Some(rows.rows.len()),
+            Self::Columnar(sorted) => Some(sorted.len()),
+            _ => None,
+        }
+    }
+
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, ExecError> {
         match self {
             Self::Memory(rows) => {

@@ -359,6 +359,70 @@ impl Fixture {
                 "{label}"
             );
         }
+        self.check_order_limits(stage);
+    }
+
+    /// The first rows in a non-key column's order, which the side index
+    /// can narrow the scan to: ascending on a NOT NULL column, descending
+    /// on a nullable one (NULLs last), and ascending on the nullable one,
+    /// where a NULL sorts first and the index must step aside.
+    fn check_order_limits(&self, stage: &str) {
+        type Key = fn(&Event) -> Option<i64>;
+        let cases: [(&str, usize, Key, bool); 4] = [
+            (
+                "SELECT id, amount FROM events ORDER BY amount, id LIMIT 25",
+                25,
+                |event| Some(event.amount),
+                false,
+            ),
+            (
+                "SELECT id, kind FROM events ORDER BY amount DESC, id LIMIT 30",
+                30,
+                |event| Some(event.amount),
+                true,
+            ),
+            (
+                "SELECT id FROM events ORDER BY account DESC, id LIMIT 40",
+                40,
+                |event| event.account,
+                true,
+            ),
+            (
+                "SELECT id, account FROM events ORDER BY account, id LIMIT 12",
+                12,
+                |event| event.account,
+                false,
+            ),
+        ];
+        for (sql, limit, key, descending) in cases {
+            let mut expected = self
+                .model
+                .iter()
+                .map(|(id, event)| (key(event), *id))
+                .collect::<Vec<_>>();
+            // NULL first ascending, last descending; ties by id ascending.
+            expected.sort_by(|left, right| {
+                let order = if descending {
+                    right.0.cmp(&left.0)
+                } else {
+                    left.0.cmp(&right.0)
+                };
+                order.then(left.1.cmp(&right.1))
+            });
+            let expected = expected
+                .into_iter()
+                .take(limit)
+                .map(|(_, id)| id)
+                .collect::<Vec<_>>();
+            for index in [false, true] {
+                let got = self
+                    .run(sql, index)
+                    .iter()
+                    .map(|row| u64::try_from(int(&row[0])).expect("id"))
+                    .collect::<Vec<_>>();
+                assert_eq!(got, expected, "{stage}, index {index}: {sql}");
+            }
+        }
     }
 }
 
@@ -495,6 +559,65 @@ fn measure_side_index_over_a_large_memtable() {
             samples.sort_by(f64::total_cmp);
             println!(
                 "{:>8.2} ms median {:>8.2} ms min  memtable index={index}  {sql}",
+                samples[samples.len() / 2],
+                samples[0]
+            );
+        }
+    }
+}
+
+/// Every row holding the smallest and the largest amount deleted, the
+/// tombstones still in the memtable: the segment's postings place the
+/// first rows among the deleted ones, too few rows come back from the
+/// narrowed scan, and the sort must read the whole table instead.
+#[test]
+fn a_narrowed_order_limit_short_of_rows_reads_the_whole_table() {
+    let mut fixture = Fixture::new();
+    let doomed = fixture
+        .model
+        .iter()
+        .filter(|(_, event)| matches!(event.amount, -40 | 60))
+        .map(|(id, event)| (*id, event.clone()))
+        .collect::<Vec<_>>();
+    let mut changes = Vec::new();
+    for (id, event) in doomed {
+        fixture.version += 1;
+        changes.push(event_row(id, &event, fixture.version, true));
+        fixture.model.remove(&id);
+    }
+    for batch in changes.chunks(2_000) {
+        fixture
+            .events
+            .ingest_cdc(batch.to_vec())
+            .expect("delete batch");
+    }
+    fixture.check_order_limits("smallest and largest deleted");
+    fixture.events.flush().expect("flush");
+    fixture.check_order_limits("deletes flushed");
+}
+
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_order_limits() {
+    let fixture = Fixture::new();
+    for sql in [
+        "SELECT id, amount FROM events ORDER BY amount, id LIMIT 25",
+        "SELECT id, kind FROM events ORDER BY amount DESC LIMIT 30",
+        "SELECT id FROM events ORDER BY account DESC, id LIMIT 40",
+        "SELECT id, note FROM events ORDER BY account DESC LIMIT 10",
+    ] {
+        for index in [false, true] {
+            fixture.run(sql, index);
+            let mut samples = (0..9)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    fixture.run(sql, index);
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect::<Vec<_>>();
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{:>8.2} ms median {:>8.2} ms min  index={index}  {sql}",
                 samples[samples.len() / 2],
                 samples[0]
             );

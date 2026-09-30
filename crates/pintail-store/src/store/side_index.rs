@@ -533,6 +533,68 @@ pub(crate) fn postings(
     Ok(built.clone())
 }
 
+/// Where the first `k` rows in the order of an integer column end, from the
+/// postings of `segments`: the smallest value at or below which (the
+/// largest at or above which, `descending`) the segments hold at least `k`
+/// non-NULL entries, and whether any of them holds a NULL there. `None`
+/// when the column is not a plain integer column (an ENUM or SET orders by
+/// something else), a segment declines, or they hold fewer than `k`
+/// entries together.
+///
+/// The entries include rows a newer version supersedes or a tombstone
+/// deletes, so the rows at or before the bound can number fewer than `k`:
+/// a caller restricting a scan to them must see at least `k` come back
+/// before trusting the restriction.
+pub(crate) fn order_bound(
+    directory: &Path,
+    segments: &[segment::SegmentMeta],
+    schema: &TableSchema,
+    column_id: u32,
+    k: usize,
+    descending: bool,
+) -> Result<Option<(i128, bool)>, StoreError> {
+    let Some(column) = schema
+        .columns()
+        .iter()
+        .find(|column| column.id() == column_id)
+    else {
+        return Ok(None);
+    };
+    if k == 0
+        || !is_integer(column.data_type())
+        || column.enum_labels().is_some()
+        || column.set_members().is_some()
+    {
+        return Ok(None);
+    }
+    let mut edge = Vec::new();
+    let mut nulls = false;
+    for meta in segments {
+        let Some(postings) = postings(directory, meta, schema, column_id, &IndexKey::Integer)?
+        else {
+            return Ok(None);
+        };
+        nulls |= postings.values.len() < postings.row_count;
+        let take = k.min(postings.values.len());
+        if descending {
+            edge.extend_from_slice(&postings.values[postings.values.len() - take..]);
+        } else {
+            edge.extend_from_slice(&postings.values[..take]);
+        }
+    }
+    if edge.len() < k {
+        return Ok(None);
+    }
+    let bound = if descending {
+        *edge
+            .select_nth_unstable_by(k - 1, |left, right| right.cmp(left))
+            .1
+    } else {
+        *edge.select_nth_unstable(k - 1).1
+    };
+    Ok(Some((i128::from(bound), nulls)))
+}
+
 /// Columns, per table directory, whose index a scan found selective enough
 /// to use: the ones the next flush or compaction of that table writes
 /// postings for, so a restart or a new segment does not rebuild them.

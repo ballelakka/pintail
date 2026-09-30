@@ -2450,6 +2450,60 @@ impl ProjectedScanStream {
         Some(super::side_index::RowAdmission::new(lookup, position))
     }
 
+    /// Where the first `k` rows of this scan's segments in the order of the
+    /// integer column `column_id` end, and whether a NULL may sort among
+    /// them: the bound over the segments' postings (see the side index's
+    /// order bound), with the memtable's rows counted as possible NULLs
+    /// under a nullable column, since nothing indexes them. A scan
+    /// restricted to the rows at or before the bound answers the first `k`
+    /// exactly only when at least `k` rows come back: superseded and
+    /// deleted segment rows count toward the bound but not toward the
+    /// answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error reading a segment's postings.
+    pub fn side_index_order_bound(
+        &self,
+        column_id: u32,
+        k: usize,
+        descending: bool,
+    ) -> Result<Option<(i128, bool)>, StoreError> {
+        // Every segment the scan's key range overlaps: an open scan has
+        // already dealt them out into its parts.
+        let segments = self
+            .snapshot
+            .manifest
+            .segments
+            .iter()
+            .filter(|segment| segment.max_key >= self.start && segment.min_key <= self.end)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(super::side_index::order_bound(
+            &self.snapshot.directory,
+            &segments,
+            &self.snapshot.schema,
+            column_id,
+            k,
+            descending,
+        )?
+        .map(|(bound, nulls)| {
+            let nullable = self
+                .snapshot
+                .schema
+                .columns()
+                .iter()
+                .find(|column| column.id() == column_id)
+                .is_some_and(pintail_types::Column::is_nullable);
+            // A segment's own NULLs count whatever the schema says now; the
+            // memtable's rows can hold one only under a nullable column.
+            (
+                bound,
+                nulls || (nullable && !self.snapshot.memtable.is_empty()),
+            )
+        }))
+    }
+
     /// The side-index request set so far, if any.
     #[must_use]
     pub const fn index_lookup(&self) -> Option<&super::side_index::IndexLookup> {

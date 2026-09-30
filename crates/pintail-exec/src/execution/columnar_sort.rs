@@ -88,6 +88,11 @@ pub(super) struct ColumnarSorted {
 }
 
 impl ColumnarSorted {
+    /// Rows kept, in order.
+    pub(super) fn len(&self) -> usize {
+        self.order.len()
+    }
+
     /// The kept rows in order, the first `limit` of them when one is given.
     pub(super) fn new(
         batches: Vec<RecordBatch>,

@@ -1592,6 +1592,56 @@ impl BatchStream for SnapshotStream {
         }
     }
 
+    fn restrict_order_limit(
+        &mut self,
+        position: usize,
+        k: usize,
+        descending: bool,
+        nulls_first: bool,
+    ) -> bool {
+        // The key column's order is the scan's own; a started scan can no
+        // longer be narrowed.
+        if self.started
+            || !pintail_store::side_index_enabled()
+            || self.key_position == Some(position)
+        {
+            return false;
+        }
+        let Some(stream) = &self.stream else {
+            return false;
+        };
+        let Some(column_id) = stream.column_ids().get(position).copied() else {
+            return false;
+        };
+        let Ok(Some((bound, nulls))) = stream.side_index_order_bound(column_id, k, descending)
+        else {
+            return false;
+        };
+        // A NULL sorting first would belong before every restricted row.
+        if nulls && nulls_first {
+            return false;
+        }
+        let value = |bound: i128| {
+            i64::try_from(bound).map_or_else(
+                |_| u64::try_from(bound).map_or(Value::Null, Value::UInt64),
+                Value::Int64,
+            )
+        };
+        let (min, max) = if descending {
+            (value(bound), Value::UInt64(u64::MAX))
+        } else {
+            (Value::Int64(i64::MIN), value(bound))
+        };
+        if matches!(min, Value::Null) || matches!(max, Value::Null) {
+            return false;
+        }
+        self.restrict_value_range(position, &min, &max);
+        // Applied only when the scan took the span as a filter-first range.
+        self.prewhere
+            .as_ref()
+            .is_some_and(|spec| spec.runtime_range.is_some())
+    }
+
     fn restrict_key_position_range(&mut self, position: usize, min: &Value, max: &Value) {
         if self.started {
             return;

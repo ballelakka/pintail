@@ -149,6 +149,17 @@ lands on the literal's hash, and a collision only adds a candidate the
 predicate rejects. The persisted section holds the exact values; the keyed
 postings derive from it per collation, keying each distinct value once.
 
+A limited sort (`ORDER BY <integer column> [DESC] LIMIT k`, k up to 65,536)
+over a scan with no predicates of its own asks the postings where the
+first `k` rows in that column's order end: the value at or before which
+the scanned segments hold `k` entries. The scan is narrowed to the rows at
+or before it, the memtable's included, and every row it leaves out sorts
+after every row it keeps, since only the first sort key decides that. The
+bound counts superseded and deleted rows, so the sort keeps an unnarrowed
+twin of its input and reads that instead when fewer than `k` rows come
+back. A nullable column whose NULLs sort first (ascending) is narrowed
+only while no segment holds a NULL and the memtable is empty.
+
 The byte-level format and crash ordering are specified in
 [`format.md`](format.md).
 
