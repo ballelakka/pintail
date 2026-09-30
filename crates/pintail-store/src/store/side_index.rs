@@ -1,4 +1,4 @@
-//! Secondary side index for one integer column of a segment.
+//! Secondary side index for one integer or text column of a segment.
 //!
 //! On unless `PINTAIL_SECONDARY_INDEX=0`. A filter on a column that is not
 //! the table's key, whose values scatter across the whole segment, touches
@@ -11,6 +11,13 @@
 //! equality, an IN list, a join's key set) asks it for their rows and hands
 //! the filter-first decode those rows alone; the scan's own predicates still
 //! decide every row, so the index only chooses which rows are looked at.
+//!
+//! A text column is indexed under the collation a lookup compares with: its
+//! postings hold a 64-bit hash of each value's collation key, so every value
+//! equal to a probed one under that collation shares the probed hash. A
+//! collision only adds candidates the predicates then reject. The persisted
+//! section holds the exact values, which no collation's rules change; the
+//! hashed postings derive from it once per collation a scan asks for.
 //!
 //! Segment rows only: rows still in the memtable are read as before, and an
 //! overlay part masks superseded segment rows among the candidates exactly
@@ -60,19 +67,88 @@ pub fn override_side_index(enabled: Option<bool>) {
     THREAD_OVERRIDE.with(|cell| cell.set(enabled));
 }
 
-/// The values a scan's rows can hold in one integer column.
+/// The values a scan's rows can hold in one column: an integer column's
+/// own values, or a text column's key hashes (see [`TextKeyer::value`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IndexProbe {
     /// Exactly these values (sorted, deduplicated); NULL is never one.
     Values(Vec<i128>),
-    /// Any value in `[lower, upper]`.
+    /// Any value in `[lower, upper]`. Integer columns only: key hashes have
+    /// no order.
     Span(i128, i128),
 }
 
-/// A side-index request a scan carries: the column and its probe.
+/// Writes a text value's collation key: two texts equal under the collation
+/// must write the same bytes.
+pub type TextKeyFn = dyn Fn(&str, &mut Vec<u8>) + Send + Sync;
+
+/// A collation as the side index sees it: an identity for the cache and the
+/// function writing a value's key.
+#[derive(Clone)]
+pub struct TextKeyer {
+    id: u32,
+    key: Arc<TextKeyFn>,
+}
+
+impl TextKeyer {
+    /// A keyer named `id`, which must differ between collations whose keys
+    /// differ and stay the same for one collation within the process.
+    #[must_use]
+    pub fn new(id: u32, key: Arc<TextKeyFn>) -> Self {
+        Self { id, key }
+    }
+
+    /// The postings value of `text`: the hash of its collation key.
+    #[must_use]
+    pub fn value(&self, text: &str) -> i64 {
+        let mut key = Vec::with_capacity(text.len() * 2 + 8);
+        (self.key)(text, &mut key);
+        xxhash_rust::xxh3::xxh3_64(&key).cast_signed()
+    }
+}
+
+impl PartialEq for TextKeyer {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for TextKeyer {}
+
+impl std::fmt::Debug for TextKeyer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TextKeyer")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a lookup's probe values are.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum IndexKey {
+    /// The integer column's own values.
+    #[default]
+    Integer,
+    /// Hashes of text values' keys under one collation.
+    Text(TextKeyer),
+}
+
+impl IndexKey {
+    const fn cache_id(&self) -> u32 {
+        match self {
+            Self::Integer => 0,
+            Self::Text(keyer) => keyer.id.saturating_add(1),
+        }
+    }
+}
+
+/// A side-index request a scan carries: the column, what its values are,
+/// and its probe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexLookup {
     pub column_id: u32,
+    pub key: IndexKey,
     pub probe: IndexProbe,
 }
 
@@ -188,6 +264,8 @@ struct CacheKey {
     schema_fingerprint: u64,
     column_id: u32,
     data_type: Option<pintail_types::DataType>,
+    /// Zero for integer postings, else the text keyer's collation.
+    key_id: u32,
 }
 
 impl CacheKey {
@@ -196,6 +274,7 @@ impl CacheKey {
         meta: &segment::SegmentMeta,
         schema: &TableSchema,
         column_id: u32,
+        key: &IndexKey,
     ) -> Self {
         Self {
             path: directory.join(&meta.file_name),
@@ -209,6 +288,7 @@ impl CacheKey {
                 .iter()
                 .find(|column| column.id() == column_id)
                 .map(pintail_types::Column::data_type),
+            key_id: key.cache_id(),
         }
     }
 }
@@ -336,16 +416,18 @@ pub fn side_index_totals() -> (usize, usize, u128) {
 
 static TOTALS: OnceLock<Mutex<(usize, usize, u128)>> = OnceLock::new();
 
-/// The postings of `column_id` in one segment, built on first use. `None`
-/// when the column does not decode as a plain integer column (or holds an
-/// unsigned value past the signed range), which declines the index.
+/// The postings of `column_id` in one segment under `index_key`, built on
+/// first use. `None` when the column does not decode as that key needs (a
+/// plain integer column, or holding an unsigned value past the signed range;
+/// text), which declines the index.
 pub(crate) fn postings(
     directory: &Path,
     meta: &segment::SegmentMeta,
     schema: &TableSchema,
     column_id: u32,
+    index_key: &IndexKey,
 ) -> Result<Option<Arc<Postings>>, StoreError> {
-    let key = CacheKey::new(directory, meta, schema, column_id);
+    let key = CacheKey::new(directory, meta, schema, column_id, index_key);
     let slot = lock_cache().slot(key.clone());
     if let Some(found) = slot.get() {
         return Ok(found.clone());
@@ -355,7 +437,7 @@ pub(crate) fn postings(
     let built = slot.get_or_init(|| {
         let started = Instant::now();
         built_here = true;
-        match build(directory, meta, schema, column_id) {
+        match build(directory, meta, schema, column_id, index_key) {
             Ok(built) => {
                 let built = built.map(Arc::new);
                 if let Some(postings) = &built {
@@ -405,10 +487,10 @@ pub(crate) fn note_useful(directory: &Path, column_id: u32) {
     }
 }
 
-/// The integer columns, with their schema positions, a segment written to
-/// `directory` carries postings for: every column a scan has used the index
-/// on, and every column `PINTAIL_SECONDARY_INDEX_COLUMNS` (a comma list of
-/// column names) names for every table. None while the index is off.
+/// The integer and text columns, with their schema positions, a segment
+/// written to `directory` carries postings for: every column a scan has used
+/// the index on, and every column `PINTAIL_SECONDARY_INDEX_COLUMNS` (a comma
+/// list of column names) names for every table. None while the index is off.
 pub(crate) fn persisted_columns(directory: &Path, schema: &TableSchema) -> Vec<(u32, usize)> {
     static NAMED: OnceLock<Vec<String>> = OnceLock::new();
     if !side_index_enabled() {
@@ -434,7 +516,9 @@ pub(crate) fn persisted_columns(directory: &Path, schema: &TableSchema) -> Vec<(
         .columns()
         .iter()
         .enumerate()
-        .filter(|(_, column)| is_integer(column.data_type()))
+        .filter(|(_, column)| {
+            is_integer(column.data_type()) || column.data_type() == pintail_types::DataType::Utf8
+        })
         .filter(|(_, column)| {
             useful.contains(&column.id())
                 || named
@@ -460,8 +544,11 @@ const fn is_integer(data_type: pintail_types::DataType) -> bool {
     )
 }
 
-/// Layout tag of a postings section; a reader meeting another declines it.
+/// Layout tag of an integer postings section; a reader meeting another
+/// declines it.
 const POSTINGS_LAYOUT: u8 = 1;
+/// Layout tag of a text postings section: exact values, no collation.
+const TEXT_POSTINGS_LAYOUT: u8 = 2;
 
 fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -487,11 +574,18 @@ fn take_varint(bytes: &[u8], position: &mut usize) -> Result<u64, String> {
 }
 
 /// The postings section for the column at schema position `index` of
-/// `rows`, as a segment writes it: the non-NULL values grouped, each group
-/// as its value's zigzag delta from the previous group's, its row count,
-/// and its rows as ascending deltas. `None` when a value is not a plain
-/// integer the index can hold, which leaves the column unindexed.
+/// `rows`, as a segment writes it: text values as [`encode_text_postings`]
+/// lays them out, integers grouped, each group as its value's zigzag delta
+/// from the previous group's, its row count, and its rows as ascending
+/// deltas. `None` when a value is neither a plain integer the index can hold
+/// nor text (or the column mixes them), which leaves the column unindexed.
 pub(crate) fn encode_row_postings(rows: &[StoredRow], index: usize) -> Option<Vec<u8>> {
+    if rows
+        .iter()
+        .any(|row| matches!(row.values().get(index), Some(Value::Utf8(_))))
+    {
+        return encode_text_postings(rows, index);
+    }
     let postings = Postings::from_pairs(row_pairs(rows, index)?, rows.len());
     let mut out = Vec::with_capacity(postings.rows.len() * 3 + 16);
     out.push(POSTINGS_LAYOUT);
@@ -518,6 +612,134 @@ pub(crate) fn encode_row_postings(rows: &[StoredRow], index: usize) -> Option<Ve
         entry = end;
     }
     Some(out)
+}
+
+/// A text postings section: `u8 layout (2) | varint entry_count | varint
+/// group_count`, then per distinct value in ascending byte order its varint
+/// length and UTF-8 bytes, a varint row count, and the rows as ascending
+/// deltas. Exact values, so the section holds under every collation.
+fn encode_text_postings(rows: &[StoredRow], index: usize) -> Option<Vec<u8>> {
+    let mut groups: std::collections::BTreeMap<&str, Vec<u32>> = std::collections::BTreeMap::new();
+    let mut entries = 0_usize;
+    for (row, stored) in rows.iter().enumerate() {
+        let row = u32::try_from(row).ok()?;
+        match stored.values().get(index)? {
+            Value::Null => {}
+            Value::Utf8(text) => {
+                groups.entry(text.as_str()).or_default().push(row);
+                entries += 1;
+            }
+            _ => return None,
+        }
+    }
+    let heap = groups.keys().map(|text| text.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(heap + entries * 3 + 16);
+    out.push(TEXT_POSTINGS_LAYOUT);
+    put_varint(&mut out, entries as u64);
+    put_varint(&mut out, groups.len() as u64);
+    for (text, group) in groups {
+        put_varint(&mut out, text.len() as u64);
+        out.extend_from_slice(text.as_bytes());
+        put_varint(&mut out, group.len() as u64);
+        let mut previous = 0_u32;
+        for (offset, row) in group.iter().enumerate() {
+            put_varint(
+                &mut out,
+                u64::from(if offset == 0 { *row } else { row - previous }),
+            );
+            previous = *row;
+        }
+    }
+    Some(out)
+}
+
+/// Reads a text postings section back as `(value, rows)` groups, holding
+/// the values to ascending byte order and every row to `row_count`.
+fn decode_text_groups(bytes: &[u8], row_count: usize) -> Result<Vec<(&str, Vec<u32>)>, String> {
+    if bytes.first() != Some(&TEXT_POSTINGS_LAYOUT) {
+        return Err("unknown postings layout".to_owned());
+    }
+    let mut position = 1_usize;
+    let size =
+        |value: u64| usize::try_from(value).map_err(|_| "postings size does not fit".to_owned());
+    let entries = size(take_varint(bytes, &mut position)?)?;
+    let group_count = size(take_varint(bytes, &mut position)?)?;
+    if entries > row_count || group_count > entries {
+        return Err("more postings than rows".to_owned());
+    }
+    let mut groups: Vec<(&str, Vec<u32>)> = Vec::with_capacity(group_count);
+    let mut seen = 0_usize;
+    for _ in 0..group_count {
+        let length = size(take_varint(bytes, &mut position)?)?;
+        let end = position
+            .checked_add(length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| "postings end inside a value".to_owned())?;
+        let text = std::str::from_utf8(&bytes[position..end])
+            .map_err(|_| "postings value is not UTF-8".to_owned())?;
+        position = end;
+        if groups
+            .last()
+            .is_some_and(|(previous, _)| previous.as_bytes() >= text.as_bytes())
+        {
+            return Err("postings values out of order".to_owned());
+        }
+        let count = size(take_varint(bytes, &mut position)?)?;
+        if count == 0 || count > entries - seen {
+            return Err("postings group size is out of range".to_owned());
+        }
+        let mut rows = Vec::with_capacity(count);
+        let mut row = 0_u64;
+        for offset in 0..count {
+            let step = take_varint(bytes, &mut position)?;
+            if offset > 0 && step == 0 {
+                return Err("postings rows out of order".to_owned());
+            }
+            row = row
+                .checked_add(step)
+                .ok_or_else(|| "postings row overflows".to_owned())?;
+            rows.push(
+                u32::try_from(row)
+                    .ok()
+                    .filter(|row| (*row as usize) < row_count)
+                    .ok_or_else(|| "postings row is outside the segment".to_owned())?,
+            );
+        }
+        seen += count;
+        groups.push((text, rows));
+    }
+    if seen != entries {
+        return Err("postings entry count does not match its groups".to_owned());
+    }
+    if position != bytes.len() {
+        return Err("trailing bytes after postings".to_owned());
+    }
+    Ok(groups)
+}
+
+/// Keyed postings from exact text groups: each distinct value hashed once.
+fn keyed_text_postings(
+    groups: Vec<(&str, Vec<u32>)>,
+    keyer: &TextKeyer,
+    row_count: usize,
+) -> Postings {
+    let entries = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>();
+    let mut hashed = groups
+        .into_iter()
+        .map(|(text, rows)| (keyer.value(text), rows))
+        .collect::<Vec<_>>();
+    hashed.sort_unstable_by_key(|(value, _)| *value);
+    let mut values = Vec::with_capacity(entries);
+    let mut all_rows = Vec::with_capacity(entries);
+    for (value, rows) in hashed {
+        values.extend(std::iter::repeat_n(value, rows.len()));
+        all_rows.extend(rows);
+    }
+    Postings {
+        values,
+        rows: all_rows,
+        row_count,
+    }
 }
 
 fn row_pairs(rows: &[StoredRow], index: usize) -> Option<Vec<(i64, u32)>> {
@@ -619,6 +841,7 @@ fn build(
     meta: &segment::SegmentMeta,
     schema: &TableSchema,
     column_id: u32,
+    index_key: &IndexKey,
 ) -> Result<Option<Postings>, StoreError> {
     let Some(position) = schema
         .columns()
@@ -639,8 +862,10 @@ fn build(
     // not an answer lost: the build below reads the column itself.
     if meta.schema_fingerprint == segment::schema_fingerprint(schema) {
         match segment::read_postings_section(directory, meta, column_id) {
-            Ok(Some(bytes)) => match decode_postings(&bytes, row_count) {
-                Ok(postings) => return Ok(Some(postings)),
+            Ok(Some(bytes)) => match decode_section(&bytes, row_count, index_key) {
+                Ok(Some(postings)) => return Ok(Some(postings)),
+                // A section of the other kind: the column changed type.
+                Ok(None) => {}
                 Err(reason) => pintail_log::log_error!(
                     "side index postings unreadable file={} column={column_id}: {reason}",
                     meta.file_name
@@ -664,6 +889,13 @@ fn build(
         row_count,
         &budget,
     )?;
+    if let IndexKey::Text(keyer) = index_key {
+        return Ok(fetch
+            .columns
+            .first()
+            .and_then(|column| text_pairs(column, keyer))
+            .map(|pairs| Postings::from_pairs(pairs, row_count)));
+    }
     let mut pairs = Vec::with_capacity(row_count);
     match fetch.columns.first() {
         Some(DecodedColumn::Int64 { values, validity }) => {
@@ -686,6 +918,92 @@ fn build(
         _ => return Ok(None),
     }
     Ok(Some(Postings::from_pairs(pairs, row_count)))
+}
+
+/// A persisted section's postings under `index_key`; `None` for a section of
+/// the other kind.
+fn decode_section(
+    bytes: &[u8],
+    row_count: usize,
+    index_key: &IndexKey,
+) -> Result<Option<Postings>, String> {
+    match (bytes.first(), index_key) {
+        (Some(&POSTINGS_LAYOUT), IndexKey::Integer) => decode_postings(bytes, row_count).map(Some),
+        (Some(&TEXT_POSTINGS_LAYOUT), IndexKey::Text(keyer)) => Ok(Some(keyed_text_postings(
+            decode_text_groups(bytes, row_count)?,
+            keyer,
+            row_count,
+        ))),
+        (Some(&(POSTINGS_LAYOUT | TEXT_POSTINGS_LAYOUT)), _) => Ok(None),
+        _ => Err("unknown postings layout".to_owned()),
+    }
+}
+
+/// `(key hash, row)` for every non-NULL row of a decoded text column, each
+/// distinct value hashed once. `None` when the column is not text.
+fn text_pairs(column: &DecodedColumn, keyer: &TextKeyer) -> Option<Vec<(i64, u32)>> {
+    let row_id = |row: usize| u32::try_from(row).ok();
+    let mut pairs = Vec::with_capacity(column.len());
+    match column {
+        DecodedColumn::DictionaryUtf8 {
+            dict_heap,
+            dict_offsets,
+            codes,
+            validity,
+        } => {
+            let hashed = dict_offsets
+                .windows(2)
+                .map(|bounds| {
+                    std::str::from_utf8(dict_heap.get(bounds[0]..bounds[1])?)
+                        .ok()
+                        .map(|text| keyer.value(text))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            for (row, code) in codes.iter().enumerate() {
+                if validity.is_valid(row) {
+                    pairs.push((*hashed.get(*code as usize)?, row_id(row)?));
+                }
+            }
+        }
+        DecodedColumn::Utf8 {
+            heap,
+            offsets,
+            validity,
+        } => {
+            let mut hashed: HashMap<&[u8], i64> = HashMap::new();
+            for row in 0..validity.len() {
+                if !validity.is_valid(row) {
+                    continue;
+                }
+                let bytes = heap.get(*offsets.get(row)?..*offsets.get(row + 1)?)?;
+                let value = if let Some(value) = hashed.get(bytes) {
+                    *value
+                } else {
+                    let value = keyer.value(std::str::from_utf8(bytes).ok()?);
+                    hashed.insert(bytes, value);
+                    value
+                };
+                pairs.push((value, row_id(row)?));
+            }
+        }
+        DecodedColumn::Values(values) => {
+            let mut hashed: HashMap<&str, i64> = HashMap::new();
+            for (row, value) in values.iter().enumerate() {
+                match value {
+                    Value::Null => {}
+                    Value::Utf8(text) => {
+                        let value = *hashed
+                            .entry(text.as_str())
+                            .or_insert_with(|| keyer.value(text));
+                        pairs.push((value, row_id(row)?));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(pairs)
 }
 
 /// Maps ranges over the concatenated candidate rows back to segment rows.
@@ -758,6 +1076,7 @@ mod tests {
             schema_fingerprint: 3,
             column_id,
             data_type: None,
+            key_id: 0,
         };
         let mut cache = Cache::default();
         for column in 0..3 {
@@ -844,7 +1163,7 @@ mod tests {
         assert!(decode_postings(&longer, rows.len()).is_err());
         let empty = encode_row_postings(&owner_rows(0), 1).expect("empty");
         assert!(decode_postings(&empty, 0).expect("empty").rows.is_empty());
-        // A text value leaves the column unindexed.
+        // A text value among integers leaves the column unindexed.
         let mut text = owner_rows(3);
         text.push(StoredRow::new(
             pintail_types::PrimaryKey::new(vec![pintail_types::KeyPart::UInt64(9)]).expect("key"),
@@ -885,10 +1204,10 @@ mod tests {
             .expect("read")
             .expect("persisted postings");
         assert!(section.len() < rows.len() * 4);
-        let persisted = postings(directory.path(), &indexed, &schema, 2)
+        let persisted = postings(directory.path(), &indexed, &schema, 2, &IndexKey::Integer)
             .expect("postings")
             .expect("integer column");
-        let rebuilt = postings(directory.path(), &plain, &schema, 2)
+        let rebuilt = postings(directory.path(), &plain, &schema, 2, &IndexKey::Integer)
             .expect("postings")
             .expect("integer column");
         assert_eq!(persisted.values, rebuilt.values);
@@ -899,6 +1218,133 @@ mod tests {
             segment::read(directory.path(), &indexed, &schema).expect("rows"),
             rows
         );
+        override_side_index(None);
+    }
+
+    /// A keyer folding ASCII case and trailing spaces, standing in for a
+    /// case-insensitive PAD SPACE collation.
+    fn folding_keyer() -> TextKeyer {
+        TextKeyer::new(
+            7,
+            Arc::new(|text: &str, out: &mut Vec<u8>| {
+                out.extend(
+                    text.trim_end_matches(' ')
+                        .bytes()
+                        .map(|b| b.to_ascii_lowercase()),
+                );
+            }),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn text_postings_persist_exact_values_and_key_them_per_collation() {
+        use pintail_types::{Column, DataType, KeyPart, PrimaryKey};
+        override_side_index(Some(true));
+        let schema = TableSchema::new(
+            1,
+            vec![
+                Column::new(1, "id", DataType::UInt64, false),
+                Column::new(2, "label", DataType::Utf8, true),
+            ],
+        )
+        .expect("schema");
+        let spellings = [
+            "Alpha",
+            "alpha",
+            "ALPHA  ",
+            "beta",
+            "Beta ",
+            "\u{e9}t\u{e9}",
+        ];
+        let rows = (0..3_000_u64)
+            .map(|id| {
+                StoredRow::new(
+                    PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
+                    vec![
+                        Value::UInt64(id),
+                        if id % 7 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Utf8(format!(
+                                "{}{}",
+                                spellings[usize::try_from(id % 6).expect("small")],
+                                id % 40
+                            ))
+                        },
+                    ],
+                    1,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let section = encode_row_postings(&rows, 1).expect("text column");
+        assert_eq!(section[0], TEXT_POSTINGS_LAYOUT);
+        let groups = decode_text_groups(&section, rows.len()).expect("decode");
+        assert_eq!(
+            groups.iter().map(|(_, rows)| rows.len()).sum::<usize>(),
+            rows.iter()
+                .filter(|row| row.values()[1] != Value::Null)
+                .count()
+        );
+        assert!(decode_text_groups(&section, 100).is_err());
+        assert!(decode_text_groups(&section[..section.len() - 1], rows.len()).is_err());
+        // An integer lookup finds a text section of the other kind.
+        assert!(
+            decode_section(&section, rows.len(), &IndexKey::Integer)
+                .expect("kind")
+                .is_none()
+        );
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let write = |id| {
+            segment::write(
+                directory.path(),
+                id,
+                &schema,
+                &rows,
+                256,
+                segment::Compression::Lz4,
+                true,
+            )
+            .expect("write segment")
+        };
+        let plain = write(1);
+        note_useful(directory.path(), 2);
+        let indexed = write(2);
+        assert!(
+            segment::read_postings_section(directory.path(), &indexed, 2)
+                .expect("read")
+                .is_some()
+        );
+        let keyer = folding_keyer();
+        let key = IndexKey::Text(keyer.clone());
+        let loaded = postings(directory.path(), &indexed, &schema, 2, &key)
+            .expect("postings")
+            .expect("text column");
+        let built = postings(directory.path(), &plain, &schema, 2, &key)
+            .expect("postings")
+            .expect("text column");
+        let probe = IndexProbe::Values(vec![i128::from(keyer.value("alpha5"))]);
+        let expected = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                matches!(&row.values()[1], Value::Utf8(text)
+                    if text.trim_end_matches(' ').eq_ignore_ascii_case("alpha5"))
+            })
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
+        for found in [&loaded, &built] {
+            let rows = found
+                .candidate_ranges(&probe, 0, 3_000)
+                .expect("selective")
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected);
+        }
+        assert!(!expected.is_empty());
         override_side_index(None);
     }
 

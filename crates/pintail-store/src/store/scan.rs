@@ -2448,6 +2448,7 @@ impl ProjectedScanStream {
             segment,
             &self.snapshot.schema,
             lookup.column_id,
+            &lookup.key,
         )?
         else {
             return Ok(None);

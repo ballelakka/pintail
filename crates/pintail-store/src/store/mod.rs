@@ -9,8 +9,8 @@ pub use scan::{
     ProjectedRow, ProjectedScan, ProjectedScanStream, ProjectedValueChunk, ScanStats,
 };
 pub use side_index::{
-    IndexLookup, IndexProbe, override_side_index, side_index_cache_usage, side_index_enabled,
-    side_index_totals,
+    IndexKey, IndexLookup, IndexProbe, TextKeyFn, TextKeyer, override_side_index,
+    side_index_cache_usage, side_index_enabled, side_index_totals,
 };
 pub use snapshot::{BackupArtifacts, BackupSegment, GroupedFoldSpan, TableSnapshot};
 

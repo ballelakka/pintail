@@ -135,8 +135,16 @@ format 6), so a restart loads rather than rebuilds them.
 named columns from the first flush. Built and loaded postings share one
 least-recently-used cache bounded by `PINTAIL_SECONDARY_INDEX_CACHE_MB`
 (default 256); `PINTAIL_SECONDARY_INDEX=0` turns the index off. Rows still
-in the memtable are scanned as before, and only integer columns are
-indexed.
+in the memtable are scanned as before.
+
+Text columns answer equality and IN filters against text literals under the
+collation the comparison itself compiles with (an explicit `COLLATE`, else
+the column's, else the plan's). Their postings hold a 64-bit hash of each
+value's collation key, so every value equal to a literal under that
+collation - other case, accents, trailing spaces where the collation pads -
+lands on the literal's hash, and a collision only adds a candidate the
+predicate rejects. The persisted section holds the exact values; the keyed
+postings derive from it per collation, keying each distinct value once.
 
 The byte-level format and crash ordering are specified in
 [`format.md`](format.md).

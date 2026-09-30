@@ -365,7 +365,7 @@ pub(super) struct JoinGroupPlan {
 /// text form doubles the bytes and allocates a `String` per cell for no
 /// purpose beyond fitting the row-shaped key. Writing the raw bytes into a
 /// caller's buffer avoids both.
-pub(super) fn append_collation_key(text: &str, collation: Collation, out: &mut Vec<u8>) {
+pub(crate) fn append_collation_key(text: &str, collation: Collation, out: &mut Vec<u8>) {
     match collation {
         Collation::Latin1SwedishCi | Collation::Latin1Bin => out.extend_from_slice(
             &crate::collation::latin1_sort_key(text, collation == Collation::Latin1Bin),

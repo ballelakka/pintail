@@ -258,7 +258,15 @@ A postings section lists one integer column's non-NULL values with the rows
 holding them: `u8 layout (1) | varint entry_count`, then per distinct value
 in ascending order a varint zigzag delta from the previous value (the first
 from zero, wrapping), a varint row count, and the rows ascending as a varint
-first row then varint gaps. Sections are an access path only: a reader that
+first row then varint gaps. A text column's section (layout 2) holds its
+exact values, never a collation's keys, so no collation's rules can make it
+stale: `u8 layout (2) | varint entry_count | varint group_count`, then per
+distinct value in ascending byte order a varint length and its UTF-8 bytes,
+a varint row count, and the rows as above. A reader derives the keyed
+postings a lookup's collation needs from it, keying each distinct value
+once. The layout byte versions the section, so adding layout 2 left the
+segment format at 6: a reader that knows only layout 1 never asks for a
+text column's section. Sections are an access path only: a reader that
 finds none, finds a damaged one, or reads the segment under a schema other
 than the one it was written with reads the column itself instead.
 

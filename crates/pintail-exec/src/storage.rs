@@ -584,7 +584,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
             let prewhere = build_prewhere_spec(scan, snapshot, self.collation);
             if prewhere.is_some()
                 && pintail_store::side_index_enabled()
-                && let Some(lookup) = predicate_index_lookup(scan, snapshot)
+                && let Some(lookup) = predicate_index_lookup(scan, snapshot, self.collation)
             {
                 stream.set_index_lookup(lookup);
             }
@@ -1109,6 +1109,7 @@ impl SnapshotStream {
         {
             stream.set_index_lookup(pintail_store::IndexLookup {
                 column_id,
+                key: pintail_store::IndexKey::Integer,
                 probe: pintail_store::IndexProbe::Span(lower, upper),
             });
         }
@@ -1143,6 +1144,7 @@ impl SnapshotStream {
         if better {
             stream.set_index_lookup(pintail_store::IndexLookup {
                 column_id,
+                key: pintail_store::IndexKey::Integer,
                 probe: pintail_store::IndexProbe::Values(values),
             });
         }
@@ -2027,67 +2029,132 @@ fn build_prewhere_spec(
 const INDEX_LOOKUP_VALUES: usize = 4_096;
 
 /// The side-index lookup a scan's own predicates imply: a top-level
-/// equality or IN list of integer literals on an integer column other than
-/// the table's key (whose range the key bounds already prune). Among
-/// several, the one naming the fewest values.
+/// equality or IN list of literals on a column other than the table's key
+/// (whose range the key bounds already prune), integer literals on an
+/// integer column or text literals on a text column. A text lookup names
+/// its values by their key under the collation the comparison itself uses,
+/// so every row that compares equal to a literal - whatever its case,
+/// accents or trailing spaces where the collation ignores them - is a
+/// candidate. Among several, the one naming the fewest values.
 fn predicate_index_lookup(
     scan: &Scan,
     snapshot: &TableSnapshot,
+    collation: Collation,
 ) -> Option<pintail_store::IndexLookup> {
-    let integer_column = |expr: &BoundExpr| match &expr.kind {
-        BoundExprKind::Column(column)
-            if !scan.table.key_column_ids.contains(&column.column_id)
-                && snapshot
-                    .schema()
-                    .columns()
-                    .iter()
-                    .find(|candidate| candidate.id() == column.column_id)
-                    .is_some_and(|candidate| is_integer_type(candidate.data_type())) =>
-        {
-            Some(column.column_id)
+    let indexed_column = |expr: &BoundExpr| match &expr.kind {
+        BoundExprKind::Column(column) if !scan.table.key_column_ids.contains(&column.column_id) => {
+            let data_type = snapshot
+                .schema()
+                .columns()
+                .iter()
+                .find(|candidate| candidate.id() == column.column_id)?
+                .data_type();
+            if is_integer_type(data_type) {
+                Some((column.column_id, false))
+            } else {
+                (data_type == pintail_types::DataType::Utf8).then_some((column.column_id, true))
+            }
         }
         _ => None,
     };
-    let literal = |expr: &BoundExpr| match &expr.kind {
-        BoundExprKind::Literal(value) => integer_bound(value),
-        _ => None,
+    let literal =
+        |expr: &BoundExpr, keyer: Option<&pintail_store::TextKeyer>| match (&expr.kind, keyer) {
+            (BoundExprKind::Literal(value), None) => integer_bound(value),
+            (BoundExprKind::Literal(Value::Utf8(text)), Some(keyer)) => {
+                Some(i128::from(keyer.value(text)))
+            }
+            _ => None,
+        };
+    // The collation a comparison node compiles under: its operands', else
+    // the plan's.
+    let keyer_for = |expr: &BoundExpr, text: bool| -> Option<Option<pintail_store::TextKeyer>> {
+        if !text {
+            return Some(None);
+        }
+        let compared = expr
+            .text_collation()
+            .and_then(Collation::from_mysql_name)
+            .unwrap_or(collation);
+        text_keyer(compared).map(Some)
     };
-    let lookup = |expr: &BoundExpr| -> Option<(u32, Vec<i128>)> {
-        match &expr.kind {
+    let lookup = |expr: &BoundExpr| -> Option<pintail_store::IndexLookup> {
+        let (column_id, keyer, values) = match &expr.kind {
             BoundExprKind::Binary {
                 op: BinaryOp::Equal,
                 left,
                 right,
-            } => integer_column(left)
-                .zip(literal(right))
-                .or_else(|| integer_column(right).zip(literal(left)))
-                .map(|(column, value)| (column, vec![value])),
+            } => {
+                let (column, value) = if let Some(column) = indexed_column(left) {
+                    (column, right)
+                } else {
+                    (indexed_column(right)?, left)
+                };
+                let keyer = keyer_for(expr, column.1)?;
+                let value = literal(value, keyer.as_ref())?;
+                (column.0, keyer, vec![value])
+            }
             BoundExprKind::Scalar {
                 function: ScalarFunction::InList { negated: false },
                 args,
             } => {
                 let (subject, list) = args.split_first()?;
-                let column = integer_column(subject)?;
-                let values = list.iter().map(literal).collect::<Option<Vec<_>>>()?;
-                (values.len() <= INDEX_LOOKUP_VALUES).then_some((column, values))
+                let (column_id, text) = indexed_column(subject)?;
+                let keyer = keyer_for(expr, text)?;
+                let values = list
+                    .iter()
+                    .map(|item| literal(item, keyer.as_ref()))
+                    .collect::<Option<Vec<_>>>()?;
+                if values.len() > INDEX_LOOKUP_VALUES {
+                    return None;
+                }
+                (column_id, keyer, values)
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some(pintail_store::IndexLookup {
+            column_id,
+            key: keyer.map_or(
+                pintail_store::IndexKey::Integer,
+                pintail_store::IndexKey::Text,
+            ),
+            probe: pintail_store::IndexProbe::Values(values),
+        })
     };
     let mut conjuncts = Vec::new();
     for predicate in &scan.predicates {
         flatten_and(predicate, &mut conjuncts);
     }
-    let (column_id, mut values) = conjuncts
+    let mut chosen = conjuncts
         .into_iter()
         .filter_map(lookup)
-        .min_by_key(|(_, values)| values.len())?;
-    values.sort_unstable();
-    values.dedup();
-    Some(pintail_store::IndexLookup {
-        column_id,
-        probe: pintail_store::IndexProbe::Values(values),
-    })
+        .min_by_key(|lookup| match &lookup.probe {
+            pintail_store::IndexProbe::Values(values) => values.len(),
+            pintail_store::IndexProbe::Span(..) => usize::MAX,
+        })?;
+    if let pintail_store::IndexProbe::Values(values) = &mut chosen.probe {
+        values.sort_unstable();
+        values.dedup();
+    }
+    Some(chosen)
+}
+
+/// The side index's view of a collation: its identity and key function.
+/// `None` for the JSON ladder, which is not a text collation.
+fn text_keyer(collation: Collation) -> Option<pintail_store::TextKeyer> {
+    if collation == Collation::Json {
+        return None;
+    }
+    // Any identity distinct per collation will do: it names cache entries
+    // within the process and is never persisted.
+    let id = collation.mysql_name().bytes().fold(0_u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    Some(pintail_store::TextKeyer::new(
+        id,
+        std::sync::Arc::new(move |text: &str, out: &mut Vec<u8>| {
+            crate::execution::append_collation_key(text, collation, out);
+        }),
+    ))
 }
 
 fn flatten_and<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {

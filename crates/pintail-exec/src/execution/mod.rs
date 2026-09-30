@@ -26,6 +26,7 @@ pub(crate) use aggregate::compare_decimal_text;
 pub(crate) use aggregate::sma_fold_hits;
 pub use budget::{MemoryBudget, MemoryScope};
 pub use error::{ExecError, SpatialError};
+pub(crate) use join::append_collation_key;
 pub use join::compare_collated_text;
 pub(crate) use order::integer_type as integer_key_type;
 

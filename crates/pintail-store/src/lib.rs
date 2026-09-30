@@ -28,11 +28,11 @@ pub use segment::{
 pub use store::GroupedFoldSpan;
 pub use store::{
     BackupArtifacts, BackupSegment, BulkIngestOutcome, ColumnValidity, CompactionOutcome,
-    CompactionStatus, DecodedColumn, FlushOutcome, IndexLookup, IndexProbe, IngestOutcome,
-    PrewhereRanges, PrewhereSelect, ProjectedColumnChunk, ProjectedRow, ProjectedScan,
-    ProjectedScanStream, ProjectedValueChunk, ScanStats, StorageMetrics, StoreOptions,
-    TableSnapshot, TableStore, WalSync, override_side_index, projected_scan_width,
-    side_index_cache_usage, side_index_enabled, side_index_totals,
+    CompactionStatus, DecodedColumn, FlushOutcome, IndexKey, IndexLookup, IndexProbe,
+    IngestOutcome, PrewhereRanges, PrewhereSelect, ProjectedColumnChunk, ProjectedRow,
+    ProjectedScan, ProjectedScanStream, ProjectedValueChunk, ScanStats, StorageMetrics,
+    StoreOptions, TableSnapshot, TableStore, TextKeyFn, TextKeyer, WalSync, override_side_index,
+    projected_scan_width, side_index_cache_usage, side_index_enabled, side_index_totals,
 };
 
 /// The stable on-disk directory for one table inside a database's `tables`
