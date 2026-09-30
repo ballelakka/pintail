@@ -146,14 +146,154 @@ impl Postings {
     }
 }
 
-type CacheKey = (PathBuf, u32);
+/// Names one segment column's postings. The file name alone is not enough:
+/// a table resynchronized into a fresh directory can reuse it, and a type
+/// change keeps the file while changing what its values mean, so the
+/// segment's identity, versions and schema fingerprint and the column's
+/// declared type are part of the key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CacheKey {
+    path: PathBuf,
+    segment_id: u64,
+    row_count: u64,
+    versions: (u64, u64),
+    schema_fingerprint: u64,
+    column_id: u32,
+    data_type: Option<pintail_types::DataType>,
+}
+
+impl CacheKey {
+    fn new(
+        directory: &Path,
+        meta: &segment::SegmentMeta,
+        schema: &TableSchema,
+        column_id: u32,
+    ) -> Self {
+        Self {
+            path: directory.join(&meta.file_name),
+            segment_id: meta.id,
+            row_count: meta.row_count,
+            versions: (meta.min_version, meta.max_version),
+            schema_fingerprint: meta.schema_fingerprint,
+            column_id,
+            data_type: schema
+                .columns()
+                .iter()
+                .find(|column| column.id() == column_id)
+                .map(pintail_types::Column::data_type),
+        }
+    }
+}
+
 /// One slot per segment column: the first scan to reach it builds, and
 /// scans reaching it meanwhile wait for that build rather than repeat it.
 type Slot = Arc<OnceLock<Option<Arc<Postings>>>>;
 
-fn cache() -> &'static Mutex<HashMap<CacheKey, Slot>> {
-    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Slot>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Default ceiling on the heap the cached postings hold together.
+const DEFAULT_CACHE_BYTES: usize = 256 << 20;
+
+/// The bytes the cached postings may hold, from
+/// `PINTAIL_SECONDARY_INDEX_CACHE_MB` when set.
+fn cache_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("PINTAIL_SECONDARY_INDEX_CACHE_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(DEFAULT_CACHE_BYTES, |megabytes| {
+                megabytes.saturating_mul(1 << 20)
+            })
+    })
+}
+
+struct CacheEntry {
+    slot: Slot,
+    /// Heap bytes of the built postings; zero until the build finishes.
+    bytes: usize,
+    last_used: u64,
+}
+
+/// The postings cache, bounded by bytes and evicted least recently used
+/// first. An evicted entry stays alive for the scans already holding it and
+/// is rebuilt by the next scan that asks.
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<CacheKey, CacheEntry>,
+    resident: usize,
+    clock: u64,
+    evictions: u64,
+}
+
+impl Cache {
+    fn slot(&mut self, key: CacheKey) -> Slot {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.entry(key).or_insert_with(|| CacheEntry {
+            slot: Slot::default(),
+            bytes: 0,
+            last_used: clock,
+        });
+        entry.last_used = clock;
+        Arc::clone(&entry.slot)
+    }
+
+    /// Charges a finished build to its entry, then evicts the least recently
+    /// used other entries until the total fits the limit again.
+    fn charge(&mut self, key: &CacheKey, bytes: usize, limit: usize) {
+        // One segment's postings alone past the limit are not kept, and
+        // evict nothing else to make room.
+        if bytes > limit {
+            if self.entries.remove(key).is_some() {
+                self.evictions += 1;
+            }
+            return;
+        }
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        self.resident = self.resident - entry.bytes + bytes;
+        entry.bytes = bytes;
+        while self.resident > limit {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(candidate, entry)| *candidate != key && entry.bytes > 0)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(candidate, _)| candidate.clone());
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&victim) {
+                self.resident -= evicted.bytes;
+                self.evictions += 1;
+            }
+        }
+    }
+
+    fn forget(&mut self, key: &CacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.resident -= entry.bytes;
+        }
+    }
+}
+
+fn cache() -> &'static Mutex<Cache> {
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Cache::default()))
+}
+
+fn lock_cache() -> std::sync::MutexGuard<'static, Cache> {
+    cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The side-index cache as it stands: entries resident, heap bytes they
+/// hold, and entries evicted since the process started.
+#[must_use]
+pub fn side_index_cache_usage() -> (usize, usize, u64) {
+    let cache = lock_cache();
+    (cache.entries.len(), cache.resident, cache.evictions)
 }
 
 /// Totals over every side index built in this process: entries, heap
@@ -177,20 +317,16 @@ pub(crate) fn postings(
     schema: &TableSchema,
     column_id: u32,
 ) -> Result<Option<Arc<Postings>>, StoreError> {
-    let key = (directory.join(&meta.file_name), column_id);
-    let slot = Arc::clone(
-        cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_default(),
-    );
+    let key = CacheKey::new(directory, meta, schema, column_id);
+    let slot = lock_cache().slot(key.clone());
     if let Some(found) = slot.get() {
         return Ok(found.clone());
     }
     let mut failure = None;
+    let mut built_here = false;
     let built = slot.get_or_init(|| {
         let started = Instant::now();
+        built_here = true;
         match build(directory, meta, schema, column_id) {
             Ok(built) => {
                 let built = built.map(Arc::new);
@@ -207,11 +343,15 @@ pub(crate) fn postings(
     });
     if let Some(error) = failure {
         // A failed build is not remembered as a decline.
-        cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(directory.join(&meta.file_name), column_id));
+        lock_cache().forget(&key);
         return Err(error);
+    }
+    if built_here {
+        // A decline is remembered at the cost of its entry alone.
+        let bytes = built
+            .as_ref()
+            .map_or(1, |postings| postings.heap_bytes().max(1));
+        lock_cache().charge(&key, bytes, cache_limit());
     }
     Ok(built.clone())
 }
@@ -353,6 +493,47 @@ mod tests {
                 .candidate_ranges(&IndexProbe::Span(0, 90), 0, 1_000)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_postings_past_its_limit() {
+        let key = |column_id| CacheKey {
+            path: PathBuf::from("segment"),
+            segment_id: 1,
+            row_count: 10,
+            versions: (1, 2),
+            schema_fingerprint: 3,
+            column_id,
+            data_type: None,
+        };
+        let mut cache = Cache::default();
+        for column in 0..3 {
+            let _ = cache.slot(key(column));
+            cache.charge(&key(column), 40, 100);
+        }
+        // The third build pushed the total to 120: the oldest went.
+        assert!(!cache.entries.contains_key(&key(0)));
+        assert_eq!(
+            (cache.entries.len(), cache.resident, cache.evictions),
+            (2, 80, 1)
+        );
+        // Touching column 1 makes column 2 the older one.
+        let _ = cache.slot(key(1));
+        let _ = cache.slot(key(3));
+        cache.charge(&key(3), 40, 100);
+        assert!(cache.entries.contains_key(&key(1)));
+        assert!(!cache.entries.contains_key(&key(2)));
+        // Postings larger than the whole limit are not kept at all.
+        let _ = cache.slot(key(4));
+        cache.charge(&key(4), 200, 100);
+        assert!(!cache.entries.contains_key(&key(4)));
+        assert_eq!((cache.entries.len(), cache.resident), (2, 80));
+        // A different type for the same column is a different entry.
+        let typed = CacheKey {
+            data_type: Some(pintail_types::DataType::Int64),
+            ..key(5)
+        };
+        assert_ne!(typed, key(5));
     }
 
     #[test]
