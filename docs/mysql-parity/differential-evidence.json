@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "commit": "3a511505f780eeeb22147211aa1c272f4debc157",
-  "measuredAt": "2026-09-30T13:31:28.057Z",
+  "commit": "3fe25812ca8befe482ee1609fdc4d9398cf207d5",
+  "measuredAt": "2026-09-30T20:42:27.971Z",
   "source": "`mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh container.",
-  "ledgerSha256": "4cd5a6df06b27d6bf6384c6069d268ca3c0f58e594a690703c29edae75a7824f",
-  "corpusSha256": "9cf2cb6601265e34fa86df7a0ad2bd9a055694002bc24fc038e44c499821b6ae",
+  "ledgerSha256": "1ac3b85d85e759cae5bc732d1e1716a43468463cd724140db7727d7ec230df60",
+  "corpusSha256": "0b8a6f9f4d1e3ce04fc47920d09c20410ea066ebdc9f41f0d33e09728d154b1c",
   "cases": [
     {
       "name": "a table joined twice under two aliases keeps them distinct",
@@ -8228,11 +8228,11 @@
   ],
   "oracle": {
     "schemaVersion": 1,
-    "commit": "d6bc609144e2e9f0523504b5772261ef217cedc2",
+    "commit": "397632c1075e4ff079c8d94629425f1783604f67",
     "sourceCommit": "374d75103eaa8b5bde44918f0e3155ecabf385d2",
     "measuredAt": "2026-09-30T13:11:44.957956736+00:00",
     "source": "MySQL 8.4.11 (mysql@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242)",
-    "ledgerSha256": "0d98df52eec2d643c8344230919101ae2fad586cf7f529bc7bea4b1c25a2b9b1",
+    "ledgerSha256": "9072566fcf1c85033d420e960cbe2a5700610222281ea5202079dea6774d8b09",
     "corpusSha256": "d3f5c2aa1e543128b465f53cc5c9f3e359a1b979fa6d4a4aae75cf2204d9ff88",
     "cases": [
       {
