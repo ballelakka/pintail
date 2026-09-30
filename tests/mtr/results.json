@@ -5,12 +5,12 @@
   "ref": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
   "mysqlVersion": "8.4.11",
   "provenance": {
-    "sourceCommit": "e215bc5176cf007ea5a3d3d1261e62d990f367c8",
+    "sourceCommit": "a1e5d532bdca73079d13ce5068bfbca2a85a8cd2",
     "sourceDirty": false,
-    "binarySha256": "48b091a869693fae70eb32fd120d8794e763284259bd818ed2756dc2bd980099"
+    "binarySha256": "d217e0b6d6ed86119658f41ddd8a450a7d0973e0d7f12c5a1ba5b400e005899a"
   },
-  "artifacts": "validate-out/mtr/runs/munxlgng-154616",
-  "measuredAt": "2026-09-30T09:59:14.122Z",
+  "artifacts": "validate-out/mtr/runs/muo44se5-153432",
+  "measuredAt": "2026-09-30T13:02:16.147Z",
   "totals": {
     "exact": 9192,
     "compared": 9302,
