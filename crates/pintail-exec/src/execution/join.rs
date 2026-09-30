@@ -1095,6 +1095,11 @@ pub(super) struct ProbePrefetch {
 /// streamed after, and the build side is taken whole.
 pub(super) const PROBE_PREFETCH_ROWS: u64 = 65_536;
 
+/// Distinct probe keys a build-side filter may hold to be taken beneath a
+/// join or a DISTINCT on the build side, to the input the key column comes
+/// from. A larger set stays above them.
+pub(super) const BUILD_KEYS_BELOW_JOIN: usize = 4_096;
+
 /// Distinct probe keys the build-side filter will hold.
 const PROBE_FILTER_KEYS: usize = 65_536;
 

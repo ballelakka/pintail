@@ -4306,6 +4306,61 @@ impl PullOperator {
                         return;
                     }
                 }
+                // Distinct keeps or drops each row whole, so a key column
+                // filtered beneath it drops the same rows; integer keys only,
+                // for the reason the grouped case gives.
+                Self::Distinct {
+                    input, state: None, ..
+                } if matches!(key_mode.form, KeyForm::Integer)
+                    && keys.len() <= join::BUILD_KEYS_BELOW_JOIN =>
+                {
+                    input.restrict_build_keys(key, key_mode, keys);
+                    return;
+                }
+                // A join that has not started passes the filter to the input
+                // the key column comes from, where every output row carrying
+                // a value is made from an input row carrying it: either input
+                // of an inner join, the preserved input of a left, semi or
+                // anti join. A build side that is itself a join of a large
+                // table and a small one is then read for the keys that can
+                // match, not joined whole and filtered after. Only a few
+                // keys go down: a set near the size of the input filters
+                // little for a lookup per row, and takes the input off the
+                // paths that read a scan directly.
+                Self::HashJoin {
+                    left,
+                    right,
+                    kind,
+                    column_types,
+                    right_width,
+                    state: None,
+                    ..
+                } if keys.len() <= join::BUILD_KEYS_BELOW_JOIN => {
+                    let left_width = match kind {
+                        BoundJoinKind::Semi | BoundJoinKind::Anti => column_types.len(),
+                        _ => column_types.len().saturating_sub(*right_width),
+                    };
+                    if position < left_width
+                        && matches!(
+                            kind,
+                            BoundJoinKind::Inner
+                                | BoundJoinKind::Left
+                                | BoundJoinKind::Semi
+                                | BoundJoinKind::Anti
+                        )
+                    {
+                        left.restrict_build_keys(key, key_mode, keys);
+                        return;
+                    }
+                    if position >= left_width && *kind == BoundJoinKind::Inner {
+                        right.restrict_build_keys(
+                            CompiledExpr::Column(position - left_width),
+                            key_mode,
+                            keys,
+                        );
+                        return;
+                    }
+                }
                 _ => {}
             }
         }

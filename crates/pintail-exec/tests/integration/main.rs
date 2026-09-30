@@ -4,6 +4,7 @@
 
 mod admission;
 mod binary_bit_aggregates;
+mod build_keys_through_joins;
 mod clustered_build_keys;
 mod computed_aggregate_arguments;
 mod conditional_count_windows;
