@@ -1754,6 +1754,37 @@ fn sma_column_bounds(predicates: &[BoundExpr]) -> Vec<pintail_store::ColumnBound
                     apply(column, Some(low), Some(high));
                 }
             }
+            // `column IN (constants)` holds only between the least and the
+            // greatest of them; a NULL in the list matches no row. A
+            // constant outside the column's domain leaves the column
+            // unbounded, since it compares by conversion.
+            BoundExprKind::Scalar {
+                function: ScalarFunction::InList { negated: false },
+                args,
+            } if args.len() > 1 => {
+                let BoundExprKind::Column(column) = &args[0].kind else {
+                    continue;
+                };
+                let Some(domain) = column_domain(column) else {
+                    continue;
+                };
+                let mut listed = Vec::with_capacity(args.len() - 1);
+                for argument in &args[1..] {
+                    let units = match &argument.kind {
+                        BoundExprKind::Literal(Value::Null) => continue,
+                        BoundExprKind::Literal(value) => literal_units(domain, value),
+                        _ => None,
+                    };
+                    let Some(units) = units else {
+                        listed.clear();
+                        break;
+                    };
+                    listed.push(units);
+                }
+                if let (Some(least), Some(greatest)) = (listed.iter().min(), listed.iter().max()) {
+                    apply(column, Some(*least), Some(*greatest));
+                }
+            }
             _ => {}
         }
     }
