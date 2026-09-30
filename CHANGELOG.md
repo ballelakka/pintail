@@ -4,6 +4,52 @@ All notable changes to Pintail are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.7-rc1] - 2026-10-01
+
+Two of 0.1.6's known regressions fixed, faster grouped aggregation, a
+side index that now answers text lookups and limited sorts, and a planner
+that orders joins from per-column statistics instead of fixed guesses.
+
+### Fixed
+
+- Scans that test a dense text column on every row are faster than in
+  0.1.5 again (about 24 ms to 14 ms on the uniform 20M-row probe): a
+  dictionary block's codes are appended with one sized extend instead of
+  a per-row loop.
+- A column that a scan both filters on and returns - the key of a join's
+  first input, or a date column under a range - was decoded twice. It is
+  decoded once, which removes the extra blocks the TPC-H Q05 profile
+  showed (a mixed-selectivity probe fell from 129 ms to 74 ms).
+
+### Performance
+
+- Grouped aggregation adds COUNT, SUM, AVG and MIN/MAX over decimals into
+  plain per-group totals and reads grouping keys and values straight from
+  packed storage; COUNT(DISTINCT) partial results merge by set union. On
+  the 20M-row benchmark with the result memo off, Q6 (top 10 spenders) is
+  about 1.6× faster and Q7 (regional analytics) about 1.9×.
+- The side index answers equality and IN filters on text columns under
+  the comparison's collation, keeps unflushed rows it rules out out of the
+  scan, and lets `ORDER BY <integer column> LIMIT k` read only the rows
+  that can come first.
+- Each segment keeps a small distinct-value sketch per column. Join
+  ordering and the choice of which side of a hash join to read first use
+  these estimates (equality and IN from distinct counts, ranges from
+  min/max), so a join run whose last table is filtered to a sliver is
+  reordered to read it first, and a small side's keys filter the large
+  side. Single-table queries never build the statistics.
+
+### Changed
+
+- The manifest format is version 4 (it carries the sketches). Earlier
+  manifests still read and fall back to the old estimates.
+
+### Known issues
+
+- The 0.1.6 slowdown of Q8 (join users + orders) on the containerized
+  20M-row benchmark did not reproduce on native or in-process runs; it
+  will be re-measured by the next stable release's benchmark.
+
 ## [0.1.6] - 2026-09-30
 
 Everything in 0.1.6-rc1 through rc3, gated with the full stable chain: fmt,
