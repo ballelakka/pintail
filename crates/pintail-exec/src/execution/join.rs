@@ -1385,6 +1385,21 @@ impl IntegerKeySet {
     }
 }
 
+/// The keys as integers, when every one is an integer and there are at
+/// most `limit` of them.
+pub(super) fn integer_key_values(keys: &HashSet<JoinHashKey>, limit: usize) -> Option<Vec<i128>> {
+    if keys.len() > limit {
+        return None;
+    }
+    keys.iter()
+        .map(|key| match key {
+            JoinHashKey::NegativeInteger(value) => Some(i128::from(*value)),
+            JoinHashKey::NonNegativeInteger(value) => Some(i128::from(*value)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The smallest and largest integer key in the set, as values a scan can
 /// restrict on; `None` when any key is not an integer.
 pub(super) fn integer_key_span(keys: &HashSet<JoinHashKey>) -> Option<(Value, Value)> {

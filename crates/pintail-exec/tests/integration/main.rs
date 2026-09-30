@@ -87,6 +87,7 @@ mod settled_memo_filter;
 mod settled_memo_group_concat;
 mod settled_memo_identity;
 mod settled_memo_scale;
+mod side_index;
 mod sort_determinism;
 mod spatial_parity;
 mod statement_warnings;

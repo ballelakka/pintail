@@ -51,6 +51,32 @@ use std::{
 
 const HASH_ENTRY_OVERHEAD: usize = 3 * size_of::<usize>();
 
+/// Most join keys handed to the experimental side index as an exact set.
+const INDEX_KEY_SET_VALUES: usize = 4_096;
+
+/// Experimental: which join kinds read their probe side ahead whatever the
+/// estimates say. `PINTAIL_PROBE_PREFETCH_ALWAYS=left` forces left and anti
+/// joins, `=1` every kind that can use the read-ahead, `=0` none; unset, it
+/// forces left and anti joins while the side index is on.
+fn probe_prefetch_forced(kind: BoundJoinKind) -> bool {
+    static FORCED: std::sync::OnceLock<Option<(bool, bool)>> = std::sync::OnceLock::new();
+    let (outer, inner) = FORCED
+        .get_or_init(
+            || match std::env::var("PINTAIL_PROBE_PREFETCH_ALWAYS").as_deref() {
+                Ok("1") => Some((true, true)),
+                Ok("left") => Some((true, false)),
+                Ok("0") => Some((false, false)),
+                _ => None,
+            },
+        )
+        .unwrap_or_else(|| (pintail_store::side_index_enabled(), false));
+    match kind {
+        BoundJoinKind::Left | BoundJoinKind::Anti => outer,
+        BoundJoinKind::Inner | BoundJoinKind::Semi => inner,
+        BoundJoinKind::Scalar | BoundJoinKind::Cross => false,
+    }
+}
+
 use pintail_catalog::{DatabaseId, TableId};
 use pintail_sql::{
     BinaryOp, BoundAggregate, BoundColumn, BoundExpr, BoundExprKind, BoundJoinKind, BoundOrderKey,
@@ -1583,6 +1609,10 @@ pub trait BatchStream: Send {
     /// column ahead of the others, ignores it, and the caller still tests
     /// every row the stream returns.
     fn restrict_integer_membership(&mut self, _position: usize, _member: &IntegerMembership) {}
+
+    /// Hands the stream the exact integer values a join can use in the
+    /// projected column at `position`. Best-effort, like the range form.
+    fn restrict_key_position_set(&mut self, _position: usize, _values: &[i128]) {}
 
     /// The collation this stream's own predicate evaluation compared text
     /// under, when it evaluates the scan's predicates itself. `None` when it
@@ -4260,6 +4290,20 @@ impl PullOperator {
         }
     }
 
+    /// Forwards a join's exact integer key set to the underlying scan, as
+    /// [`Self::restrict_probe_range`] forwards its span.
+    fn restrict_probe_set(&mut self, position: usize, values: &[i128]) {
+        match self {
+            Self::Scan { stream, .. } => stream.restrict_key_position_set(position, values),
+            Self::Filter { input, .. }
+            | Self::KeyFilter { input, .. }
+            | Self::Profiled { input, .. } => {
+                input.restrict_probe_set(position, values);
+            }
+            _ => {}
+        }
+    }
+
     /// Keeps only build rows whose key is in `keys`, the set the probe side
     /// carries. A row whose key no probe row has can match nothing, so for
     /// inner, left, semi and anti joins it contributes nothing to the
@@ -4368,6 +4412,17 @@ impl PullOperator {
             && let Some((minimum, maximum)) = join::integer_key_span(&keys)
         {
             self.restrict_probe_range(position, &minimum, &maximum);
+        }
+        // The index lookup goes first: it only takes a scan whose own
+        // predicates built a filter-first spec, and the membership below
+        // creates one for any scan.
+        if let Some(position) = key.column_index()
+            && matches!(key_mode.form, KeyForm::Integer)
+            && !key_mode.null_safe
+            && pintail_store::side_index_enabled()
+            && let Some(values) = join::integer_key_values(&keys, INDEX_KEY_SET_VALUES)
+        {
+            self.restrict_probe_set(position, &values);
         }
         let integers = join::IntegerKeySet::from_keys(&keys).map(std::sync::Arc::new);
         if let Some(position) = key.column_index()
@@ -5354,7 +5409,16 @@ fn build_operator_inner(
             build_estimate,
             residual,
         } => {
-            let probe_prefetch = probe_prefetch_applies(kind, probe_estimate, build_estimate);
+            // With the experimental side index on, a build side restricted
+            // to the probe's keys is read through the index, so the read-
+            // ahead is worth trying whatever the estimates say: it stays
+            // bounded, and a probe side past its caps streams as before.
+            // Forcing it on an inner join costs the probe scan its
+            // restriction to the build's key span, which a started scan
+            // can no longer take, so only outer joins are forced unless
+            // asked.
+            let probe_prefetch = probe_prefetch_applies(kind, probe_estimate, build_estimate)
+                || probe_prefetch_forced(kind);
             let (left, left_columns) = build_operator(*left, provider, memory, collation)?;
             let (right, right_columns) = build_operator(*right, provider, memory, collation)?;
             // Each join key decides its own collation from the columns it

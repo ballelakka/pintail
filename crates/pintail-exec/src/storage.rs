@@ -581,6 +581,13 @@ impl ScanProvider for SnapshotScanProvider<'_> {
             // memtable overlaps be decoded directly with the superseded rows
             // masked by those columns, instead of merged row by row.
             stream.enable_memtable_overlay(&scan.table.key_column_ids);
+            let prewhere = build_prewhere_spec(scan, snapshot, self.collation);
+            if prewhere.is_some()
+                && pintail_store::side_index_enabled()
+                && let Some(lookup) = predicate_index_lookup(scan, snapshot)
+            {
+                stream.set_index_lookup(lookup);
+            }
             return Ok(Box::new(SnapshotStream {
                 stats: Arc::clone(&self.stats),
                 stats_key: key,
@@ -591,7 +598,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
                 last_prefiltered: false,
                 prefetched: VecDeque::new(),
                 stream: Some(stream),
-                prewhere: build_prewhere_spec(scan, snapshot, self.collation),
+                prewhere,
                 key_position,
                 started: false,
                 types,
@@ -1084,6 +1091,7 @@ impl SnapshotStream {
         let Some((spec, index)) = self.filter_first_column(position) else {
             return;
         };
+        let column_id = spec.predicate_ids[index];
         let (lower, upper) = match spec.runtime_range {
             Some(existing) if existing.index == index => {
                 (lower.max(existing.lower), upper.min(existing.upper))
@@ -1095,6 +1103,49 @@ impl SnapshotStream {
             lower,
             upper,
         });
+        if pintail_store::side_index_enabled()
+            && let Some(stream) = &mut self.stream
+            && stream.index_lookup().is_none()
+        {
+            stream.set_index_lookup(pintail_store::IndexLookup {
+                column_id,
+                probe: pintail_store::IndexProbe::Span(lower, upper),
+            });
+        }
+    }
+
+    /// Hands the side index the exact integer values a join's build side
+    /// can use in the projected column at `position`. Replaces a span or a
+    /// predicate lookup with more values: fewer values name fewer rows.
+    fn restrict_value_set(&mut self, position: usize, values: &[i128]) {
+        if self.started || !pintail_store::side_index_enabled() {
+            return;
+        }
+        let Some(data_type) = self.types.get(position).copied() else {
+            return;
+        };
+        if !is_integer_type(data_type) || self.prewhere.is_none() {
+            return;
+        }
+        let Some(stream) = &mut self.stream else {
+            return;
+        };
+        let Some(column_id) = stream.column_ids().get(position).copied() else {
+            return;
+        };
+        let mut values = values.to_vec();
+        values.sort_unstable();
+        values.dedup();
+        let better = match stream.index_lookup().map(|lookup| &lookup.probe) {
+            Some(pintail_store::IndexProbe::Values(existing)) => existing.len() > values.len(),
+            _ => true,
+        };
+        if better {
+            stream.set_index_lookup(pintail_store::IndexLookup {
+                column_id,
+                probe: pintail_store::IndexProbe::Values(values),
+            });
+        }
     }
 
     /// Makes the integer column at `position` one the filter-first decode
@@ -1533,6 +1584,12 @@ impl BatchStream for SnapshotStream {
         }
     }
 
+    fn restrict_key_position_set(&mut self, position: usize, values: &[i128]) {
+        if self.key_position != Some(position) {
+            self.restrict_value_set(position, values);
+        }
+    }
+
     fn restrict_key_position_range(&mut self, position: usize, min: &Value, max: &Value) {
         if self.started {
             return;
@@ -1964,6 +2021,87 @@ fn build_prewhere_spec(
         membership: None,
         wide_projection,
     })
+}
+
+/// Most values an IN list or a join key set may hand the side index.
+const INDEX_LOOKUP_VALUES: usize = 4_096;
+
+/// The side-index lookup a scan's own predicates imply: a top-level
+/// equality or IN list of integer literals on an integer column other than
+/// the table's key (whose range the key bounds already prune). Among
+/// several, the one naming the fewest values.
+fn predicate_index_lookup(
+    scan: &Scan,
+    snapshot: &TableSnapshot,
+) -> Option<pintail_store::IndexLookup> {
+    let integer_column = |expr: &BoundExpr| match &expr.kind {
+        BoundExprKind::Column(column)
+            if !scan.table.key_column_ids.contains(&column.column_id)
+                && snapshot
+                    .schema()
+                    .columns()
+                    .iter()
+                    .find(|candidate| candidate.id() == column.column_id)
+                    .is_some_and(|candidate| is_integer_type(candidate.data_type())) =>
+        {
+            Some(column.column_id)
+        }
+        _ => None,
+    };
+    let literal = |expr: &BoundExpr| match &expr.kind {
+        BoundExprKind::Literal(value) => integer_bound(value),
+        _ => None,
+    };
+    let lookup = |expr: &BoundExpr| -> Option<(u32, Vec<i128>)> {
+        match &expr.kind {
+            BoundExprKind::Binary {
+                op: BinaryOp::Equal,
+                left,
+                right,
+            } => integer_column(left)
+                .zip(literal(right))
+                .or_else(|| integer_column(right).zip(literal(left)))
+                .map(|(column, value)| (column, vec![value])),
+            BoundExprKind::Scalar {
+                function: ScalarFunction::InList { negated: false },
+                args,
+            } => {
+                let (subject, list) = args.split_first()?;
+                let column = integer_column(subject)?;
+                let values = list.iter().map(literal).collect::<Option<Vec<_>>>()?;
+                (values.len() <= INDEX_LOOKUP_VALUES).then_some((column, values))
+            }
+            _ => None,
+        }
+    };
+    let mut conjuncts = Vec::new();
+    for predicate in &scan.predicates {
+        flatten_and(predicate, &mut conjuncts);
+    }
+    let (column_id, mut values) = conjuncts
+        .into_iter()
+        .filter_map(lookup)
+        .min_by_key(|(_, values)| values.len())?;
+    values.sort_unstable();
+    values.dedup();
+    Some(pintail_store::IndexLookup {
+        column_id,
+        probe: pintail_store::IndexProbe::Values(values),
+    })
+}
+
+fn flatten_and<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match &expr.kind {
+        BoundExprKind::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            flatten_and(left, out);
+            flatten_and(right, out);
+        }
+        _ => out.push(expr),
+    }
 }
 
 /// Integer carrier types a runtime join span can be compared against.
