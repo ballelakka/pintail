@@ -145,8 +145,7 @@ pub(super) fn compress_framed_for_storage(
     directory.u64(digest);
     let mut stored_block = directory.finish();
     stored_block.extend_from_slice(&data);
-    if policy == Compression::AdaptiveLz4 && !materially_smaller(bytes.len(), stored_block.len())
-    {
+    if policy == Compression::AdaptiveLz4 && !materially_smaller(bytes.len(), stored_block.len()) {
         return Ok((Compression::None, bytes.to_vec()));
     }
     Ok((Compression::Framed, stored_block))
@@ -228,7 +227,9 @@ pub(super) fn parse_frames(
     let data = bytes
         .get(directory_length + 8..)
         .ok_or("frame directory digest is truncated")?;
-    let stored = entries.last().map_or(0, |entry| entry.stored_offset + entry.stored_length);
+    let stored = entries
+        .last()
+        .map_or(0, |entry| entry.stored_offset + entry.stored_length);
     if stored != data.len() {
         return Err(format!(
             "frames store {stored} bytes, block holds {}",
@@ -307,7 +308,9 @@ pub(super) fn decompress_block(
                     }
                 };
                 if written != entry.uncompressed_length {
-                    return Err("frame decompressed to a length other than its directory's".to_owned());
+                    return Err(
+                        "frame decompressed to a length other than its directory's".to_owned()
+                    );
                 }
                 offset = end;
             }

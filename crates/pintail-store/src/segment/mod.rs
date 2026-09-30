@@ -4,7 +4,8 @@ use encoding::{
     FRAME_ENTRY_BYTES, FRAMED_MINIMUM_BYTES, compare_cells, compress_block_for_storage,
     compress_framed_for_storage, decode_integer_base, decode_payload, decoded_heap_upper_bound,
     decompress_block, decompress_frame, encode_payload, framed_head_digest, hll_registers,
-    parse_frame_directory, select_encoding, unpack, unpack_delta_each, unpack_signed_into, unpack_unsigned_into,
+    parse_frame_directory, select_encoding, unpack, unpack_delta_each, unpack_signed_into,
+    unpack_unsigned_into,
 };
 
 use std::{
@@ -4402,7 +4403,11 @@ fn read_file_framed_utf8_rows(
         .u64()
         .map_err(|reason| corrupt_here(path, decoder, reason))?;
     if framed_head_digest(&head, &directory) != digest {
-        return Err(corrupt(path, block_offset, "framed block head checksum mismatch"));
+        return Err(corrupt(
+            path,
+            block_offset,
+            "framed block head checksum mismatch",
+        ));
     }
     let entries = parse_frame_directory(&directory, uncompressed_length)
         .map_err(|reason| corrupt(path, block_offset, reason))?;
@@ -4411,7 +4416,11 @@ fn read_file_framed_utf8_rows(
         .last()
         .map_or(0, |entry| entry.stored_offset + entry.stored_length);
     if stored + directory_length + 8 != stored_total {
-        return Err(corrupt(path, block_offset, "frames do not fill their block"));
+        return Err(corrupt(
+            path,
+            block_offset,
+            "frames do not fill their block",
+        ));
     }
     let null_bitmap = &head[bitmap_start..bitmap_start + bitmap_length as usize];
     let is_null = |row: usize| null_bitmap[row / 8] & (1 << (row % 8)) != 0;
@@ -4452,7 +4461,10 @@ fn read_file_framed_utf8_rows(
             } else {
                 let frame_index = entries.partition_point(|entry| entry.end_value() <= ordinal);
                 let entry = &entries[frame_index];
-                if loaded.as_ref().is_none_or(|(index, _)| *index != frame_index) {
+                if loaded
+                    .as_ref()
+                    .is_none_or(|(index, _)| *index != frame_index)
+                {
                     decoder
                         .seek_to(data_start + entry.stored_offset)
                         .map_err(|reason| corrupt_here(path, decoder, reason))?;
@@ -4466,8 +4478,9 @@ fn read_file_framed_utf8_rows(
                             "frame checksum mismatch",
                         ));
                     }
-                    let bytes = decompress_frame(entry, &stored)
-                        .map_err(|reason| corrupt(path, data_start + entry.stored_offset, reason))?;
+                    let bytes = decompress_frame(entry, &stored).map_err(|reason| {
+                        corrupt(path, data_start + entry.stored_offset, reason)
+                    })?;
                     loaded = Some((frame_index, bytes));
                     cursor = 0;
                     cursor_value = entry.first_value;
@@ -5993,10 +6006,22 @@ mod framed_block_tests {
             .iter()
             .map(|row| row.values()[2].clone())
             .collect::<Vec<_>>();
-        for compression in [Compression::AdaptiveLz4, Compression::Zstd, Compression::Lz4] {
+        for compression in [
+            Compression::AdaptiveLz4,
+            Compression::Zstd,
+            Compression::Lz4,
+        ] {
             let directory = tempfile::tempdir().expect("tempdir");
-            let meta = write(directory.path(), 1, &schema(), &rows, 1024, compression, true)
-                .expect("write segment");
+            let meta = write(
+                directory.path(),
+                1,
+                &schema(),
+                &rows,
+                1024,
+                compression,
+                true,
+            )
+            .expect("write segment");
             let bytes = std::fs::read(directory.path().join(&meta.file_name)).expect("bytes");
             assert_eq!(bytes[5], super::FORMAT_VERSION);
             let range_sets: Vec<Vec<std::ops::Range<usize>>> = vec![
@@ -6041,11 +6066,20 @@ mod framed_block_tests {
             *byte ^= 0x5A;
         }
         std::fs::write(&path, &bytes).expect("rewrite segment");
-        let every_other = (0..3000_usize).step_by(2).map(|row| row..row + 1).collect::<Vec<_>>();
+        let every_other = (0..3000_usize)
+            .step_by(2)
+            .map(|row| row..row + 1)
+            .collect::<Vec<_>>();
         let budget_cell = std::sync::atomic::AtomicUsize::new(0);
         let budget = ScanMemoryBudget::new(&budget_cell, usize::MAX);
-        let read =
-            read_projected_column_ranges(directory.path(), &meta, &schema(), &[2], &every_other, &budget);
+        let read = read_projected_column_ranges(
+            directory.path(),
+            &meta,
+            &schema(),
+            &[2],
+            &every_other,
+            &budget,
+        );
         let Err(error) = read else {
             panic!("a damaged frame must fail the read");
         };
@@ -6069,8 +6103,16 @@ mod framed_block_tests {
             for version in [4_u8, 5] {
                 super::WRITTEN_FORMAT_VERSION.with(|written| written.set(version));
                 let directory = tempfile::tempdir().expect("tempdir");
-                let meta = write(directory.path(), 1, &schema(), &rows, 16_384, compression, true)
-                    .expect("write segment");
+                let meta = write(
+                    directory.path(),
+                    1,
+                    &schema(),
+                    &rows,
+                    16_384,
+                    compression,
+                    true,
+                )
+                .expect("write segment");
                 super::WRITTEN_FORMAT_VERSION.with(|written| written.set(super::FORMAT_VERSION));
                 let size = std::fs::metadata(directory.path().join(&meta.file_name))
                     .expect("metadata")
