@@ -721,7 +721,12 @@
   },
   {
     "phase": "snapshot",
-    "check": "query:geometry: spatial functions are a documented gap",
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "SKIP"
+  },
+  {
+    "phase": "snapshot",
+    "check": "query:geometry: spatial predicates filter replicated rows",
     "status": "SKIP"
   },
   {
@@ -2071,7 +2076,12 @@
   },
   {
     "phase": "orm-compat",
-    "check": "query:geometry: spatial functions are a documented gap",
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "SKIP"
+  },
+  {
+    "phase": "orm-compat",
+    "check": "query:geometry: spatial predicates filter replicated rows",
     "status": "SKIP"
   },
   {
@@ -3301,7 +3311,12 @@
   },
   {
     "phase": "crud",
-    "check": "query:geometry: spatial functions are a documented gap",
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "SKIP"
+  },
+  {
+    "phase": "crud",
+    "check": "query:geometry: spatial predicates filter replicated rows",
     "status": "SKIP"
   },
   {
@@ -4531,7 +4546,12 @@
   },
   {
     "phase": "composite-keys",
-    "check": "query:geometry: spatial functions are a documented gap",
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "SKIP"
+  },
+  {
+    "phase": "composite-keys",
+    "check": "query:geometry: spatial predicates filter replicated rows",
     "status": "SKIP"
   },
   {
@@ -5761,7 +5781,12 @@
   },
   {
     "phase": "type-edges",
-    "check": "query:geometry: spatial functions are a documented gap",
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "SKIP"
+  },
+  {
+    "phase": "type-edges",
+    "check": "query:geometry: spatial predicates filter replicated rows",
     "status": "SKIP"
   },
   {
@@ -7016,9 +7041,13 @@
   },
   {
     "phase": "ddl",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "ddl",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "ddl",
@@ -8257,9 +8286,13 @@
   },
   {
     "phase": "schema-drift-minimal",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "schema-drift-minimal",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "schema-drift-minimal",
@@ -9498,9 +9531,13 @@
   },
   {
     "phase": "schema-drift-unseen",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "schema-drift-unseen",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "schema-drift-unseen",
@@ -10769,9 +10806,13 @@
   },
   {
     "phase": "churn",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "churn",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "churn",
@@ -12010,9 +12051,13 @@
   },
   {
     "phase": "contention",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "contention",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "contention",
@@ -13276,9 +13321,13 @@
   },
   {
     "phase": "execution-budget",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "execution-budget",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "execution-budget",
@@ -14537,9 +14586,13 @@
   },
   {
     "phase": "spill",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "spill",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "spill",
@@ -15798,9 +15851,13 @@
   },
   {
     "phase": "pooling",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "pooling",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "pooling",
@@ -17134,9 +17191,13 @@
   },
   {
     "phase": "local-database",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "local-database",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "local-database",
@@ -18380,9 +18441,13 @@
   },
   {
     "phase": "restart",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "restart",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "restart",
@@ -18893,7 +18958,7 @@
     "phase": "activity-history",
     "check": "activity-history:the history is in the control plane pintail reads",
     "status": "PASS",
-    "detail": "150030 sync_runs rows for db_71a4795776ac864158a1686ae1a7aeaa"
+    "detail": "150030 sync_runs rows for db_e26a76fd1f837536f72f6d1858e1cbab"
   },
   {
     "phase": "activity-history",
@@ -18905,25 +18970,25 @@
     "phase": "activity-history",
     "check": "activity-history:scoped feed stays fast over a large history",
     "status": "PASS",
-    "detail": "p50 1ms p95 2ms over 150000 rows"
+    "detail": "p50 1ms p95 1ms over 150000 rows"
   },
   {
     "phase": "activity-history",
     "check": "activity-history:workspace feed stays fast over a large history",
     "status": "PASS",
-    "detail": "p50 1ms p95 1ms"
+    "detail": "p50 1ms p95 2ms"
   },
   {
     "phase": "activity-history",
     "check": "activity-history:25 concurrent feed reads do not pile up",
     "status": "PASS",
-    "detail": "p50 27ms p99 30ms"
+    "detail": "p50 25ms p99 29ms"
   },
   {
     "phase": "activity-history",
     "check": "activity-history:health answers while the feed is hammered",
     "status": "PASS",
-    "detail": "health p95 2ms"
+    "detail": "health p95 3ms"
   },
   {
     "phase": "activity-history",
@@ -19657,9 +19722,13 @@
   },
   {
     "phase": "activity-history",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "activity-history",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "activity-history",
@@ -20170,19 +20239,19 @@
     "phase": "poll-storm",
     "check": "poll-storm:no request fails under 25 open dashboards",
     "status": "PASS",
-    "detail": "0 failed of 4934"
+    "detail": "0 failed of 4925"
   },
   {
     "phase": "poll-storm",
     "check": "poll-storm:latency stays bounded",
     "status": "PASS",
-    "detail": "4934 requests: p50 1ms p99 10ms"
+    "detail": "4925 requests: p50 1ms p99 8ms"
   },
   {
     "phase": "poll-storm",
     "check": "poll-storm:health never stalls",
     "status": "PASS",
-    "detail": "health p99 2ms"
+    "detail": "health p99 1ms"
   },
   {
     "phase": "poll-storm",
@@ -20922,9 +20991,13 @@
   },
   {
     "phase": "poll-storm",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "poll-storm",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "poll-storm",
@@ -22273,9 +22346,13 @@
   },
   {
     "phase": "control-plane",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "control-plane",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "control-plane",
@@ -23524,9 +23601,13 @@
   },
   {
     "phase": "snapshot-ddl-window",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "snapshot-ddl-window",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "snapshot-ddl-window",
@@ -24796,9 +24877,13 @@
   },
   {
     "phase": "drop-table-cdc",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "drop-table-cdc",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "drop-table-cdc",
@@ -26057,9 +26142,13 @@
   },
   {
     "phase": "drop-table-recreate",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "drop-table-recreate",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "drop-table-recreate",
@@ -26585,7 +26674,7 @@
     "phase": "drop-table-polling",
     "check": "polling:one dropped table does not stop the other tables",
     "status": "WARN",
-    "detail": "the whole poll cycle aborts on the first table that fails, so every other table stops replicating too: {\"database\":{\"restored_backup_created_at\":null,\"data_age_seconds\":null,\"id\":\"db_71a4795776ac864158a1686ae1a7aeaa\",\"name\":\"e2e_db\",\"mode\":\"polling\",\"effective_mode\":\"polling\",\"state\":\"error\",\"include_tables\":[],\"exclude_tables\":[],\"poll_interval_seconds\":5,\"reconcile_interval_seconds\":600,\"keyless_policy\":\"quarantine\",\"created_at\":\"2026-09-28T09:11:15.167653633+00:00\",\"updated_at\":\"2026-09-28T09:15:21.528506527+00:00\"},\"tables\":30,\"rows\":10900}"
+    "detail": "the whole poll cycle aborts on the first table that fails, so every other table stops replicating too: {\"database\":{\"restored_backup_created_at\":null,\"data_age_seconds\":null,\"id\":\"db_e26a76fd1f837536f72f6d1858e1cbab\",\"name\":\"e2e_db\",\"mode\":\"polling\",\"effective_mode\":\"polling\",\"state\":\"error\",\"include_tables\":[],\"exclude_tables\":[],\"poll_interval_seconds\":5,\"reconcile_interval_seconds\":600,\"keyless_policy\":\"quarantine\",\"created_at\":\"2026-09-30T07:14:42.924887990+00:00\",\"updated_at\":\"2026-09-30T07:18:48.039953124+00:00\"},\"tables\":30,\"rows\":10900}"
   },
   {
     "phase": "drop-table-polling",
@@ -27329,9 +27418,13 @@
   },
   {
     "phase": "drop-table-polling",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "drop-table-polling",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "drop-table-polling",
@@ -28596,9 +28689,13 @@
   },
   {
     "phase": "restart-during-snapshot",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "restart-during-snapshot",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "restart-during-snapshot",
@@ -29874,9 +29971,13 @@
   },
   {
     "phase": "restart-during-resync",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "restart-during-resync",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "restart-during-resync",
@@ -30393,7 +30494,7 @@
     "phase": "memory-pressure",
     "check": "memory-pressure:the process survives the storm",
     "status": "PASS",
-    "detail": "wire 240 ok, http 68 ok, dashboards 132 ok; no errors"
+    "detail": "wire 240 ok, http 74 ok, dashboards 126 ok; no errors"
   },
   {
     "phase": "memory-pressure",
@@ -30405,25 +30506,25 @@
     "phase": "memory-pressure",
     "check": "memory-pressure:work still gets done",
     "status": "PASS",
-    "detail": "wire 240 of 240, http 68"
+    "detail": "wire 240 of 240, http 74"
   },
   {
     "phase": "memory-pressure",
     "check": "memory-pressure:wire queries are not starved by the HTTP surface",
     "status": "PASS",
-    "detail": "wire p50 266ms p99 1106ms over 240 queries"
+    "detail": "wire p50 275ms p99 1241ms over 240 queries"
   },
   {
     "phase": "memory-pressure",
     "check": "memory-pressure:health never stalls",
     "status": "PASS",
-    "detail": "health p99 21ms over 9 samples"
+    "detail": "health p99 16ms over 9 samples"
   },
   {
     "phase": "memory-pressure",
     "check": "memory-pressure:the process stays inside its ceiling",
     "status": "PASS",
-    "detail": "peak RSS 150MB with a 256MB budget"
+    "detail": "peak RSS 140MB with a 256MB budget"
   },
   {
     "phase": "memory-pressure",
@@ -31174,9 +31275,13 @@
   },
   {
     "phase": "memory-pressure",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "memory-pressure",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "memory-pressure",
@@ -31711,7 +31816,7 @@
     "phase": "reconcile-memory",
     "check": "reconcile-memory:reconciliation is bounded in memory",
     "status": "PASS",
-    "detail": "RSS 67MB before, peak 249MB during (margin 768MB)"
+    "detail": "RSS 69MB before, peak 218MB during (margin 768MB)"
   },
   {
     "phase": "reconcile-memory",
@@ -32450,9 +32555,13 @@
   },
   {
     "phase": "reconcile-memory",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "reconcile-memory",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "reconcile-memory",
@@ -33737,9 +33846,13 @@
   },
   {
     "phase": "drop-database",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "drop-database",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "drop-database",
@@ -34986,9 +35099,13 @@
   },
   {
     "phase": "ddl-documented-gaps",
-    "check": "query:geometry: spatial functions are a documented gap",
-    "status": "WARN",
-    "detail": "spatial query functions are not implemented; geometry is carried as bytes only\nError: unsupported expression: ST_AsText(route)"
+    "check": "query:geometry: spatial functions read replicated geometry",
+    "status": "PASS"
+  },
+  {
+    "phase": "ddl-documented-gaps",
+    "check": "query:geometry: spatial predicates filter replicated rows",
+    "status": "PASS"
   },
   {
     "phase": "ddl-documented-gaps",

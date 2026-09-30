@@ -1,12 +1,12 @@
 # Pintail end-to-end differential gate
 
-Measured 2026-09-28T09:01:02.823Z.
+Measured 2026-09-30T07:03:52.869Z.
 
 Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh container.
 
-**7015 passed, 0 failed, 29 documented-gap warnings, 44 skipped.**
+**7061 passed, 0 failed, 6 documented-gap warnings, 49 skipped.**
 
-223 unique corpus queries produced 6244 corpus checks across phases; the remaining checks are convergence, battery, and control-plane assertions.
+224 unique corpus queries produced 6272 corpus checks across phases; the remaining checks are convergence, battery, and control-plane assertions.
 
 | Phase | Check | Status | Detail |
 |---|---|---|---|
@@ -154,7 +154,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | snapshot | query:geometry: hex round-trips the internal format | SKIP |  |
 | snapshot | query:geometry: byte length includes the srid prefix | SKIP |  |
 | snapshot | query:geometry: null routes filter and count | SKIP |  |
-| snapshot | query:geometry: spatial functions are a documented gap | SKIP |  |
+| snapshot | query:geometry: spatial functions read replicated geometry | SKIP |  |
+| snapshot | query:geometry: spatial predicates filter replicated rows | SKIP |  |
 | snapshot | query:set: find_in_set filters by membership | PASS |  |
 | snapshot | query:set: equality is literal, not member-normalized | PASS |  |
 | snapshot | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -424,7 +425,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | orm-compat | query:geometry: hex round-trips the internal format | SKIP |  |
 | orm-compat | query:geometry: byte length includes the srid prefix | SKIP |  |
 | orm-compat | query:geometry: null routes filter and count | SKIP |  |
-| orm-compat | query:geometry: spatial functions are a documented gap | SKIP |  |
+| orm-compat | query:geometry: spatial functions read replicated geometry | SKIP |  |
+| orm-compat | query:geometry: spatial predicates filter replicated rows | SKIP |  |
 | orm-compat | query:set: find_in_set filters by membership | PASS |  |
 | orm-compat | query:set: equality is literal, not member-normalized | PASS |  |
 | orm-compat | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -670,7 +672,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | crud | query:geometry: hex round-trips the internal format | SKIP |  |
 | crud | query:geometry: byte length includes the srid prefix | SKIP |  |
 | crud | query:geometry: null routes filter and count | SKIP |  |
-| crud | query:geometry: spatial functions are a documented gap | SKIP |  |
+| crud | query:geometry: spatial functions read replicated geometry | SKIP |  |
+| crud | query:geometry: spatial predicates filter replicated rows | SKIP |  |
 | crud | query:set: find_in_set filters by membership | PASS |  |
 | crud | query:set: equality is literal, not member-normalized | PASS |  |
 | crud | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -916,7 +919,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | composite-keys | query:geometry: hex round-trips the internal format | SKIP |  |
 | composite-keys | query:geometry: byte length includes the srid prefix | SKIP |  |
 | composite-keys | query:geometry: null routes filter and count | SKIP |  |
-| composite-keys | query:geometry: spatial functions are a documented gap | SKIP |  |
+| composite-keys | query:geometry: spatial functions read replicated geometry | SKIP |  |
+| composite-keys | query:geometry: spatial predicates filter replicated rows | SKIP |  |
 | composite-keys | query:set: find_in_set filters by membership | PASS |  |
 | composite-keys | query:set: equality is literal, not member-normalized | PASS |  |
 | composite-keys | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -1162,7 +1166,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | type-edges | query:geometry: hex round-trips the internal format | SKIP |  |
 | type-edges | query:geometry: byte length includes the srid prefix | SKIP |  |
 | type-edges | query:geometry: null routes filter and count | SKIP |  |
-| type-edges | query:geometry: spatial functions are a documented gap | SKIP |  |
+| type-edges | query:geometry: spatial functions read replicated geometry | SKIP |  |
+| type-edges | query:geometry: spatial predicates filter replicated rows | SKIP |  |
 | type-edges | query:set: find_in_set filters by membership | PASS |  |
 | type-edges | query:set: equality is literal, not member-normalized | PASS |  |
 | type-edges | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -1413,7 +1418,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | ddl | query:geometry: hex round-trips the internal format | PASS |  |
 | ddl | query:geometry: byte length includes the srid prefix | PASS |  |
 | ddl | query:geometry: null routes filter and count | PASS |  |
-| ddl | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| ddl | query:geometry: spatial functions read replicated geometry | PASS |  |
+| ddl | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | ddl | query:set: find_in_set filters by membership | PASS |  |
 | ddl | query:set: equality is literal, not member-normalized | PASS |  |
 | ddl | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -1661,7 +1667,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | schema-drift-minimal | query:geometry: hex round-trips the internal format | PASS |  |
 | schema-drift-minimal | query:geometry: byte length includes the srid prefix | PASS |  |
 | schema-drift-minimal | query:geometry: null routes filter and count | PASS |  |
-| schema-drift-minimal | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| schema-drift-minimal | query:geometry: spatial functions read replicated geometry | PASS |  |
+| schema-drift-minimal | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | schema-drift-minimal | query:set: find_in_set filters by membership | PASS |  |
 | schema-drift-minimal | query:set: equality is literal, not member-normalized | PASS |  |
 | schema-drift-minimal | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -1909,7 +1916,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | schema-drift-unseen | query:geometry: hex round-trips the internal format | PASS |  |
 | schema-drift-unseen | query:geometry: byte length includes the srid prefix | PASS |  |
 | schema-drift-unseen | query:geometry: null routes filter and count | PASS |  |
-| schema-drift-unseen | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| schema-drift-unseen | query:geometry: spatial functions read replicated geometry | PASS |  |
+| schema-drift-unseen | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | schema-drift-unseen | query:set: find_in_set filters by membership | PASS |  |
 | schema-drift-unseen | query:set: equality is literal, not member-normalized | PASS |  |
 | schema-drift-unseen | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -2163,7 +2171,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | churn | query:geometry: hex round-trips the internal format | PASS |  |
 | churn | query:geometry: byte length includes the srid prefix | PASS |  |
 | churn | query:geometry: null routes filter and count | PASS |  |
-| churn | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| churn | query:geometry: spatial functions read replicated geometry | PASS |  |
+| churn | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | churn | query:set: find_in_set filters by membership | PASS |  |
 | churn | query:set: equality is literal, not member-normalized | PASS |  |
 | churn | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -2411,7 +2420,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | contention | query:geometry: hex round-trips the internal format | PASS |  |
 | contention | query:geometry: byte length includes the srid prefix | PASS |  |
 | contention | query:geometry: null routes filter and count | PASS |  |
-| contention | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| contention | query:geometry: spatial functions read replicated geometry | PASS |  |
+| contention | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | contention | query:set: find_in_set filters by membership | PASS |  |
 | contention | query:set: equality is literal, not member-normalized | PASS |  |
 | contention | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -2664,7 +2674,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | execution-budget | query:geometry: hex round-trips the internal format | PASS |  |
 | execution-budget | query:geometry: byte length includes the srid prefix | PASS |  |
 | execution-budget | query:geometry: null routes filter and count | PASS |  |
-| execution-budget | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| execution-budget | query:geometry: spatial functions read replicated geometry | PASS |  |
+| execution-budget | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | execution-budget | query:set: find_in_set filters by membership | PASS |  |
 | execution-budget | query:set: equality is literal, not member-normalized | PASS |  |
 | execution-budget | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -2916,7 +2927,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | spill | query:geometry: hex round-trips the internal format | PASS |  |
 | spill | query:geometry: byte length includes the srid prefix | PASS |  |
 | spill | query:geometry: null routes filter and count | PASS |  |
-| spill | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| spill | query:geometry: spatial functions read replicated geometry | PASS |  |
+| spill | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | spill | query:set: find_in_set filters by membership | PASS |  |
 | spill | query:set: equality is literal, not member-normalized | PASS |  |
 | spill | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -3168,7 +3180,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | pooling | query:geometry: hex round-trips the internal format | PASS |  |
 | pooling | query:geometry: byte length includes the srid prefix | PASS |  |
 | pooling | query:geometry: null routes filter and count | PASS |  |
-| pooling | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| pooling | query:geometry: spatial functions read replicated geometry | PASS |  |
+| pooling | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | pooling | query:set: find_in_set filters by membership | PASS |  |
 | pooling | query:set: equality is literal, not member-normalized | PASS |  |
 | pooling | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -3435,7 +3448,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | local-database | query:geometry: hex round-trips the internal format | PASS |  |
 | local-database | query:geometry: byte length includes the srid prefix | PASS |  |
 | local-database | query:geometry: null routes filter and count | PASS |  |
-| local-database | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| local-database | query:geometry: spatial functions read replicated geometry | PASS |  |
+| local-database | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | local-database | query:set: find_in_set filters by membership | PASS |  |
 | local-database | query:set: equality is literal, not member-normalized | PASS |  |
 | local-database | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -3684,7 +3698,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | restart | query:geometry: hex round-trips the internal format | PASS |  |
 | restart | query:geometry: byte length includes the srid prefix | PASS |  |
 | restart | query:geometry: null routes filter and count | PASS |  |
-| restart | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| restart | query:geometry: spatial functions read replicated geometry | PASS |  |
+| restart | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | restart | query:set: find_in_set filters by membership | PASS |  |
 | restart | query:set: equality is literal, not member-normalized | PASS |  |
 | restart | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -3786,11 +3801,11 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | restart | query:where: an unsigned column against a negative literal | PASS |  |
 | restart | query:where: a string number against an integer column | PASS |  |
 | restart | query:where: a general_ci column under PAD SPACE | PASS |  |
-| activity-history | activity-history:the history is in the control plane pintail reads | PASS | 150030 sync_runs rows for db_4dbc48a4be6ec0a8c26fe9be1f0f5001 |
+| activity-history | activity-history:the history is in the control plane pintail reads | PASS | 150030 sync_runs rows for db_a5c3eef9f9b3934d32f1525d7b440dd0 |
 | activity-history | activity-history:the feed pages the full history | PASS | limit=200 returned 200 |
-| activity-history | activity-history:scoped feed stays fast over a large history | PASS | p50 1ms p95 2ms over 150000 rows |
+| activity-history | activity-history:scoped feed stays fast over a large history | PASS | p50 1ms p95 1ms over 150000 rows |
 | activity-history | activity-history:workspace feed stays fast over a large history | PASS | p50 1ms p95 1ms |
-| activity-history | activity-history:25 concurrent feed reads do not pile up | PASS | p50 27ms p99 31ms |
+| activity-history | activity-history:25 concurrent feed reads do not pile up | PASS | p50 26ms p99 28ms |
 | activity-history | activity-history:health answers while the feed is hammered | PASS | health p95 2ms |
 | activity-history | converge:Dim | PASS |  |
 | activity-history | converge:Event | PASS |  |
@@ -3938,7 +3953,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | activity-history | query:geometry: hex round-trips the internal format | PASS |  |
 | activity-history | query:geometry: byte length includes the srid prefix | PASS |  |
 | activity-history | query:geometry: null routes filter and count | PASS |  |
-| activity-history | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| activity-history | query:geometry: spatial functions read replicated geometry | PASS |  |
+| activity-history | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | activity-history | query:set: find_in_set filters by membership | PASS |  |
 | activity-history | query:set: equality is literal, not member-normalized | PASS |  |
 | activity-history | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -4040,10 +4056,10 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | activity-history | query:where: an unsigned column against a negative literal | PASS |  |
 | activity-history | query:where: a string number against an integer column | PASS |  |
 | activity-history | query:where: a general_ci column under PAD SPACE | PASS |  |
-| poll-storm | poll-storm:no request fails under 25 open dashboards | PASS | 0 failed of 4934 |
-| poll-storm | poll-storm:latency stays bounded | PASS | 4934 requests: p50 1ms p99 8ms |
-| poll-storm | poll-storm:health never stalls | PASS | health p99 1ms |
-| poll-storm | poll-storm:replication keeps pace under the storm | PASS | orders replica 7592 vs source 7592 |
+| poll-storm | poll-storm:no request fails under 25 open dashboards | PASS | 0 failed of 4924 |
+| poll-storm | poll-storm:latency stays bounded | PASS | 4924 requests: p50 1ms p99 10ms |
+| poll-storm | poll-storm:health never stalls | PASS | health p99 3ms |
+| poll-storm | poll-storm:replication keeps pace under the storm | PASS | orders replica 7536 vs source 7536 |
 | poll-storm | converge:Dim | PASS |  |
 | poll-storm | converge:Event | PASS |  |
 | poll-storm | converge:Fact | PASS |  |
@@ -4190,7 +4206,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | poll-storm | query:geometry: hex round-trips the internal format | PASS |  |
 | poll-storm | query:geometry: byte length includes the srid prefix | PASS |  |
 | poll-storm | query:geometry: null routes filter and count | PASS |  |
-| poll-storm | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| poll-storm | query:geometry: spatial functions read replicated geometry | PASS |  |
+| poll-storm | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | poll-storm | query:set: find_in_set filters by membership | PASS |  |
 | poll-storm | query:set: equality is literal, not member-normalized | PASS |  |
 | poll-storm | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -4460,7 +4477,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | control-plane | query:geometry: hex round-trips the internal format | PASS |  |
 | control-plane | query:geometry: byte length includes the srid prefix | PASS |  |
 | control-plane | query:geometry: null routes filter and count | PASS |  |
-| control-plane | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| control-plane | query:geometry: spatial functions read replicated geometry | PASS |  |
+| control-plane | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | control-plane | query:set: find_in_set filters by membership | PASS |  |
 | control-plane | query:set: equality is literal, not member-normalized | PASS |  |
 | control-plane | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -4710,7 +4728,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | snapshot-ddl-window | query:geometry: hex round-trips the internal format | PASS |  |
 | snapshot-ddl-window | query:geometry: byte length includes the srid prefix | PASS |  |
 | snapshot-ddl-window | query:geometry: null routes filter and count | PASS |  |
-| snapshot-ddl-window | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| snapshot-ddl-window | query:geometry: spatial functions read replicated geometry | PASS |  |
+| snapshot-ddl-window | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | snapshot-ddl-window | query:set: find_in_set filters by membership | PASS |  |
 | snapshot-ddl-window | query:set: equality is literal, not member-normalized | PASS |  |
 | snapshot-ddl-window | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -4964,7 +4983,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | drop-table-cdc | query:geometry: hex round-trips the internal format | PASS |  |
 | drop-table-cdc | query:geometry: byte length includes the srid prefix | PASS |  |
 | drop-table-cdc | query:geometry: null routes filter and count | PASS |  |
-| drop-table-cdc | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| drop-table-cdc | query:geometry: spatial functions read replicated geometry | PASS |  |
+| drop-table-cdc | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | drop-table-cdc | query:set: find_in_set filters by membership | PASS |  |
 | drop-table-cdc | query:set: equality is literal, not member-normalized | PASS |  |
 | drop-table-cdc | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -5216,7 +5236,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | drop-table-recreate | query:geometry: hex round-trips the internal format | PASS |  |
 | drop-table-recreate | query:geometry: byte length includes the srid prefix | PASS |  |
 | drop-table-recreate | query:geometry: null routes filter and count | PASS |  |
-| drop-table-recreate | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| drop-table-recreate | query:geometry: spatial functions read replicated geometry | PASS |  |
+| drop-table-recreate | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | drop-table-recreate | query:set: find_in_set filters by membership | PASS |  |
 | drop-table-recreate | query:set: equality is literal, not member-normalized | PASS |  |
 | drop-table-recreate | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -5321,7 +5342,7 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | drop-table-polling | polling:fixtures replicate before the mode switch | PASS |  |
 | drop-table-polling | polling:database is healthy before the drop | PASS |  |
 | drop-table-polling | polling:TRUNCATE empties the replica | PASS |  |
-| drop-table-polling | polling:one dropped table does not stop the other tables | WARN | the whole poll cycle aborts on the first table that fails, so every other table stops replicating too: {"database":{"restored_backup_created_at":null,"data_age_seconds":null,"id":"db_4dbc48a4be6ec0a8c26fe9be1f0f5001","name":"e2e_db","mode":"polling","effective_mode":"polling","state":"error","include_tables":[],"exclude_tables":[],"poll_interval_seconds":5,"reconcile_interval_seconds":600,"keyless_policy":"quarantine","created_at":"2026-09-28T08:55:56.402524986+00:00","updated_at":"2026-09-28T09:00:03.128397769+00:00"},"tables":30,"rows":11505} |
+| drop-table-polling | polling:one dropped table does not stop the other tables | WARN | the whole poll cycle aborts on the first table that fails, so every other table stops replicating too: {"database":{"restored_backup_created_at":null,"data_age_seconds":null,"id":"db_a5c3eef9f9b3934d32f1525d7b440dd0","name":"e2e_db","mode":"polling","effective_mode":"polling","state":"error","include_tables":[],"exclude_tables":[],"poll_interval_seconds":5,"reconcile_interval_seconds":600,"keyless_policy":"quarantine","created_at":"2026-09-30T06:58:47.104663109+00:00","updated_at":"2026-09-30T07:02:52.686076570+00:00"},"tables":30,"rows":11449} |
 | drop-table-polling | polling:re-probe restores replication for the surviving tables | PASS |  |
 | drop-table-polling | converge:Dim | PASS |  |
 | drop-table-polling | converge:Event | PASS |  |
@@ -5470,7 +5491,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | drop-table-polling | query:geometry: hex round-trips the internal format | PASS |  |
 | drop-table-polling | query:geometry: byte length includes the srid prefix | PASS |  |
 | drop-table-polling | query:geometry: null routes filter and count | PASS |  |
-| drop-table-polling | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| drop-table-polling | query:geometry: spatial functions read replicated geometry | PASS |  |
+| drop-table-polling | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | drop-table-polling | query:set: find_in_set filters by membership | PASS |  |
 | drop-table-polling | query:set: equality is literal, not member-normalized | PASS |  |
 | drop-table-polling | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -5723,7 +5745,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | restart-during-snapshot | query:geometry: hex round-trips the internal format | PASS |  |
 | restart-during-snapshot | query:geometry: byte length includes the srid prefix | PASS |  |
 | restart-during-snapshot | query:geometry: null routes filter and count | PASS |  |
-| restart-during-snapshot | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| restart-during-snapshot | query:geometry: spatial functions read replicated geometry | PASS |  |
+| restart-during-snapshot | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | restart-during-snapshot | query:set: find_in_set filters by membership | PASS |  |
 | restart-during-snapshot | query:set: equality is literal, not member-normalized | PASS |  |
 | restart-during-snapshot | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -5978,7 +6001,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | restart-during-resync | query:geometry: hex round-trips the internal format | PASS |  |
 | restart-during-resync | query:geometry: byte length includes the srid prefix | PASS |  |
 | restart-during-resync | query:geometry: null routes filter and count | PASS |  |
-| restart-during-resync | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| restart-during-resync | query:geometry: spatial functions read replicated geometry | PASS |  |
+| restart-during-resync | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | restart-during-resync | query:set: find_in_set filters by membership | PASS |  |
 | restart-during-resync | query:set: equality is literal, not member-normalized | PASS |  |
 | restart-during-resync | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -6081,13 +6105,13 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | restart-during-resync | query:where: a string number against an integer column | PASS |  |
 | restart-during-resync | query:where: a general_ci column under PAD SPACE | PASS |  |
 | memory-pressure | memory-pressure:a CDC table with a secondary UNIQUE key streams under the ceiling | PASS | pintail 40, source 40 |
-| memory-pressure | memory-pressure:the process survives the storm | PASS | wire 240 ok, http 80 ok, dashboards 156 ok; no errors |
+| memory-pressure | memory-pressure:the process survives the storm | PASS | wire 240 ok, http 77 ok, dashboards 138 ok; no errors |
 | memory-pressure | memory-pressure:every failure is a designed refusal | PASS | only refusals; 0 dashboard requests failed |
-| memory-pressure | memory-pressure:work still gets done | PASS | wire 240 of 240, http 80 |
-| memory-pressure | memory-pressure:wire queries are not starved by the HTTP surface | PASS | wire p50 300ms p99 1378ms over 240 queries |
-| memory-pressure | memory-pressure:health never stalls | PASS | health p99 17ms over 11 samples |
-| memory-pressure | memory-pressure:the process stays inside its ceiling | PASS | peak RSS 150MB with a 256MB budget |
-| memory-pressure | memory-pressure:the replica catches up after the storm | PASS | big 201100 vs source 201100 |
+| memory-pressure | memory-pressure:work still gets done | PASS | wire 240 of 240, http 77 |
+| memory-pressure | memory-pressure:wire queries are not starved by the HTTP surface | PASS | wire p50 267ms p99 1115ms over 240 queries |
+| memory-pressure | memory-pressure:health never stalls | PASS | health p99 16ms over 10 samples |
+| memory-pressure | memory-pressure:the process stays inside its ceiling | PASS | peak RSS 139MB with a 256MB budget |
+| memory-pressure | memory-pressure:the replica catches up after the storm | PASS | big 201000 vs source 201000 |
 | memory-pressure | memory-pressure:queries recover once the storm passes | PASS | 3 of 3 sequential queries succeeded |
 | memory-pressure | converge:Dim | PASS |  |
 | memory-pressure | converge:Event | PASS |  |
@@ -6236,7 +6260,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | memory-pressure | query:geometry: hex round-trips the internal format | PASS |  |
 | memory-pressure | query:geometry: byte length includes the srid prefix | PASS |  |
 | memory-pressure | query:geometry: null routes filter and count | PASS |  |
-| memory-pressure | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| memory-pressure | query:geometry: spatial functions read replicated geometry | PASS |  |
+| memory-pressure | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | memory-pressure | query:set: find_in_set filters by membership | PASS |  |
 | memory-pressure | query:set: equality is literal, not member-normalized | PASS |  |
 | memory-pressure | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -6342,7 +6367,7 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | reconcile-memory | reconcile-memory:every child row arrives | PASS | 2000000 of 2000000 |
 | reconcile-memory | reconcile-memory:the cascade removed the deleted parents' children | PASS | 1800000 remain |
 | reconcile-memory | reconcile-memory:reconciliation converges the replica on the source | PASS | child 1800000 vs source 1800000 after 4.4s |
-| reconcile-memory | reconcile-memory:reconciliation is bounded in memory | PASS | RSS 68MB before, peak 222MB during (margin 768MB) |
+| reconcile-memory | reconcile-memory:reconciliation is bounded in memory | PASS | RSS 75MB before, peak 181MB during (margin 768MB) |
 | reconcile-memory | converge:Dim | PASS |  |
 | reconcile-memory | converge:Event | PASS |  |
 | reconcile-memory | converge:Fact | PASS |  |
@@ -6490,7 +6515,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | reconcile-memory | query:geometry: hex round-trips the internal format | PASS |  |
 | reconcile-memory | query:geometry: byte length includes the srid prefix | PASS |  |
 | reconcile-memory | query:geometry: null routes filter and count | PASS |  |
-| reconcile-memory | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| reconcile-memory | query:geometry: spatial functions read replicated geometry | PASS |  |
+| reconcile-memory | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | reconcile-memory | query:set: find_in_set filters by membership | PASS |  |
 | reconcile-memory | query:set: equality is literal, not member-normalized | PASS |  |
 | reconcile-memory | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -6747,7 +6773,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | drop-database | query:geometry: hex round-trips the internal format | PASS |  |
 | drop-database | query:geometry: byte length includes the srid prefix | PASS |  |
 | drop-database | query:geometry: null routes filter and count | PASS |  |
-| drop-database | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| drop-database | query:geometry: spatial functions read replicated geometry | PASS |  |
+| drop-database | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | drop-database | query:set: find_in_set filters by membership | PASS |  |
 | drop-database | query:set: equality is literal, not member-normalized | PASS |  |
 | drop-database | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -6996,7 +7023,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | ddl-documented-gaps | query:geometry: hex round-trips the internal format | PASS |  |
 | ddl-documented-gaps | query:geometry: byte length includes the srid prefix | PASS |  |
 | ddl-documented-gaps | query:geometry: null routes filter and count | PASS |  |
-| ddl-documented-gaps | query:geometry: spatial functions are a documented gap | WARN | spatial query functions are not implemented; geometry is carried as bytes only |
+| ddl-documented-gaps | query:geometry: spatial functions read replicated geometry | PASS |  |
+| ddl-documented-gaps | query:geometry: spatial predicates filter replicated rows | PASS |  |
 | ddl-documented-gaps | query:set: find_in_set filters by membership | PASS |  |
 | ddl-documented-gaps | query:set: equality is literal, not member-normalized | PASS |  |
 | ddl-documented-gaps | query:set: distinct values walk the bitmask including empty | PASS |  |
@@ -7104,31 +7132,31 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | Phase | run s | converge s | corpus s |
 |---|---|---|---|
 | snapshot | 0.0 | 0.1 | 0.7 |
-| orm-compat | 1.9 | 0.0 | 0.7 |
-| crud | 0.0 | 2.4 | 0.8 |
-| composite-keys | 0.0 | 1.6 | 0.8 |
-| type-edges | 0.0 | 1.8 | 0.8 |
-| ddl | 6.6 | 2.9 | 0.7 |
-| schema-drift-minimal | 0.0 | 1.6 | 0.7 |
-| schema-drift-unseen | 0.0 | 1.8 | 0.7 |
-| churn | 0.2 | 1.6 | 0.7 |
-| contention | 13.4 | 0.1 | 1.3 |
-| execution-budget | 0.0 | 0.1 | 1.3 |
-| spill | 5.0 | 0.5 | 1.4 |
-| pooling | 0.1 | 0.6 | 1.3 |
-| local-database | 0.0 | 0.1 | 1.3 |
-| restart | 0.5 | 2.9 | 1.3 |
-| activity-history | 1.0 | 0.5 | 1.3 |
-| poll-storm | 21.3 | 0.1 | 1.3 |
-| control-plane | 31.1 | 0.1 | 1.1 |
+| orm-compat | 2.1 | 0.0 | 0.7 |
+| crud | 0.0 | 2.2 | 0.7 |
+| composite-keys | 0.0 | 1.8 | 0.7 |
+| type-edges | 0.0 | 1.8 | 0.7 |
+| ddl | 6.9 | 2.9 | 0.5 |
+| schema-drift-minimal | 0.0 | 1.6 | 0.5 |
+| schema-drift-unseen | 0.0 | 2.3 | 0.5 |
+| churn | 0.2 | 1.3 | 0.6 |
+| contention | 13.4 | 0.1 | 1.1 |
+| execution-budget | 0.0 | 0.1 | 1.1 |
+| spill | 5.1 | 0.4 | 1.0 |
+| pooling | 0.1 | 1.1 | 1.0 |
+| local-database | 0.0 | 0.1 | 1.0 |
+| restart | 0.5 | 3.0 | 1.0 |
+| activity-history | 1.0 | 0.4 | 1.1 |
+| poll-storm | 21.3 | 0.1 | 1.1 |
+| control-plane | 31.3 | 0.1 | 1.2 |
 | snapshot-ddl-window | 5.1 | 0.1 | 0.7 |
-| drop-table-cdc | 9.4 | 0.1 | 1.2 |
-| drop-table-recreate | 11.2 | 0.1 | 1.2 |
-| drop-table-polling | 103.9 | 0.1 | 0.7 |
-| restart-during-snapshot | 1.7 | 0.1 | 0.8 |
+| drop-table-cdc | 9.7 | 0.1 | 1.1 |
+| drop-table-recreate | 11.2 | 0.1 | 1.1 |
+| drop-table-polling | 104.0 | 0.1 | 0.7 |
+| restart-during-snapshot | 1.9 | 0.1 | 0.7 |
 | restart-during-resync | 4.1 | 0.1 | 0.7 |
-| memory-pressure | 9.9 | 0.1 | 0.7 |
-| reconcile-memory | 21.5 | 0.1 | 0.8 |
-| drop-database | 11.6 | 0.1 | 0.7 |
-| ddl-documented-gaps | 0.0 | 0.1 | 0.7 |
-| total | 259.5 | 19.5 | 26.3 |
+| memory-pressure | 10.2 | 0.1 | 0.7 |
+| reconcile-memory | 21.0 | 0.1 | 0.7 |
+| drop-database | 12.1 | 0.1 | 0.7 |
+| ddl-documented-gaps | 0.0 | 0.1 | 0.6 |
+| total | 261.2 | 20.4 | 23.1 |
