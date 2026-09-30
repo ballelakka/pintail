@@ -129,6 +129,7 @@ impl<'catalog> Binder<'catalog> {
                 row_count: None,
                 estimated_rows: None,
                 key_column_ids: Vec::new(),
+                column_statistics: None,
                 input: None,
             });
         }
@@ -396,6 +397,7 @@ impl<'catalog> Binder<'catalog> {
             row_count: None,
             estimated_rows: None,
             key_column_ids: Vec::new(),
+            column_statistics: None,
             input: None,
         };
         let mut scope = ctes.to_vec();
@@ -2421,6 +2423,7 @@ impl<'catalog> Binder<'catalog> {
             row_count: None,
             estimated_rows: None,
             key_column_ids: Vec::new(),
+            column_statistics: None,
             input: Some(Box::new(input)),
         };
         Ok(BoundJoinRelation {
@@ -2638,6 +2641,7 @@ impl<'catalog> Binder<'catalog> {
             row_count: table.statistics().row_count(),
             estimated_rows: table.statistics().estimated_row_count(),
             key_column_ids: table.key_column_ids().to_vec(),
+            column_statistics: table.column_statistics().cloned(),
             input: None,
         })
     }
@@ -2698,6 +2702,7 @@ impl<'catalog> Binder<'catalog> {
             row_count: None,
             estimated_rows: None,
             key_column_ids: Vec::new(),
+            column_statistics: None,
             input: Some(Box::new(input)),
         }
     }

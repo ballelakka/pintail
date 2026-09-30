@@ -166,6 +166,9 @@ pub struct BoundTable {
     pub estimated_rows: Option<u64>,
     /// Stable columns that produce the physical storage key.
     pub key_column_ids: Vec<u32>,
+    /// Per-column statistics from the table's stored data, for planning
+    /// only.
+    pub column_statistics: Option<std::sync::Arc<pintail_catalog::ColumnStatistics>>,
     /// Bound input for a derived table or common table expression.
     ///
     /// Catalog-backed tables leave this empty and become storage scans.

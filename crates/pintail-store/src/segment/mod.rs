@@ -9,7 +9,7 @@ use encoding::{
 };
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -302,6 +302,9 @@ pub struct ColumnSma {
     pub non_null: u64,
     pub sum: Option<SmaSum>,
     pub extremes: Option<SmaExtremes>,
+    /// Distinct live non-NULL values, as a mergeable sketch; `None` for
+    /// segments recorded before manifest format v4.
+    pub distinct: Option<crate::sketch::DistinctSketch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -422,7 +425,11 @@ pub(crate) fn sma_disjoint(meta: &SegmentMeta, bounds: &[ColumnBounds]) -> bool 
 /// contents fall outside the supported statistics keep only the non-NULL
 /// count, which still answers COUNT(column).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn compute_segment_smas(schema: &TableSchema, rows: &[StoredRow]) -> SegmentSmas {
+pub(crate) fn compute_segment_smas(
+    schema: &TableSchema,
+    rows: &[StoredRow],
+    sketches: &BTreeMap<u32, crate::sketch::DistinctSketch>,
+) -> SegmentSmas {
     let tombstones = rows.iter().filter(|row| row.is_deleted()).count() as u64;
     let live_rows = rows.len() as u64 - tombstones;
     let columns = schema
@@ -552,6 +559,7 @@ pub(crate) fn compute_segment_smas(schema: &TableSchema, rows: &[StoredRow]) -> 
                 non_null,
                 sum,
                 extremes,
+                distinct: sketches.get(&column.id()).copied(),
             }
         })
         .collect();
@@ -911,10 +919,14 @@ pub(crate) fn write(
     let mut position = header.len();
     let mut column_offsets = Vec::with_capacity(specs.len());
     let mut descriptors = Vec::with_capacity(specs.len() * COLUMN_DESCRIPTOR_LENGTH);
+    let mut sketches = BTreeMap::new();
     for spec in &specs {
         column_offsets.push(position as u64);
         let mut column = Encoder::new();
-        write_column(&mut column, spec, rows, block_rows, compression)?;
+        sketches.insert(
+            spec.id,
+            write_column(&mut column, spec, rows, block_rows, compression)?,
+        );
         let column = column.finish();
         descriptors.extend_from_slice(&column[..COLUMN_DESCRIPTOR_LENGTH]);
         file.write_all(&column)
@@ -1002,7 +1014,7 @@ pub(crate) fn write(
         max_key,
         bloom,
         unique_keys,
-        smas: Some(compute_segment_smas(schema, rows)),
+        smas: Some(compute_segment_smas(schema, rows, &sketches)),
     })
 }
 
@@ -3530,26 +3542,31 @@ fn write_column(
     rows: &[StoredRow],
     block_rows: usize,
     compression: Compression,
-) -> Result<(), StoreError> {
+) -> Result<crate::sketch::DistinctSketch, StoreError> {
     encoder.u32(spec.id);
     encoder.u8(spec.logical_type as u8);
     encoder.length(rows.len().div_ceil(block_rows), "column block count")?;
+    // The blocks' own registers, merged: the column's sketch costs no
+    // hashing beyond what each block's statistics already do.
+    let mut sketch = crate::sketch::DistinctSketch::default();
     for block in rows.chunks(block_rows) {
         let cells = block
             .iter()
             .map(|row| cell_for(spec, row))
             .collect::<Result<Vec<_>, _>>()?;
-        write_block(encoder, spec.logical_type, &cells, compression)?;
+        let registers = write_block(encoder, spec.logical_type, &cells, compression)?;
+        sketch.merge(&crate::sketch::DistinctSketch::from_registers(registers));
     }
-    Ok(())
+    Ok(sketch)
 }
 
+/// Writes one block and answers its distinct-value registers.
 fn write_block(
     encoder: &mut Encoder,
     logical_type: LogicalType,
     cells: &[Cell],
     compression: Compression,
-) -> Result<(), StoreError> {
+) -> Result<[u8; 64], StoreError> {
     let mut block = Encoder::new();
     block.length(cells.len(), "block row count")?;
     let mut null_bitmap = vec![0_u8; cells.len().div_ceil(8)];
@@ -3607,11 +3624,12 @@ fn write_block(
         .unwrap_or_default();
     block.bytes(&min, "block minimum")?;
     block.bytes(&max, "block maximum")?;
-    block.bytes(&hll_registers(&encoded_values), "block HLL sketch")?;
+    let registers = hll_registers(&encoded_values);
+    block.bytes(&registers, "block HLL sketch")?;
     let payload = block.finish();
     encoder.bytes(&payload, "column block")?;
     encoder.u64(xxh3_64(&payload));
-    Ok(())
+    Ok(registers)
 }
 
 /// Holds a segment header's row count to the manifest's. The header sits

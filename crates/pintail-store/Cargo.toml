@@ -12,6 +12,7 @@ fuzzing = []
 failpoints = ["pintail-failpoint/failpoints"]
 
 [dependencies]
+pintail-catalog.workspace = true
 pintail-failpoint.workspace = true
 pintail-log.workspace = true
 fs2.workspace = true

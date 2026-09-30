@@ -1,0 +1,120 @@
+//! Per-column planner statistics assembled from a snapshot's segment
+//! statistics and its unflushed rows.
+
+use pintail_catalog::{ColumnFacts, ColumnRange, ColumnStatistics, RangeDomain};
+
+use super::TableSnapshot;
+use crate::{
+    segment::{NativeUnits, SmaExtremes},
+    sketch::DistinctSketch,
+};
+
+/// Unflushed rows folded into the sketches at most. More are sampled
+/// evenly, so a large memtable costs a catalog build no more than this.
+const MEMTABLE_SAMPLE_ROWS: usize = 4_096;
+
+impl TableSnapshot {
+    /// Per-column statistics for the planner: every segment's distinct
+    /// sketch merged, value ranges widened across segments, and the
+    /// unflushed rows folded in (an even sample of them when there are
+    /// many). Segments recorded before sketches existed leave a column's
+    /// distinct count unknown rather than guessed. Superseded row versions
+    /// still stored in older segments are counted too; the figures order
+    /// joins and never answer a query.
+    #[must_use]
+    pub fn column_statistics(&self) -> ColumnStatistics {
+        let columns = self.schema.columns();
+        let mut rows = 0_u64;
+        let mut non_null = vec![0_u64; columns.len()];
+        let mut sketches: Vec<Option<DistinctSketch>> =
+            vec![Some(DistinctSketch::default()); columns.len()];
+        let mut ranges: Vec<Option<Option<ColumnRange>>> = vec![None; columns.len()];
+        for segment in &self.manifest.segments {
+            let Some(smas) = &segment.smas else {
+                rows = rows.saturating_add(segment.row_count);
+                sketches.fill(None);
+                ranges.fill(Some(None));
+                continue;
+            };
+            rows = rows.saturating_add(smas.live_rows);
+            for (index, column) in columns.iter().enumerate() {
+                let Some(sma) = smas.columns.iter().find(|sma| sma.column_id == column.id()) else {
+                    // Added after this segment was written: its rows hold
+                    // the column's default, which no sketch here counted.
+                    sketches[index] = None;
+                    ranges[index] = Some(None);
+                    continue;
+                };
+                non_null[index] = non_null[index].saturating_add(sma.non_null);
+                match (&mut sketches[index], &sma.distinct) {
+                    (Some(sketch), Some(theirs)) => sketch.merge(theirs),
+                    (sketch, _) => *sketch = None,
+                }
+                if sma.non_null > 0 {
+                    let range = sma.extremes.and_then(range_of);
+                    ranges[index] = Some(match (ranges[index], range) {
+                        (None, range) => range,
+                        (Some(Some(known)), Some(range)) if known.domain == range.domain => {
+                            Some(ColumnRange {
+                                domain: known.domain,
+                                low: known.low.min(range.low),
+                                high: known.high.max(range.high),
+                            })
+                        }
+                        _ => None,
+                    });
+                }
+            }
+        }
+        let live = self.memtable.values().filter(|row| !row.is_deleted());
+        let memtable_rows = live.clone().count();
+        rows = rows.saturating_add(u64::try_from(memtable_rows).unwrap_or(u64::MAX));
+        let stride = memtable_rows.div_ceil(MEMTABLE_SAMPLE_ROWS).max(1);
+        let scale = u64::try_from(stride).unwrap_or(1);
+        for row in live.step_by(stride) {
+            for (index, value) in row.values().iter().enumerate().take(columns.len()) {
+                if matches!(value, pintail_types::Value::Null) {
+                    continue;
+                }
+                non_null[index] = non_null[index].saturating_add(scale);
+                if let Some(sketch) = &mut sketches[index] {
+                    sketch.insert(value);
+                }
+            }
+        }
+        ColumnStatistics {
+            rows,
+            columns: columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| ColumnFacts {
+                    column_id: column.id(),
+                    non_null: non_null[index],
+                    distinct: sketches[index]
+                        .as_ref()
+                        .map(|sketch| sketch.estimate().min(non_null[index])),
+                    range: ranges[index].flatten(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn range_of(extremes: SmaExtremes) -> Option<ColumnRange> {
+    let (domain, low, high) = match extremes {
+        SmaExtremes::Int { min, max } => (RangeDomain::Int, i128::from(min), i128::from(max)),
+        SmaExtremes::UInt { min, max } => (RangeDomain::UInt, i128::from(min), i128::from(max)),
+        SmaExtremes::DecimalUnits { min, max, scale } => (RangeDomain::Decimal { scale }, min, max),
+        SmaExtremes::Temporal { min, max, units } => (
+            match units {
+                NativeUnits::Date => RangeDomain::Date,
+                NativeUnits::DateTime { .. } => RangeDomain::DateTime,
+                NativeUnits::Decimal { .. } => return None,
+            },
+            i128::from(min),
+            i128::from(max),
+        ),
+        SmaExtremes::Float { .. } => return None,
+    };
+    Some(ColumnRange { domain, low, high })
+}

@@ -3,6 +3,7 @@ mod lifecycle_tests;
 mod scan;
 pub(crate) mod side_index;
 mod snapshot;
+mod statistics;
 
 pub use scan::{
     ColumnValidity, DecodedColumn, PrewhereRanges, PrewhereSelect, ProjectedColumnChunk,

@@ -10,13 +10,17 @@ use crate::{
         ColumnSma, SegmentMeta, SegmentSmas, SmaExtremes, SmaSum, schema_fingerprint,
         sync_directory,
     },
+    sketch::{DistinctSketch, SKETCH_REGISTERS},
 };
 
 pub(crate) const FILE_NAME: &str = "manifest.ptm";
 const MAGIC: &[u8; 5] = b"PTMAN";
 /// v2 adds optional per-segment SMAs; v1 manifests still decode (their
-/// segments carry no SMAs and decline the aggregate fast path).
-const FORMAT_VERSION: u8 = 3;
+/// segments carry no SMAs and decline the aggregate fast path). v3 adds the
+/// committed local-transaction version. v4 adds a distinct-value sketch to
+/// each SMA column; older SMAs decode without one and the planner falls
+/// back to its fixed guesses for them.
+const FORMAT_VERSION: u8 = 4;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Manifest {
@@ -172,7 +176,7 @@ pub(crate) fn load(directory: &Path, schema: &TableSchema) -> Result<Manifest, S
             }
         };
         let smas = if format_version >= 2 {
-            decode_smas(&mut decoder)?
+            decode_smas(&mut decoder, format_version)?
         } else {
             None
         };
@@ -379,12 +383,43 @@ fn encode_smas(encoder: &mut Encoder, smas: Option<&SegmentSmas>) -> Result<(), 
                 }
             }
         }
+        match &column.distinct {
+            None => encoder.u8(0),
+            Some(sketch) => {
+                encoder.u8(1);
+                encoder.raw(sketch.registers());
+            }
+        }
     }
     Ok(())
 }
 
+fn decode_sketch(decoder: &mut Decoder<'_>) -> Result<Option<DistinctSketch>, StoreError> {
+    match decoder
+        .u8()
+        .map_err(|reason| corrupt_here(decoder, reason))?
+    {
+        0 => Ok(None),
+        1 => {
+            let registers: [u8; SKETCH_REGISTERS] = decoder
+                .take(SKETCH_REGISTERS)
+                .map_err(|reason| corrupt_here(decoder, reason))?
+                .try_into()
+                .map_err(|_| corrupt_here(decoder, "short distinct sketch"))?;
+            Ok(Some(DistinctSketch::from_registers(registers)))
+        }
+        tag => Err(corrupt_here(
+            decoder,
+            format!("invalid distinct sketch tag {tag}"),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-fn decode_smas(decoder: &mut Decoder<'_>) -> Result<Option<SegmentSmas>, StoreError> {
+fn decode_smas(
+    decoder: &mut Decoder<'_>,
+    format_version: u8,
+) -> Result<Option<SegmentSmas>, StoreError> {
     match decoder
         .u8()
         .map_err(|reason| corrupt_here(decoder, reason))?
@@ -517,11 +552,17 @@ fn decode_smas(decoder: &mut Decoder<'_>) -> Result<Option<SegmentSmas>, StoreEr
                 ));
             }
         };
+        let distinct = if format_version >= 4 {
+            decode_sketch(decoder)?
+        } else {
+            None
+        };
         columns.push(ColumnSma {
             column_id,
             non_null,
             sum,
             extremes,
+            distinct,
         });
     }
     Ok(Some(SegmentSmas {

@@ -82,9 +82,12 @@ A reader loads a manifest, recovers WAL sequences newer than its
 flushed-sequence change restarts the open, preventing an old-manifest/new-WAL
 combination during publication and WAL reset.
 
-## Manifest (`PTMAN`, version 1)
+## Manifest (`PTMAN`, version 4)
 
-The checksummed binary manifest is:
+Readers accept versions 1 to 4. Version 2 adds the optional per-segment
+small materialized aggregates (`segment_smas` below), version 3 the
+committed local-transaction version, and version 4 a distinct-value sketch
+in each SMA column. The checksummed binary manifest is:
 
 ```
 "PTMAN" | u8 format_version
@@ -107,8 +110,36 @@ repeated segment_count times:
     composite_key max_key
     bytes primary_key_bloom_filter
     u8 globally_unique_keys
+    segment_smas                # version 2 and later
 u64 xxh3(all preceding manifest bytes)
 ```
+
+`u64 committed_version` follows `memtable_epoch` in version 3 and later.
+`segment_smas` is `u8 0` when absent, else:
+
+```
+u8 1
+u64 live_rows
+u64 tombstones
+u32 column_count
+repeated column_count times:
+    u32 column_id
+    u64 non_null
+    u8 sum_tag | sum             # 0 none, 1 i128, 2 f64 bits, 3 i128 + u8 scale
+    u8 extremes_tag | extremes   # 0 none, 1 i64, 2 u64, 3 f64 bits,
+                                 # 4 i128 + u8 scale, 5 i64 + temporal units
+    u8 sketch_tag | registers    # version 4 and later: 0 none, 1 then 64 bytes
+```
+
+The distinct sketch is the register-wise maximum of the column's block HLL
+sketches in that segment (same hashing: `xxh3` of each value's physical
+bytes, low six bits pick one of 64 registers, rank one more than the
+leading zeros of the remaining 58 bits), so it counts every stored value,
+superseded versions included. Sketches merge by
+taking each register's maximum, so a table's per-column distinct estimate is
+the merge over its segments plus a bounded sample of unflushed rows. They
+feed join ordering only; version 1-3 manifests carry none, and their
+columns plan with fixed selectivity guesses.
 
 Publication writes and synchronizes `.manifest.ptm.tmp`, atomically renames
 it to `manifest.ptm`, then synchronizes the table directory. A snapshot holds

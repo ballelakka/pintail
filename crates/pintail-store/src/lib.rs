@@ -13,6 +13,7 @@ mod manifest;
 mod memtable;
 mod publication;
 mod segment;
+mod sketch;
 mod store;
 mod wal;
 
@@ -25,6 +26,7 @@ pub use segment::{
     BoundDomain, ColumnBounds, ColumnSma, NativeUnits, SegmentSmas, SmaExtremes, SmaSum,
     sync_directory,
 };
+pub use sketch::DistinctSketch;
 pub use store::GroupedFoldSpan;
 pub use store::{
     BackupArtifacts, BackupSegment, BulkIngestOutcome, ColumnValidity, CompactionOutcome,

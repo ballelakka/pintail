@@ -85,6 +85,71 @@ impl TableStatistics {
     }
 }
 
+/// Per-column facts a table's stored data maintains for the planner: how
+/// many distinct values a column holds and the span its values cover.
+/// Estimates only. They choose join orders and build sides and never decide
+/// an answer, so a stale or approximate figure costs time, not correctness.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ColumnStatistics {
+    /// Live rows the statistics describe.
+    pub rows: u64,
+    /// One entry per column that has statistics, in no particular order.
+    pub columns: Vec<ColumnFacts>,
+}
+
+impl ColumnStatistics {
+    /// The facts recorded for one stable column ID.
+    #[must_use]
+    pub fn column(&self, column_id: u32) -> Option<&ColumnFacts> {
+        self.columns
+            .iter()
+            .find(|column| column.column_id == column_id)
+    }
+}
+
+/// What the stored data says about one column.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnFacts {
+    /// Stable schema column ID.
+    pub column_id: u32,
+    /// Live rows whose value is not NULL.
+    pub non_null: u64,
+    /// Estimated distinct non-NULL values, when a sketch covers the column.
+    pub distinct: Option<u64>,
+    /// Smallest and largest non-NULL value, when the column's type has an
+    /// ordered numeric form.
+    pub range: Option<ColumnRange>,
+}
+
+/// A column's value span in an integer domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnRange {
+    /// Which values the bounds are measured in.
+    pub domain: RangeDomain,
+    /// Smallest value, inclusive.
+    pub low: i128,
+    /// Largest value, inclusive.
+    pub high: i128,
+}
+
+/// The unit a [`ColumnRange`] is measured in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RangeDomain {
+    /// Signed integers.
+    Int,
+    /// Unsigned integers.
+    UInt,
+    /// Decimal values scaled by `10^scale`.
+    Decimal {
+        /// Digits after the decimal point.
+        scale: u8,
+    },
+    /// Days since 1970-01-01.
+    Date,
+    /// Microseconds since the epoch.
+    DateTime,
+}
+
 /// An immutable table entry in a catalog snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableEntry {
@@ -93,6 +158,7 @@ pub struct TableEntry {
     schema: Arc<TableSchema>,
     statistics: TableStatistics,
     key_column_ids: Vec<u32>,
+    column_statistics: Option<Arc<ColumnStatistics>>,
 }
 
 impl TableEntry {
@@ -131,7 +197,21 @@ impl TableEntry {
             schema: Arc::new(schema),
             statistics,
             key_column_ids: Vec::new(),
+            column_statistics: None,
         })
+    }
+
+    /// Attaches the per-column statistics the table's stored data keeps.
+    #[must_use]
+    pub fn with_column_statistics(mut self, statistics: Arc<ColumnStatistics>) -> Self {
+        self.column_statistics = Some(statistics);
+        self
+    }
+
+    /// Per-column statistics, when the table's storage supplied them.
+    #[must_use]
+    pub fn column_statistics(&self) -> Option<&Arc<ColumnStatistics>> {
+        self.column_statistics.as_ref()
     }
 
     /// Declares the stable columns that produce the physical primary or
