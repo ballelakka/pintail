@@ -80,13 +80,19 @@ pub struct IndexLookup {
 pub(crate) struct Postings {
     values: Vec<i64>,
     rows: Vec<u32>,
+    /// Rows in the segment, NULLs included.
+    row_count: usize,
 }
 
 impl Postings {
-    fn from_pairs(mut pairs: Vec<(i64, u32)>) -> Self {
+    fn from_pairs(mut pairs: Vec<(i64, u32)>, row_count: usize) -> Self {
         pairs.sort_unstable();
         let (values, rows) = pairs.into_iter().unzip();
-        Self { values, rows }
+        Self {
+            values,
+            rows,
+            row_count,
+        }
     }
 
     /// Heap bytes the postings hold.
@@ -131,9 +137,15 @@ impl Postings {
             let row = *row as usize;
             row >= start && row < end
         };
-        // Counted before anything is collected, and abandoned as soon as the
-        // share is passed: a wide span declines at the cost of that count.
         let total = runs.iter().map(ExactSizeIterator::len).sum::<usize>();
+        // A probe past the share of the whole segment declines at once: a
+        // segment read in several slices otherwise walked the probe's every
+        // row once per slice to count the ones inside it.
+        if total.saturating_mul(MAX_CANDIDATE_SHARE) > self.row_count {
+            return None;
+        }
+        // Counted before anything is collected, and abandoned as soon as the
+        // slice's share is passed.
         if total > limit {
             let mut counted = 0_usize;
             for run in &runs {
@@ -480,7 +492,7 @@ fn take_varint(bytes: &[u8], position: &mut usize) -> Result<u64, String> {
 /// and its rows as ascending deltas. `None` when a value is not a plain
 /// integer the index can hold, which leaves the column unindexed.
 pub(crate) fn encode_row_postings(rows: &[StoredRow], index: usize) -> Option<Vec<u8>> {
-    let postings = Postings::from_pairs(row_pairs(rows, index)?);
+    let postings = Postings::from_pairs(row_pairs(rows, index)?, rows.len());
     let mut out = Vec::with_capacity(postings.rows.len() * 3 + 16);
     out.push(POSTINGS_LAYOUT);
     put_varint(&mut out, postings.rows.len() as u64);
@@ -570,7 +582,11 @@ fn decode_postings(bytes: &[u8], row_count: usize) -> Result<Postings, String> {
     if position != bytes.len() {
         return Err("trailing bytes after postings".to_owned());
     }
-    Ok(Postings { values, rows })
+    Ok(Postings {
+        values,
+        rows,
+        row_count,
+    })
 }
 
 fn record_build(
@@ -669,7 +685,7 @@ fn build(
         }
         _ => return Ok(None),
     }
-    Ok(Some(Postings::from_pairs(pairs)))
+    Ok(Some(Postings::from_pairs(pairs, row_count)))
 }
 
 /// Maps ranges over the concatenated candidate rows back to segment rows.
@@ -711,7 +727,7 @@ mod tests {
         let pairs = (0..1_000_u32)
             .map(|row| (i64::from(row % 97), row))
             .collect::<Vec<_>>();
-        let postings = Postings::from_pairs(pairs);
+        let postings = Postings::from_pairs(pairs, 1_000);
         let ranges = postings
             .candidate_ranges(&IndexProbe::Values(vec![5, 6]), 0, 1_000)
             .expect("selective");
@@ -815,7 +831,7 @@ mod tests {
     fn postings_sections_round_trip_and_refuse_damage() {
         let rows = owner_rows(2_000);
         let section = encode_row_postings(&rows, 1).expect("integer column");
-        let built = Postings::from_pairs(row_pairs(&rows, 1).expect("pairs"));
+        let built = Postings::from_pairs(row_pairs(&rows, 1).expect("pairs"), rows.len());
         let decoded = decode_postings(&section, rows.len()).expect("decode");
         assert_eq!(decoded.values, built.values);
         assert_eq!(decoded.rows, built.rows);
