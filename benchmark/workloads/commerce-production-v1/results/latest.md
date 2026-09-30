@@ -1,32 +1,32 @@
 # commerce-production-v1 — ci profile
 
-Run: 2026-09-25T18:17:50.881Z → 2026-09-25T18:18:41.843Z. Engines: mysql, pintail. Scale: 0.01.
+Run: 2026-09-30T13:14:17.765Z → 2026-09-30T13:15:13.297Z. Engines: mysql, pintail. Scale: 0.01.
 
 ## Phase: cold
 
 | Query | Engine | Status | Median ms | p95 ms |
 |---|---|---|---:|---:|
-| q01-tenant-revenue | mysql | ok | 50.3 | 305.0 |
-| q01-tenant-revenue | pintail | ok | 2.5 | 49.0 |
-| q02-customer-history | mysql | ok | 0.8 | 7.3 |
-| q02-customer-history | pintail | ok | 109.6 | 117.5 |
-| q03-fulfillment-backlog | mysql | ok | 0.8 | 2.3 |
-| q03-fulfillment-backlog | pintail | ok | 2.0 | 11.2 |
-| q04-inventory-risk | mysql | ok | 0.7 | 2.4 |
-| q04-inventory-risk | pintail | ok | 65.2 | 66.5 |
-| q05-payment-failures | mysql | ok | 89.5 | 128.5 |
-| q05-payment-failures | pintail | ok | 2.3 | 152.6 |
-| q06-refund-rate | mysql | ok | 972.4 | 976.7 |
-| q06-refund-rate | pintail | ok | 207.9 | 210.0 |
-| q07-product-performance | mysql | ok | 910.3 | 918.6 |
-| q07-product-performance | pintail | ok | 220.7 | 221.0 |
-| q08-regional-cohorts | mysql | ok | 411.5 | 473.1 |
-| q08-regional-cohorts | pintail | ok | 281.7 | 284.6 |
-| q09-order-lifecycle | mysql | ok | 258.3 | 259.3 |
-| q09-order-lifecycle | pintail | ok | 304.5 | 308.5 |
-| q10-wide-operational-join | mysql | ok | 456.7 | 600.9 |
-| q10-wide-operational-join | pintail | ok | 241.7 | 262.2 |
-| q11-dormant-customers | mysql | ok | 5.6 | 23.1 |
-| q11-dormant-customers | pintail | ok | 7.8 | 8.2 |
-| q12-per-customer-revenue | mysql | ok | 5.5 | 9.8 |
-| q12-per-customer-revenue | pintail | ok | 2.5 | 9.8 |
+| q01-tenant-revenue | mysql | ok | 29.0 | 92.5 |
+| q01-tenant-revenue | pintail | ok | 2.9 | 28.2 |
+| q02-customer-history | mysql | ok | 0.3 | 1.1 |
+| q02-customer-history | pintail | ok | 3.6 | 7.6 |
+| q03-fulfillment-backlog | mysql | ok | 0.4 | 1.1 |
+| q03-fulfillment-backlog | pintail | ok | 2.1 | 6.9 |
+| q04-inventory-risk | mysql | ok | 0.9 | 0.9 |
+| q04-inventory-risk | pintail | ok | 2.2 | 2.2 |
+| q05-payment-failures | mysql | ok | 52.4 | 65.7 |
+| q05-payment-failures | pintail | ok | 3.0 | 155.9 |
+| q06-refund-rate | mysql | ok | 497.1 | 510.2 |
+| q06-refund-rate | pintail | ok | 194.3 | 196.5 |
+| q07-product-performance | mysql | ok | 469.4 | 471.9 |
+| q07-product-performance | pintail | ok | 193.0 | 193.0 |
+| q08-regional-cohorts | mysql | ok | 218.6 | 226.2 |
+| q08-regional-cohorts | pintail | ok | 349.3 | 351.7 |
+| q09-order-lifecycle | mysql | ok | 159.6 | 161.0 |
+| q09-order-lifecycle | pintail | ok | 367.4 | 367.6 |
+| q10-wide-operational-join | mysql | ok | 160.2 | 193.2 |
+| q10-wide-operational-join | pintail | ok | 151.1 | 156.1 |
+| q11-dormant-customers | mysql | ok | 6.0 | 10.2 |
+| q11-dormant-customers | pintail | ok | 9.7 | 13.5 |
+| q12-per-customer-revenue | mysql | ok | 5.5 | 7.9 |
+| q12-per-customer-revenue | pintail | ok | 4.1 | 9.5 |
