@@ -2460,6 +2460,12 @@ fn contains_table(plan: &LogicalPlan, table: &TableKey) -> bool {
 /// Inputs that nothing links to remain a Cartesian product with the rest,
 /// which is the honest outcome: the query really did ask for one.
 fn infer_joins_from_filter(input: LogicalPlan, predicate: BoundExpr) -> LogicalPlan {
+    infer_joins(input, predicate, false)
+}
+
+/// [`infer_joins_from_filter`], with `filtered` choosing whether a scan's
+/// cost hint counts the predicates it carries (see [`filtered_scan_rows`]).
+fn infer_joins(input: LogicalPlan, predicate: BoundExpr, filtered: bool) -> LogicalPlan {
     let LogicalPlan::CrossJoin { inputs } = input else {
         return LogicalPlan::Filter {
             input: Box::new(input),
@@ -2472,7 +2478,7 @@ fn infer_joins_from_filter(input: LogicalPlan, predicate: BoundExpr) -> LogicalP
     // tree from the first input. Growing from the first input abandons the whole
     // rewrite the moment that input links to nothing - a one-row `config` table
     // crossed with a linked fact and dimension left the entire product intact.
-    while let Some((left, right)) = find_linked_pair(&components, &conjuncts) {
+    while let Some((left, right)) = find_linked_pair(&components, &conjuncts, filtered) {
         // Removed high-index-first so the low index stays valid.
         let candidate = components.remove(right);
         let tree = components.remove(left);
@@ -2495,7 +2501,23 @@ fn infer_joins_from_filter(input: LogicalPlan, predicate: BoundExpr) -> LogicalP
         // larger - joining a five-row dimension to a twenty-million-row fact
         // built the fact and could spill it. An unknown estimate is treated as
         // large, so it is probed rather than built.
-        let (left, right) = if estimated_or_max(&candidate) <= estimated_or_max(&tree) {
+        //
+        // A reordered inner join run puts the side holding a relation pinned
+        // by its key on the left instead: it is the small one, and a small
+        // probe side is read first and filters the build side by its keys,
+        // which the build side's scan applies before decoding the rest of
+        // each row. A small build side only bounds the probe scan's range.
+        let pinned_side = (filtered && has_pinned_key(&tree) != has_pinned_key(&candidate))
+            .then(|| has_pinned_key(&candidate));
+        let (left, right) = if let Some(candidate_pinned) = pinned_side {
+            if candidate_pinned {
+                (candidate, tree)
+            } else {
+                (tree, candidate)
+            }
+        } else if JoinCost::for_plan(&candidate, filtered).rows
+            <= JoinCost::for_plan(&tree, filtered).rows
+        {
             (tree, candidate)
         } else {
             (candidate, tree)
@@ -2533,7 +2555,7 @@ struct JoinCost {
 }
 
 impl JoinCost {
-    fn for_plan(plan: &LogicalPlan) -> Self {
+    fn for_plan(plan: &LogicalPlan, filtered: bool) -> Self {
         match plan {
             LogicalPlan::Scan(scan) => {
                 let key: BTreeSet<_> = scan
@@ -2543,8 +2565,13 @@ impl JoinCost {
                     .filter(|column| scan.table.key_column_ids.contains(&column.column_id))
                     .map(column_key)
                     .collect();
+                let rows = scan.estimated_rows().unwrap_or(u64::MAX);
                 Self {
-                    rows: scan.estimated_rows().unwrap_or(u64::MAX),
+                    rows: if filtered {
+                        filtered_scan_rows(scan, rows)
+                    } else {
+                        rows
+                    },
                     keys: if key.is_empty() {
                         Vec::new()
                     } else {
@@ -2553,7 +2580,7 @@ impl JoinCost {
                 }
             }
             LogicalPlan::Filter { input, .. } | LogicalPlan::Sort { input, .. } => {
-                Self::for_plan(input)
+                Self::for_plan(input, filtered)
             }
             LogicalPlan::Join {
                 left,
@@ -2561,8 +2588,8 @@ impl JoinCost {
                 kind: BoundJoinKind::Inner,
                 condition: Some(condition),
             } => Self::joined(
-                &Self::for_plan(left),
-                &Self::for_plan(right),
+                &Self::for_plan(left, filtered),
+                &Self::for_plan(right, filtered),
                 &conjuncts_of(condition),
             ),
             _ => Self {
@@ -2600,16 +2627,159 @@ impl JoinCost {
     }
 }
 
-fn estimated_or_max(plan: &LogicalPlan) -> u64 {
-    JoinCost::for_plan(plan).rows
+/// A scan's rows as a join-order hint once its own predicates apply: a
+/// whole single-column primary key equal to a constant, or in a list of
+/// them, names at most that many rows; every other equality or list over a
+/// constant is taken to keep a tenth. Deterministic and cheap, and used only
+/// to order joins, never to bound anything.
+fn filtered_scan_rows(scan: &Scan, rows: u64) -> u64 {
+    if let Some(pinned) = pinned_key_rows(scan) {
+        return rows.min(pinned);
+    }
+    let selective = scan
+        .predicates
+        .iter()
+        .filter(|predicate| constant_membership(predicate).is_some())
+        .count();
+    (0..selective).fold(rows, |rows, _| (rows / 10).max(1))
+}
+
+/// Constants a scan's predicates pin its whole single-column primary key
+/// to, when one of them does.
+fn pinned_key_rows(scan: &Scan) -> Option<u64> {
+    let [key] = scan.table.key_column_ids.as_slice() else {
+        return None;
+    };
+    scan.predicates
+        .iter()
+        .filter_map(|predicate| {
+            let (column, listed) = constant_membership(predicate)?;
+            (column.column_id == *key
+                && column.table_id == scan.table.table_id
+                && column.database_id == scan.table.database_id)
+                .then_some(listed)
+        })
+        .min()
+}
+
+/// `column = constant` or `column IN (constants)`: the column and how many
+/// constants it is compared with.
+fn constant_membership(predicate: &BoundExpr) -> Option<(&BoundColumn, u64)> {
+    fn column(expr: &BoundExpr) -> Option<&BoundColumn> {
+        match &expr.kind {
+            BoundExprKind::Column(column) if !column.outer => Some(column),
+            _ => None,
+        }
+    }
+    let constant = |expr: &BoundExpr| matches!(expr.kind, BoundExprKind::Literal(_));
+    match &predicate.kind {
+        BoundExprKind::Binary {
+            op: BinaryOp::Equal,
+            left,
+            right,
+        } => match (column(left), column(right)) {
+            (Some(column), None) if constant(right) => Some((column, 1)),
+            (None, Some(column)) if constant(left) => Some((column, 1)),
+            _ => None,
+        },
+        BoundExprKind::Scalar {
+            function: pintail_sql::ScalarFunction::InList { negated: false },
+            args,
+        } if args.len() > 1 && args[1..].iter().all(constant) => {
+            Some((column(&args[0])?, u64::try_from(args.len() - 1).ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a scan in `plan`, beneath filters, projections and inner joins,
+/// is pinned by its whole primary key (see [`pinned_key_rows`]).
+fn has_pinned_key(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => pinned_key_rows(scan).is_some(),
+        LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+            has_pinned_key(input)
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            kind: BoundJoinKind::Inner,
+            ..
+        } => has_pinned_key(left) || has_pinned_key(right),
+        _ => false,
+    }
+}
+
+/// Reorders a run of inner joins written as `a JOIN b ON .. JOIN c ON ..`
+/// when a later relation is pinned by its whole primary key and the first
+/// is not. Written order joins every relation to the first before the
+/// pinned one is reached, so a filter keeping one row of a small table ran
+/// after the large one had been joined whole. The run is taken apart into
+/// its relations and ON conjuncts and joined again as a filtered product
+/// is, with each scan's cost hint counting its own predicates, so the
+/// pinned relation and what it links to are joined first. A run the rebuild
+/// cannot link completely is left as written.
+fn reorder_inner_join_run(plan: LogicalPlan) -> LogicalPlan {
+    fn flatten(
+        plan: &LogicalPlan,
+        relations: &mut Vec<LogicalPlan>,
+        conjuncts: &mut Vec<BoundExpr>,
+    ) {
+        if let LogicalPlan::Join {
+            left,
+            right,
+            kind: BoundJoinKind::Inner,
+            condition: Some(condition),
+        } = plan
+            && !expression_contains_subquery(condition)
+        {
+            flatten(left, relations, conjuncts);
+            flatten(right, relations, conjuncts);
+            conjuncts.extend(split_conjunction(condition.clone()));
+            return;
+        }
+        relations.push(plan.clone());
+    }
+    let mut relations = Vec::new();
+    let mut conjuncts = Vec::new();
+    flatten(&plan, &mut relations, &mut conjuncts);
+    if relations.len() < 3
+        || has_pinned_key(&relations[0])
+        || !relations[1..].iter().any(has_pinned_key)
+        || conjuncts.iter().any(is_volatile)
+    {
+        return plan;
+    }
+    let Some(predicate) = conjuncts.into_iter().reduce(and_expr) else {
+        return plan;
+    };
+    let rebuilt = infer_joins(
+        LogicalPlan::CrossJoin { inputs: relations },
+        predicate,
+        true,
+    );
+    let complete = match &rebuilt {
+        LogicalPlan::Filter { input, .. } => {
+            !matches!(input.as_ref(), LogicalPlan::CrossJoin { .. })
+        }
+        other => !matches!(other, LogicalPlan::CrossJoin { .. }),
+    };
+    if complete { rebuilt } else { plan }
 }
 
 /// Choose the connected pair with the smallest estimated intermediate work.
 /// Source order breaks ties. In a cyclic graph, the first linked pair can be
 /// two dimensions sharing a non-unique attribute, expanding millions of rows
 /// before either fact-table key is applied.
-fn find_linked_pair(components: &[LogicalPlan], conjuncts: &[BoundExpr]) -> Option<(usize, usize)> {
-    let estimates: Vec<_> = components.iter().map(JoinCost::for_plan).collect();
+fn find_linked_pair(
+    components: &[LogicalPlan],
+    conjuncts: &[BoundExpr],
+    filtered: bool,
+) -> Option<(usize, usize)> {
+    let estimates: Vec<_> = components
+        .iter()
+        .map(|component| JoinCost::for_plan(component, filtered))
+        .collect();
     let mut best = None;
     for left in 0..components.len() {
         for right in (left + 1)..components.len() {
@@ -2746,12 +2916,7 @@ fn reorder_cross_joins(plan: LogicalPlan) -> LogicalPlan {
             right,
             kind,
             condition,
-        } => LogicalPlan::Join {
-            left: Box::new(reorder_cross_joins(*left)),
-            right: Box::new(reorder_cross_joins(*right)),
-            kind,
-            condition,
-        },
+        } => reorder_join(*left, *right, kind, condition),
         LogicalPlan::Filter { input, predicate } => {
             infer_joins_from_filter(reorder_cross_joins(*input), predicate)
         }
@@ -2794,6 +2959,27 @@ fn reorder_cross_joins(plan: LogicalPlan) -> LogicalPlan {
             limit,
         },
         LogicalPlan::Empty | LogicalPlan::OneRow | LogicalPlan::Scan(_) => plan,
+    }
+}
+
+/// A join with its inputs reordered, and an inner join run beginning at
+/// it reordered as [`reorder_inner_join_run`] decides.
+fn reorder_join(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    kind: BoundJoinKind,
+    condition: Option<BoundExpr>,
+) -> LogicalPlan {
+    let join = LogicalPlan::Join {
+        left: Box::new(reorder_cross_joins(left)),
+        right: Box::new(reorder_cross_joins(right)),
+        kind,
+        condition,
+    };
+    if kind == BoundJoinKind::Inner {
+        reorder_inner_join_run(join)
+    } else {
+        join
     }
 }
 

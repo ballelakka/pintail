@@ -65,6 +65,7 @@ mod out_of_range_diagnostics;
 mod packed_predicate_kernels;
 mod pairs_fixture;
 mod partition_rewrites;
+mod pinned_join_order;
 mod point_scan_memo;
 mod pre_aggregated_join;
 mod prefiltered_scan;
