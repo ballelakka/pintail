@@ -113,8 +113,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_memtable_bytes(StoreOptions::default().memtable_bytes)
+    }
+
+    fn with_memtable_bytes(memtable_bytes: usize) -> Self {
         let options = StoreOptions {
             background_compaction: false,
+            memtable_bytes,
             ..StoreOptions::default()
         };
         let owner_dir = tempfile::tempdir().expect("owner dir");
@@ -433,4 +438,66 @@ fn measure_side_index_lookups() {
     }
     let (entries, bytes, build_us) = pintail_store::side_index_totals();
     println!("side index: {entries} entries, {bytes} bytes, built in {build_us} us");
+}
+
+/// Rewrites every other flushed row and appends as many new ones again,
+/// all left unflushed: 300,000 rows in the memtable over the segment.
+fn fill_memtable(fixture: &mut Fixture) {
+    let mut changes = Vec::new();
+    for id in (2..=EVENTS).step_by(2) {
+        fixture.version += 1;
+        let mut event = fixture.model[&id].clone();
+        event.amount += 1;
+        changes.push(event_row(id, &event, fixture.version, false));
+        fixture.model.insert(id, event);
+    }
+    for id in EVENTS + 1..=EVENTS + 200_000 {
+        fixture.version += 1;
+        let event = initial(id);
+        changes.push(event_row(id, &event, fixture.version, false));
+        fixture.model.insert(id, event);
+    }
+    for batch in changes.chunks(5_000) {
+        fixture
+            .events
+            .ingest_cdc(batch.to_vec())
+            .expect("change batch");
+    }
+}
+
+#[test]
+fn a_side_index_lookup_answers_exactly_over_a_large_memtable() {
+    let mut fixture = Fixture::with_memtable_bytes(1 << 30);
+    fill_memtable(&mut fixture);
+    fixture.check("a large memtable");
+}
+
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_side_index_over_a_large_memtable() {
+    let mut fixture = Fixture::with_memtable_bytes(1 << 30);
+    fill_memtable(&mut fixture);
+    for sql in [
+        "SELECT id, amount FROM events WHERE account = 17 ORDER BY id",
+        "SELECT e.id FROM events e WHERE e.account IN (17, 508, 999) AND e.kind = 'open'",
+        "SELECT COUNT(*), SUM(e.amount) FROM owners o JOIN events e ON e.account = o.id \
+         WHERE o.id IN (17, 18, 508)",
+    ] {
+        for index in [false, true] {
+            fixture.run(sql, index);
+            let mut samples = (0..9)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    fixture.run(sql, index);
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect::<Vec<_>>();
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{:>8.2} ms median {:>8.2} ms min  memtable index={index}  {sql}",
+                samples[samples.len() / 2],
+                samples[0]
+            );
+        }
+    }
 }

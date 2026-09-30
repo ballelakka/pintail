@@ -135,7 +135,10 @@ format 6), so a restart loads rather than rebuilds them.
 named columns from the first flush. Built and loaded postings share one
 least-recently-used cache bounded by `PINTAIL_SECONDARY_INDEX_CACHE_MB`
 (default 256); `PINTAIL_SECONDARY_INDEX=0` turns the index off. Rows still
-in the memtable are scanned as before.
+in the memtable hold no postings; the lookup tests each of them directly
+(a text value keyed once per distinct value) and leaves out the rows it
+rejects before they are materialized, while a rejected row still masks
+the segment row it supersedes.
 
 Text columns answer equality and IN filters against text literals under the
 collation the comparison itself compiles with (an explicit `COLLATE`, else

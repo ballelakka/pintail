@@ -1750,9 +1750,14 @@ impl ProjectedScanStream {
             .collect::<Vec<Vec<pintail_types::Value>>>();
         let mut row_count = 0usize;
         let mut last_key = None;
+        let mut admission = self.row_admission();
         for (key, row) in self.overlay_rows.range((lo, hi.clone())) {
             last_key = Some(key.clone());
-            if row.is_deleted() {
+            if row.is_deleted()
+                || admission
+                    .as_mut()
+                    .is_some_and(|admission| !admission.admits(row))
+            {
                 continue;
             }
             for (column, position) in columns.iter_mut().zip(&projection) {
@@ -2076,7 +2081,8 @@ impl ProjectedScanStream {
                 .decode_slice_plain(slice, memory_limit, prewhere)
                 .map(|chunk| vec![chunk]);
         };
-        let memtable = self.overlay_span_rows(slice, key_ids.len())?;
+        let mut memtable = self.overlay_span_rows(slice, key_ids.len())?;
+        self.mask_unwanted_live_rows(&mut memtable);
         if memtable.is_empty() {
             return self
                 .decode_slice_plain(slice, memory_limit, prewhere)
@@ -2414,6 +2420,34 @@ impl ProjectedScanStream {
     /// [`super::side_index`]). Callers set it only while the index is on.
     pub fn set_index_lookup(&mut self, lookup: super::side_index::IndexLookup) {
         self.index_lookup = Some(lookup);
+    }
+
+    /// The side-index lookup as a test of whole rows (the memtable's, or a
+    /// layered cluster's resolved ones): the lookup and its column's schema
+    /// position. A row it rejects is one the scan does not want, so it is
+    /// left out rather than materialized for the filter to drop.
+    /// Turns the overlay's live rows the side-index lookup rejects into
+    /// masks: such a row still supersedes its segment row, it is only not
+    /// interleaved.
+    fn mask_unwanted_live_rows<'a>(&'a self, rows: &mut [(Vec<i128>, Option<&'a StoredRow>)]) {
+        if let Some(mut admission) = self.row_admission() {
+            for (_, row) in rows {
+                if row.is_some_and(|row| !admission.admits(row)) {
+                    *row = None;
+                }
+            }
+        }
+    }
+
+    fn row_admission(&self) -> Option<super::side_index::RowAdmission<'_>> {
+        let lookup = self.index_lookup.as_ref()?;
+        let position = self
+            .snapshot
+            .schema
+            .columns()
+            .iter()
+            .position(|column| column.id() == lookup.column_id)?;
+        Some(super::side_index::RowAdmission::new(lookup, position))
     }
 
     /// The side-index request set so far, if any.

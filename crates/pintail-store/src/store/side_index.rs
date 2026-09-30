@@ -19,9 +19,11 @@
 //! section holds the exact values, which no collation's rules change; the
 //! hashed postings derive from it once per collation a scan asks for.
 //!
-//! Segment rows only: rows still in the memtable are read as before, and an
-//! overlay part masks superseded segment rows among the candidates exactly
-//! as it masks them among all rows.
+//! Postings cover segment rows only. Rows still in the memtable (or resolved
+//! from a layered cluster) are tested against the lookup one by one, and a
+//! row it rejects is left out before it is materialized; an overlay part
+//! still masks the segment row a rejected memtable row supersedes, and masks
+//! superseded segment rows among the candidates exactly as among all rows.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -150,6 +152,71 @@ pub struct IndexLookup {
     pub column_id: u32,
     pub key: IndexKey,
     pub probe: IndexProbe,
+}
+
+impl IndexLookup {
+    /// Whether a row holding `value` in the lookup's column can be one the
+    /// scan wants. The probe names every value a wanted row can hold, so a
+    /// row it rejects - NULL included, which no probe names - is one the
+    /// scan's predicates or join would drop. A value of a kind the lookup
+    /// does not describe is kept, left for the predicates to judge.
+    #[must_use]
+    pub fn admits(&self, value: &Value) -> bool {
+        let probed = match (&self.key, value) {
+            (_, Value::Null) => return false,
+            (IndexKey::Integer, Value::Int64(value)) => i128::from(*value),
+            (IndexKey::Integer, Value::UInt64(value)) => i128::from(*value),
+            (IndexKey::Text(keyer), Value::Utf8(text)) => i128::from(keyer.value(text)),
+            _ => return true,
+        };
+        match &self.probe {
+            IndexProbe::Values(values) => values.binary_search(&probed).is_ok(),
+            IndexProbe::Span(lower, upper) => (*lower..=*upper).contains(&probed),
+        }
+    }
+}
+
+/// Distinct texts a [`RowAdmission`] remembers its verdict for; past this
+/// it keys each further text as it meets it.
+const ADMISSION_MEMO: usize = 4_096;
+
+/// Judges whole rows (the memtable's, or a layered cluster's) against a
+/// lookup. A text value's collation key is the costly part, and a text
+/// column in the memtable repeats a few values over many rows, so each
+/// distinct text is keyed once.
+pub(crate) struct RowAdmission<'a> {
+    lookup: &'a IndexLookup,
+    position: usize,
+    texts: HashMap<&'a str, bool>,
+}
+
+impl<'a> RowAdmission<'a> {
+    /// Judges the column at schema `position` of each row by `lookup`.
+    pub(crate) fn new(lookup: &'a IndexLookup, position: usize) -> Self {
+        Self {
+            lookup,
+            position,
+            texts: HashMap::new(),
+        }
+    }
+
+    /// Whether the scan can want `row` (see [`IndexLookup::admits`]).
+    pub(crate) fn admits(&mut self, row: &'a StoredRow) -> bool {
+        let Some(value) = row.values().get(self.position) else {
+            return true;
+        };
+        if let (IndexKey::Text(_), Value::Utf8(text)) = (&self.lookup.key, value) {
+            if let Some(known) = self.texts.get(text.as_str()) {
+                return *known;
+            }
+            let admitted = self.lookup.admits(value);
+            if self.texts.len() < ADMISSION_MEMO {
+                self.texts.insert(text.as_str(), admitted);
+            }
+            return admitted;
+        }
+        self.lookup.admits(value)
+    }
 }
 
 /// One segment column's non-NULL values sorted with their rows.

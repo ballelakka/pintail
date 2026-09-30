@@ -294,10 +294,16 @@ fn a_probe_side_past_the_read_ahead_takes_the_whole_build() {
         vec![vec![Value::UInt64(all_matched), Value::Int64(all_sum)]]
     );
     // Every dimension is a small probe side, so the build is the facts
-    // that reference one: two thirds of them, which this ceiling cannot
-    // hold either. The contrast that matters is the group-3 build above,
+    // that reference one: two thirds of them. The facts are still in the
+    // memtable, and the side index's key set leaves out the third that
+    // references no dimension before any of it is materialized, so this
+    // build fits the ceiling; it spilled while those rows were built and
+    // then dropped. The contrast that matters is the group-3 build above,
     // which fits, against the unfiltered build below, which cannot.
-    assert!(metrics.files > 0);
+    assert_eq!(
+        metrics.files, 0,
+        "the key set must keep unmatched memtable facts out of the build"
+    );
     let (rows, metrics) = fixture.run(
         "SELECT COUNT(*), SUM(f.amount) FROM fact f2 JOIN fact f ON f.id = f2.id",
         TIGHT,

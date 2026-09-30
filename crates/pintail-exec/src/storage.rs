@@ -2035,7 +2035,10 @@ const INDEX_LOOKUP_VALUES: usize = 4_096;
 /// its values by their key under the collation the comparison itself uses,
 /// so every row that compares equal to a literal - whatever its case,
 /// accents or trailing spaces where the collation ignores them - is a
-/// candidate. Among several, the one naming the fewest values.
+/// candidate. Among several, an integer one before a text one (an
+/// identifier names fewer rows than a label as a rule, and costs no
+/// collation key per row still in the memtable), then the one naming the
+/// fewest values.
 fn predicate_index_lookup(
     scan: &Scan,
     snapshot: &TableSnapshot,
@@ -2127,9 +2130,14 @@ fn predicate_index_lookup(
     let mut chosen = conjuncts
         .into_iter()
         .filter_map(lookup)
-        .min_by_key(|lookup| match &lookup.probe {
-            pintail_store::IndexProbe::Values(values) => values.len(),
-            pintail_store::IndexProbe::Span(..) => usize::MAX,
+        .min_by_key(|lookup| {
+            (
+                matches!(lookup.key, pintail_store::IndexKey::Text(_)),
+                match &lookup.probe {
+                    pintail_store::IndexProbe::Values(values) => values.len(),
+                    pintail_store::IndexProbe::Span(..) => usize::MAX,
+                },
+            )
         })?;
     if let pintail_store::IndexProbe::Values(values) = &mut chosen.probe {
         values.sort_unstable();
