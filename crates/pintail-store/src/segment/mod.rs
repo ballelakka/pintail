@@ -4873,7 +4873,7 @@ pub(crate) struct FooterLayout {
     pub(crate) sparse: Vec<(u64, PrimaryKey)>,
     /// The header and column-descriptor digest, from format version 4.
     pub(crate) descriptor_digest: Option<u64>,
-    /// Side-index postings sections, from format version 5.
+    /// Side-index postings sections, from format version 6.
     pub(crate) postings: Vec<PostingsEntry>,
 }
 
@@ -4996,7 +4996,7 @@ fn parse_footer_body(
     })
 }
 
-/// Reads the side-index postings directory a version 5 footer ends with,
+/// Reads the side-index postings directory a version 6 footer ends with,
 /// holding every section inside the segment body.
 fn parse_postings_directory(
     path: &Path,
