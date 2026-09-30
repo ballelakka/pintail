@@ -56,8 +56,8 @@ const INDEX_KEY_SET_VALUES: usize = 4_096;
 
 /// Experimental: which join kinds read their probe side ahead whatever the
 /// estimates say. `PINTAIL_PROBE_PREFETCH_ALWAYS=left` forces left and anti
-/// joins, `=1` every kind that can use the read-ahead, `=0` none; unset, it
-/// forces left and anti joins while the side index is on.
+/// joins, `=1` every kind that can use the read-ahead, `=0` none; unset,
+/// none: the estimates decide.
 fn probe_prefetch_forced(kind: BoundJoinKind) -> bool {
     static FORCED: std::sync::OnceLock<Option<(bool, bool)>> = std::sync::OnceLock::new();
     let (outer, inner) = FORCED
@@ -69,7 +69,7 @@ fn probe_prefetch_forced(kind: BoundJoinKind) -> bool {
                 _ => None,
             },
         )
-        .unwrap_or_else(|| (pintail_store::side_index_enabled(), false));
+        .unwrap_or((false, false));
     match kind {
         BoundJoinKind::Left | BoundJoinKind::Anti => outer,
         BoundJoinKind::Inner | BoundJoinKind::Semi => inner,
@@ -5409,14 +5409,10 @@ fn build_operator_inner(
             build_estimate,
             residual,
         } => {
-            // With the side index on, a build side restricted
-            // to the probe's keys is read through the index, so the read-
-            // ahead is worth trying whatever the estimates say: it stays
-            // bounded, and a probe side past its caps streams as before.
-            // Forcing it on an inner join costs the probe scan its
-            // restriction to the build's key span, which a started scan
-            // can no longer take, so only outer joins are forced unless
-            // asked.
+            // The estimates decide the read-ahead; forcing it (see
+            // `probe_prefetch_forced`) is a measurement switch only. Forced
+            // on every left join it cost wide grouped reports more than the
+            // index lookups it enabled saved them.
             let probe_prefetch = probe_prefetch_applies(kind, probe_estimate, build_estimate)
                 || probe_prefetch_forced(kind);
             let (left, left_columns) = build_operator(*left, provider, memory, collation)?;
