@@ -1480,6 +1480,33 @@ impl AggregateState {
         }
     }
 
+    /// Exact decimal AVG on a partial total of `rows` values, each in units
+    /// `digits` places short of the result scale. Widening the total once
+    /// gives the same exact number as widening every value and adding them.
+    pub(super) fn add_decimal_average_partial(
+        &mut self,
+        units: i128,
+        digits: u8,
+        scale: u8,
+        rows: u64,
+    ) -> Result<(), ExecError> {
+        match &mut self.value {
+            AggregateValue::DecimalAverage {
+                units: total,
+                scale: existing,
+                count,
+            } if *existing == scale => {
+                let widened = ExactUnits::from_int(units, digits).ok_or(ExecError::NumericOverflow)?;
+                *total = total.plus(&widened)?;
+                *count = count.checked_add(rows).ok_or(ExecError::NumericOverflow)?;
+                Ok(())
+            }
+            _ => Err(ExecError::InvalidPhysicalPlan(
+                "decimal unit average applied to an incompatible aggregate state",
+            )),
+        }
+    }
+
     /// COUNT(DISTINCT) on a raw integer key: dedup in the i128 set and
     /// bump the count only for new keys — no Value cell is built.
     pub(super) fn update_distinct_count_int(

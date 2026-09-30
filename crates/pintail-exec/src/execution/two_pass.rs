@@ -1086,13 +1086,38 @@ fn two_pass_scatter_batch(
     let group_values = batch.column(group_column).ok_or(ExecError::InvalidBatch(
         "grouping column is outside the input batch",
     ))?;
+    let readers = lane_readers(batch, lanes);
+    // Packed integer keys read their bits straight from storage; the cell
+    // path below would materialize the whole key column to return them.
+    let packed_key = match group_values.typed() {
+        Some((crate::batch::TypedValues::Int64(values), validity)) => Some((
+            PackedInts::Signed(values.as_slice()),
+            validity,
+        )),
+        Some((crate::batch::TypedValues::UInt64(values), validity)) => Some((
+            PackedInts::Unsigned(values.as_slice()),
+            validity,
+        )),
+        _ => None,
+    };
+    if let Some((values, validity)) = packed_key {
+        for row in morsel.selected_rows() {
+            let (key_bits, key_null) = if validity.is_valid(row) {
+                (values.bits(row), false)
+            } else {
+                (0, true)
+            };
+            scatter_two_pass_row(&readers, row, key_bits, key_null, partitions, buckets);
+        }
+        return Ok(());
+    }
     for row in morsel.selected_rows() {
         let value = group_values.value(row).ok_or(ExecError::InvalidBatch(
             "grouping row is outside the input batch",
         ))?;
         let (key_bits, key_null) = two_pass_key_bits(value)
             .ok_or(ExecError::InvalidBatch("two-pass key is not scalar"))?;
-        scatter_two_pass_row(batch, row, key_bits, key_null, lanes, partitions, buckets);
+        scatter_two_pass_row(&readers, row, key_bits, key_null, partitions, buckets);
     }
     Ok(())
 }
@@ -1118,6 +1143,7 @@ fn two_pass_scatter_strings(
         ));
     };
     if let Some((codes, dict_values)) = strings.dictionary() {
+        let readers = lane_readers(batch, lanes);
         let translation = dict_values
             .iter()
             .map(|value| intern.intern(value.as_bytes(), memory))
@@ -1129,10 +1155,11 @@ fn two_pass_scatter_strings(
             } else {
                 translation[usize::try_from(codes[row]).expect("dict code fits usize")]
             };
-            scatter_two_pass_row(batch, row, key_bits, key_null, lanes, partitions, buckets);
+            scatter_two_pass_row(&readers, row, key_bits, key_null, partitions, buckets);
         }
     } else {
         let (views, heap) = (strings.views(), strings.heap());
+        let readers = lane_readers(batch, lanes);
         for row in batch.selection().selected_rows() {
             let key_null = !validity.is_valid(row);
             let key_bits = if key_null {
@@ -1140,7 +1167,7 @@ fn two_pass_scatter_strings(
             } else {
                 views[row].with_bytes(heap, |bytes| intern.intern(bytes, memory))?
             };
-            scatter_two_pass_row(batch, row, key_bits, key_null, lanes, partitions, buckets);
+            scatter_two_pass_row(&readers, row, key_bits, key_null, partitions, buckets);
         }
     }
     Ok(())
@@ -1271,6 +1298,7 @@ fn two_pass_scatter_text_prepared(
         readers.push((codes, validity, translation));
     }
     let pair = readers.len() == 2;
+    let values = lane_readers(batch, lanes);
     for row in morsel.selected_rows() {
         let mut key_bits = 0_u64;
         let mut key_null = false;
@@ -1289,7 +1317,7 @@ fn two_pass_scatter_text_prepared(
             };
             key_bits = if pair { (key_bits << 32) | id } else { id };
         }
-        scatter_two_pass_row(batch, row, key_bits, key_null, lanes, partitions, buckets);
+        scatter_two_pass_row(&values, row, key_bits, key_null, partitions, buckets);
     }
     Ok(())
 }
@@ -1309,6 +1337,7 @@ fn two_pass_scatter_string_pair(
 ) -> Result<(), ExecError> {
     let (first_reader, first_validity) = string_key_reader(batch, first, intern, memory)?;
     let (second_reader, second_validity) = string_key_reader(batch, second, intern, memory)?;
+    let readers = lane_readers(batch, lanes);
     for row in batch.selection().selected_rows() {
         let first_id = if first_validity.is_valid(row) {
             first_reader.read(row, intern, memory)? + 1
@@ -1321,7 +1350,7 @@ fn two_pass_scatter_string_pair(
             0
         };
         let key_bits = (first_id << 32) | second_id;
-        scatter_two_pass_row(batch, row, key_bits, false, lanes, partitions, buckets);
+        scatter_two_pass_row(&readers, row, key_bits, false, partitions, buckets);
     }
     Ok(())
 }
@@ -1336,6 +1365,7 @@ fn two_pass_scatter_date_parts(
     buckets: &mut [TwoPassBucket],
 ) -> Result<(), ExecError> {
     let batch = morsel.batch;
+    let readers = lane_readers(batch, lanes);
     for row in morsel.selected_rows() {
         let mut key_bits = 0_u64;
         for (part, column) in parts.iter().flatten() {
@@ -1362,7 +1392,7 @@ fn two_pass_scatter_date_parts(
             debug_assert!(id < 1 << 20, "date part value fits 20 bits");
             key_bits = (key_bits << 20) | id;
         }
-        scatter_two_pass_row(batch, row, key_bits, false, lanes, partitions, buckets);
+        scatter_two_pass_row(&readers, row, key_bits, false, partitions, buckets);
     }
     Ok(())
 }
@@ -1427,16 +1457,105 @@ fn two_pass_lane_bits(batch: &RecordBatch, row: usize, lane: &TwoPassLane) -> Op
     }
 }
 
+/// A packed integer key column, signed or unsigned.
+#[derive(Clone, Copy)]
+enum PackedInts<'a> {
+    Signed(&'a [i64]),
+    Unsigned(&'a [u64]),
+}
+
+impl PackedInts<'_> {
+    /// The bits `two_pass_key_bits` gives this row's `Int64`/`UInt64` cell.
+    #[inline]
+    fn bits(self, row: usize) -> u64 {
+        match self {
+            Self::Signed(values) => u64::from_ne_bytes(values[row].to_ne_bytes()),
+            Self::Unsigned(values) => values[row],
+        }
+    }
+}
+
+/// One lane's input column, resolved once per batch. The row loop then
+/// reads packed storage directly: resolving per row looked the column up
+/// and matched its representation for every row and lane, and the integer
+/// lanes read through `ColumnVector::value`, which materialized the whole
+/// column as `Value` cells to hand back one integer.
+enum LaneReader<'a> {
+    CountStar,
+    /// Scaled decimal units from a packed decimal column.
+    Units(&'a crate::batch::DecimalUnits, &'a crate::array::ValidityMask),
+    Int64(&'a [i64], &'a crate::array::ValidityMask),
+    UInt64(&'a [u64], &'a crate::array::ValidityMask),
+    /// Any other representation takes the per-row reader.
+    Row(&'a RecordBatch, &'a TwoPassLane),
+}
+
+impl LaneReader<'_> {
+    /// The same bits [`two_pass_lane_bits`] returns for this row.
+    #[inline]
+    fn bits(&self, row: usize) -> Option<u64> {
+        match self {
+            Self::CountStar => Some(0),
+            Self::Units(values, validity) => validity
+                .is_valid(row)
+                .then(|| values.get(row))
+                .flatten()
+                .and_then(|units| i64::try_from(units).ok())
+                .map(|units| u64::from_ne_bytes(units.to_ne_bytes())),
+            Self::Int64(values, validity) => validity
+                .is_valid(row)
+                .then(|| u64::from_ne_bytes(values[row].to_ne_bytes())),
+            Self::UInt64(values, validity) => validity.is_valid(row).then(|| values[row]),
+            Self::Row(batch, lane) => two_pass_lane_bits(batch, row, lane),
+        }
+    }
+}
+
+fn lane_readers<'a>(batch: &'a RecordBatch, lanes: &'a [TwoPassLane]) -> Vec<LaneReader<'a>> {
+    use crate::batch::TypedValues;
+    lanes
+        .iter()
+        .map(|lane| {
+            let typed = |column: usize| batch.column(column).and_then(crate::ColumnVector::typed);
+            match lane {
+                TwoPassLane::CountStar => LaneReader::CountStar,
+                TwoPassLane::DecimalUnits { column, .. }
+                | TwoPassLane::ExtremeDecimal { column, .. } => match typed(*column) {
+                    Some((TypedValues::Decimal128 { values, .. }, validity)) => {
+                        LaneReader::Units(values, validity)
+                    }
+                    _ => LaneReader::Row(batch, lane),
+                },
+                // A packed integer vector materializes exactly these values
+                // (`Int64`/`UInt64` cells, NULL where invalid); floats are
+                // normalized on the way into a cell, so they keep the row
+                // reader.
+                TwoPassLane::Int { column, .. }
+                | TwoPassLane::Exact { column, .. }
+                | TwoPassLane::Distinct { column, .. } => match typed(*column) {
+                    Some((TypedValues::Int64(values), validity)) => {
+                        LaneReader::Int64(values, validity)
+                    }
+                    Some((TypedValues::UInt64(values), validity)) => {
+                        LaneReader::UInt64(values, validity)
+                    }
+                    _ => LaneReader::Row(batch, lane),
+                },
+                TwoPassLane::Float { .. } => LaneReader::Row(batch, lane),
+            }
+        })
+        .collect()
+}
+
 fn scatter_two_pass_row(
-    batch: &RecordBatch,
+    readers: &[LaneReader<'_>],
     row: usize,
     key_bits: u64,
     key_null: bool,
-    lanes: &[TwoPassLane],
     partitions: usize,
     buckets: &mut [TwoPassBucket],
 ) {
-    let lane_count = lanes.len();
+    let lane_count = readers.len();
     {
         let mut mask = u8::from(key_null) << 7;
         let bucket = &mut buckets[usize::try_from(
@@ -1445,8 +1564,8 @@ fn scatter_two_pass_row(
         .expect("partition index fits usize")];
         let lane_base = bucket.lanes.len();
         bucket.lanes.resize(lane_base + lane_count, 0);
-        for (lane_index, lane) in lanes.iter().enumerate() {
-            match two_pass_lane_bits(batch, row, lane) {
+        for (lane_index, reader) in readers.iter().enumerate() {
+            match reader.bits(row) {
                 Some(bits) => bucket.lanes[lane_base + lane_index] = bits,
                 None => mask |= 1 << lane_index,
             }
@@ -1640,6 +1759,139 @@ fn two_pass_flush(
         *destination = bucket;
     }
     outcome
+}
+
+/// A lane whose rows reduce to one integer total and a row count, so a
+/// group's rows can be summed in a plain cell and applied to its
+/// [`AggregateState`] once. Applying every row to the state costs a call,
+/// an enum match and a carrier rebuild per row, on state that is often
+/// out of cache: that was most of a high-cardinality grouped SUM's time.
+#[derive(Clone, Copy)]
+enum PackedLane {
+    Count,
+    Sum {
+        scale: u8,
+        float_output: bool,
+    },
+    Average {
+        /// Places between the input scale and the result scale.
+        digits: u8,
+        result_scale: u8,
+    },
+    Minimum {
+        scale: u8,
+    },
+    Maximum {
+        scale: u8,
+    },
+}
+
+/// Largest rescale a packed average takes: an `i64` unit times `10^19`
+/// still fits `i128`, so no row the per-row path would widen successfully
+/// can fail here, and no row it would refuse can be taken.
+const PACKED_AVERAGE_MAX_DIGITS: u8 = 19;
+
+fn packed_lane(lane: &TwoPassLane, aggregate: &CompiledAggregate) -> Option<PackedLane> {
+    match *lane {
+        TwoPassLane::CountStar => Some(PackedLane::Count),
+        TwoPassLane::DecimalUnits {
+            scale,
+            float_output,
+            ..
+        } => match decimal_average_scale(aggregate) {
+            None => Some(PackedLane::Sum {
+                scale,
+                float_output,
+            }),
+            Some(result_scale) => result_scale
+                .checked_sub(scale)
+                .filter(|digits| *digits <= PACKED_AVERAGE_MAX_DIGITS)
+                .map(|digits| PackedLane::Average {
+                    digits,
+                    result_scale,
+                }),
+        },
+        TwoPassLane::ExtremeDecimal { scale, .. } => match aggregate.function {
+            AggregateFunction::Minimum => Some(PackedLane::Minimum { scale }),
+            AggregateFunction::Maximum => Some(PackedLane::Maximum { scale }),
+            _ => None,
+        },
+        TwoPassLane::Float { .. }
+        | TwoPassLane::Int { .. }
+        | TwoPassLane::Exact { .. }
+        | TwoPassLane::Distinct { .. } => None,
+    }
+}
+
+/// One group's running total for one packed lane.
+#[derive(Clone, Copy, Default)]
+struct PackedCell {
+    total: i128,
+    rows: u64,
+}
+
+impl PackedCell {
+    /// Folds one non-NULL row's lane bits in. Totals of `i64` units cannot
+    /// leave `i128` before `2^63` rows, which no window holds.
+    #[inline]
+    fn add(&mut self, lane: PackedLane, bits: u64) -> Result<(), ExecError> {
+        let units = i128::from(i64::from_ne_bytes(bits.to_ne_bytes()));
+        match lane {
+            PackedLane::Count => {}
+            PackedLane::Sum { .. } | PackedLane::Average { .. } => {
+                self.total = self
+                    .total
+                    .checked_add(units)
+                    .ok_or(ExecError::NumericOverflow)?;
+            }
+            PackedLane::Minimum { .. } => {
+                if self.rows == 0 || units < self.total {
+                    self.total = units;
+                }
+            }
+            PackedLane::Maximum { .. } => {
+                if self.rows == 0 || units > self.total {
+                    self.total = units;
+                }
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Applies the cell to the group's state: the same state the per-row
+    /// path leaves, since every packed lane is an exact, order-free fold.
+    fn commit(
+        &self,
+        lane: PackedLane,
+        state: &mut AggregateState,
+        aggregate: &CompiledAggregate,
+        memory: &MemoryTracker,
+    ) -> Result<(), ExecError> {
+        if self.rows == 0 {
+            return Ok(());
+        }
+        match lane {
+            PackedLane::Count => state.add_dense_count(self.rows),
+            PackedLane::Sum {
+                scale,
+                float_output,
+            } => state.update_decimal_sum_units(self.total, scale, float_output),
+            PackedLane::Average {
+                digits,
+                result_scale,
+            } => state.add_decimal_average_partial(self.total, digits, result_scale, self.rows),
+            PackedLane::Minimum { scale } | PackedLane::Maximum { scale } => {
+                let units = self.total;
+                state.update_extreme_units(
+                    aggregate,
+                    units,
+                    || Some(pintail_types::format_decimal_scaled(units, scale)),
+                    memory,
+                )
+            }
+        }
+    }
 }
 
 /// Applies one lane's scattered bits to one aggregate state. Shared by
@@ -2096,6 +2348,138 @@ fn two_pass_dense_batch(
     Ok(())
 }
 
+/// One chunk of a dense window when every lane is packed: rows sum into
+/// plain cells per slot, and the slots' states see each lane once at the
+/// end of the chunk. A batch whose key columns lost their dictionary codes
+/// takes the per-row fold instead.
+#[allow(clippy::too_many_arguments)]
+fn dense_packed_chunk(
+    chunk: &[(RecordBatch, Vec<Vec<u64>>)],
+    keys: TwoPassKeySource,
+    columns: &[usize],
+    lanes: &[TwoPassLane],
+    packed: &[PackedLane],
+    aggregates: &[CompiledAggregate],
+    acc: &mut DenseGroupSlots,
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
+    let lane_count = lanes.len();
+    let slot_count = acc.len();
+    let mut cells = vec![PackedCell::default(); slot_count * lane_count];
+    let mut present = vec![false; slot_count];
+    for (batch, translations) in chunk {
+        let Some(slots) = dense_row_slots(batch, keys, columns, translations)? else {
+            two_pass_dense_batch(
+                batch,
+                keys,
+                columns,
+                translations,
+                lanes,
+                aggregates,
+                acc,
+                memory,
+            )?;
+            continue;
+        };
+        let readers = lane_readers(batch, lanes);
+        for (row, slot) in batch.selection().selected_rows().zip(&slots) {
+            let slot = *slot as usize;
+            present[slot] = true;
+            let group_cells = &mut cells[slot * lane_count..(slot + 1) * lane_count];
+            for ((cell, reader), lane) in group_cells.iter_mut().zip(&readers).zip(packed) {
+                if let Some(bits) = reader.bits(row) {
+                    cell.add(*lane, bits)?;
+                }
+            }
+        }
+    }
+    for (slot, seen) in present.iter().enumerate() {
+        if !seen {
+            continue;
+        }
+        let states =
+            acc[slot].get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
+        for (lane_index, (lane, aggregate)) in packed.iter().zip(aggregates).enumerate() {
+            cells[slot * lane_count + lane_index].commit(
+                *lane,
+                &mut states[lane_index],
+                aggregate,
+                memory,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Each selected row's dense slot, in selection order, for an integer,
+/// text or text-pair key - the slots [`two_pass_dense_batch`] folds into.
+/// `None` when a text key column carries no dictionary codes.
+fn dense_row_slots(
+    batch: &RecordBatch,
+    keys: TwoPassKeySource,
+    columns: &[usize],
+    translations: &[Vec<u64>],
+) -> Result<Option<Vec<u32>>, ExecError> {
+    let mut slots = Vec::with_capacity(batch.visible_row_count());
+    if let TwoPassKeySource::Int { column, .. } = keys {
+        let (typed, validity) = batch
+            .column(column)
+            .and_then(crate::ColumnVector::typed)
+            .ok_or(ExecError::InvalidBatch(
+                "dense integer key lost its packed projection",
+            ))?;
+        for row in batch.selection().selected_rows() {
+            let slot = if validity.is_valid(row) {
+                usize::try_from(typed.int_key_at(row).expect("checked integer key"))
+                    .expect("checked dense domain")
+                    + 1
+            } else {
+                0
+            };
+            slots.push(u32::try_from(slot).expect("dense slot fits u32"));
+        }
+        return Ok(Some(slots));
+    }
+    let mut readers = Vec::with_capacity(columns.len());
+    for (column, translation) in columns.iter().zip(translations) {
+        let vector = batch.column(*column).ok_or(ExecError::InvalidBatch(
+            "grouping column is outside the input batch",
+        ))?;
+        let Some((crate::batch::TypedValues::Utf8(strings), validity)) = vector.typed() else {
+            return Err(ExecError::InvalidBatch(
+                "string two-pass key column lost its typed projection",
+            ));
+        };
+        let Some((codes, _)) = strings.dictionary() else {
+            return Ok(None);
+        };
+        readers.push((codes, validity, translation));
+    }
+    let pair = readers.len() == 2;
+    for row in batch.selection().selected_rows() {
+        let mut key_bits = 0_u64;
+        let mut key_null = false;
+        for (codes, validity, translation) in &readers {
+            let id = if validity.is_valid(row) {
+                let code = usize::try_from(codes[row]).expect("dict code fits usize");
+                let interned = *translation
+                    .get(code)
+                    .ok_or(ExecError::InvalidBatch("dictionary code is out of bounds"))?;
+                if pair { interned + 1 } else { interned }
+            } else {
+                if !pair {
+                    key_null = true;
+                }
+                0
+            };
+            key_bits = if pair { (key_bits << 32) | id } else { id };
+        }
+        let slot = dense_slot_index(keys, key_bits, key_null);
+        slots.push(u32::try_from(slot).expect("dense slot fits u32"));
+    }
+    Ok(Some(slots))
+}
+
 /// Folds one window into the dense slots of a text or text-pair key.
 ///
 /// One partial per rayon worker (fold), merged pairwise (reduce): batches of
@@ -2132,11 +2516,22 @@ fn dense_text_window(
     if memory.reserve(partial_bytes).is_err() {
         return Ok(false);
     }
+    let packed = lanes
+        .iter()
+        .zip(aggregates)
+        .map(|(lane, aggregate)| packed_lane(lane, aggregate))
+        .collect::<Option<Vec<_>>>();
     let outcome = (|| {
         let partials = window
             .par_chunks(chunk_size)
             .map(|chunk| {
                 let mut acc = vec![None; slot_count];
+                if let Some(packed) = &packed {
+                    dense_packed_chunk(
+                        chunk, keys, columns, lanes, packed, aggregates, &mut acc, memory,
+                    )?;
+                    return Ok(acc);
+                }
                 for (batch, translations) in chunk {
                     two_pass_dense_batch(
                         batch,
@@ -2371,6 +2766,108 @@ fn fold_dense_into_maps(
 /// worker): each partition folds its bucket from EVERY set, so parallel
 /// pass 1 needs no cross-worker merging (e13's shape, bounded windows).
 #[allow(clippy::too_many_lines)]
+/// Pass 2 for one partition when some lanes are packed: those lanes sum
+/// into a compact per-partition table of plain cells and reach each group's
+/// states once, at the end; the rest apply per row as before. Returns
+/// `false`, having touched nothing, when the table's worst case does not
+/// fit the query's budget, so the caller takes the per-row path.
+#[allow(clippy::too_many_arguments)]
+fn flush_partition_packed(
+    sets: &[Vec<TwoPassBucket>],
+    partition: usize,
+    map: &mut GroupKeyMap,
+    lanes: &[TwoPassLane],
+    packed: &[Option<PackedLane>],
+    aggregates: &[CompiledAggregate],
+    memory: &MemoryTracker,
+) -> Result<bool, ExecError> {
+    let lane_count = lanes.len();
+    let rows = sets
+        .iter()
+        .map(|set| set[partition].keys.len())
+        .sum::<usize>();
+    if rows == 0 {
+        return Ok(true);
+    }
+    // Worst case every row is its own group: an index entry plus a cell per
+    // lane. Charged for the table's lifetime, handed back before returning.
+    let bound = rows.saturating_mul(
+        size_of::<((u64, bool), u32)>()
+            .saturating_add(HASH_ENTRY_OVERHEAD)
+            .saturating_add(lane_count.saturating_mul(size_of::<PackedCell>())),
+    );
+    if memory.reserve(bound).is_err() {
+        return Ok(false);
+    }
+    let outcome = (|| {
+        let mut index: HashMap<
+            (u64, bool),
+            u32,
+            std::hash::BuildHasherDefault<super::aggregate::GroupKeyHasher>,
+        > = HashMap::default();
+        let mut cells: Vec<PackedCell> = Vec::new();
+        let unpacked = packed.iter().any(Option::is_none);
+        for set in sets {
+            let bucket = &set[partition];
+            for (row, (key, mask)) in bucket.keys.iter().zip(&bucket.masks).enumerate() {
+                let key_null = mask & (1 << 7) != 0;
+                let next = u32::try_from(index.len()).map_err(|_| ExecError::NumericOverflow)?;
+                let slot = *index.entry((*key, key_null)).or_insert_with(|| {
+                    cells.resize(cells.len() + lane_count, PackedCell::default());
+                    next
+                }) as usize;
+                let lane_bits = &bucket.lanes[row * lane_count..(row + 1) * lane_count];
+                let group_cells = &mut cells[slot * lane_count..(slot + 1) * lane_count];
+                for (lane_index, lane) in packed.iter().enumerate() {
+                    if let Some(lane) = lane
+                        && mask & (1 << lane_index) == 0
+                    {
+                        group_cells[lane_index].add(*lane, lane_bits[lane_index])?;
+                    }
+                }
+                if unpacked {
+                    let states = map
+                        .entry((*key, key_null))
+                        .or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
+                    for (lane_index, ((lane, aggregate), packed)) in
+                        lanes.iter().zip(aggregates).zip(packed).enumerate()
+                    {
+                        if packed.is_some() || mask & (1 << lane_index) != 0 {
+                            continue;
+                        }
+                        apply_two_pass_lane(
+                            &mut states[lane_index],
+                            lane,
+                            aggregate,
+                            lane_bits[lane_index],
+                            memory,
+                        )?;
+                    }
+                }
+            }
+        }
+        for (key, slot) in &index {
+            let states = map
+                .entry(*key)
+                .or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
+            let slot = *slot as usize;
+            for (lane_index, (lane, aggregate)) in packed.iter().zip(aggregates).enumerate() {
+                if let Some(lane) = lane {
+                    cells[slot * lane_count + lane_index].commit(
+                        *lane,
+                        &mut states[lane_index],
+                        aggregate,
+                        memory,
+                    )?;
+                }
+            }
+        }
+        Ok(true)
+    })();
+    memory.release(bound);
+    outcome
+}
+
 fn two_pass_flush_sets(
     sets: &mut [Vec<TwoPassBucket>],
     maps: &mut [GroupKeyMap],
@@ -2391,11 +2888,27 @@ fn two_pass_flush_sets(
     // spill had supposedly freed.
     let used_before = memory.used();
     let sets_ref: &[Vec<TwoPassBucket>] = sets;
+    let packed = lanes
+        .iter()
+        .zip(aggregates)
+        .map(|(lane, aggregate)| packed_lane(lane, aggregate))
+        .collect::<Vec<_>>();
+    let any_packed = packed.iter().any(Option::is_some);
     let added = maps
         .par_iter_mut()
         .enumerate()
         .map(|(partition, map)| -> Result<usize, ExecError> {
             let before = map.len();
+            if any_packed
+                && flush_partition_packed(
+                    sets_ref, partition, map, lanes, &packed, aggregates, memory,
+                )?
+            {
+                let new_groups = map.len().saturating_sub(before);
+                let bytes = new_groups.saturating_mul(per_group_bytes);
+                memory.reserve(bytes)?;
+                return Ok(bytes);
+            }
             for set in sets_ref {
                 let bucket = &set[partition];
                 for (row, (key, mask)) in bucket.keys.iter().zip(&bucket.masks).enumerate() {
