@@ -557,7 +557,7 @@ async function waitForState(database: string, wanted: string, timeoutMs: number)
 }
 
 async function phaseSeed() {
-  // a user's conformance seed, vendored: case variants, trailing spaces,
+  // A user's conformance seed, vendored: case variants, trailing spaces,
   // mixed collations per column, an ENUM declared out of alphabetical
   // order, NULL join keys, a dangling FK alias, and timestamp ties - the
   // classes real parity bugs lived in. Loaded into the corpus schema with
@@ -3687,8 +3687,8 @@ async function phaseControlPlane() {
     // The parameters an application's own DSN carries - node mysql2 spells
     // them multipleStatements and dateStrings - configure that driver, not
     // the connection, and mysql_async refuses a URL containing them. So an
-    // operator could not paste the string already in their .env: a user
-    // reported building their pools "with the query parameters dropped",
+    // operator could not paste the string already in their .env: one
+    // deployment reported building its pools "with the query parameters dropped",
     // which is that refusal seen from the outside.
     const host = await dockerHost()
     const mysqlPort = await publishedPort(mysqlName, 3306)

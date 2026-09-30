@@ -655,7 +655,7 @@ fn probe_round_typing() {
 
 #[test]
 fn json_distinct_is_case_sensitive() {
-    // a user's coll-10: MySQL types JSON_UNQUOTE output utf8mb4_bin, so
+    // A reported collation case: MySQL types JSON_UNQUOTE output utf8mb4_bin, so
     // DISTINCT keeps "PREMIUM" and "premium" apart exactly as GROUP BY
     // does. The dedup path must resolve the same collation the grouping
     // path already resolves.
@@ -675,7 +675,7 @@ fn json_count_distinct_is_case_sensitive() {
 
 #[test]
 fn json_distinct_survives_a_derived_table_boundary() {
-    // a user's coll-10, the real shape: the ->> collation must ride the
+    // A reported collation case, the real shape: the ->> collation must ride the
     // derived-table column, or DISTINCT above the boundary folds case
     // variants MySQL keeps apart.
     let rows = run(

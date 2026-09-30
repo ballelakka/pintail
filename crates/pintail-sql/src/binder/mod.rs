@@ -9553,7 +9553,7 @@ mod tests {
         ));
     }
 
-    /// a user: `GROUP BY fact.plan_id` while selecting
+    /// A reported shape: `GROUP BY fact.plan_id` while selecting
     /// `plan.plan_name` off a LEFT JOIN on that same key. The
     /// join equality carries the grouping key onto the dimension's primary
     /// key, and the primary key fixes the name.
@@ -9642,7 +9642,7 @@ mod tests {
         );
     }
 
-    /// a user PT-3, both directions. The negative case is the
+    /// A reported correlated-scalar shape, both directions. The negative case is the
     /// load-bearing one: accepting it would return an arbitrary value per
     /// group, which is worse than the refusal it replaces.
     #[test]
@@ -9675,7 +9675,7 @@ mod tests {
     #[test]
     fn a_grouped_correlated_scalar_is_refused_without_naming_an_internal() {
         // Decorrelation turns the subquery into a derived join called
-        // __scalar_N with a __scalar_value column. a user was told
+        // __scalar_N with a __scalar_value column. A user was told
         // "column __scalar_2.__scalar_value is neither grouped nor
         // aggregated" and could not act on it: neither name appears in the
         // SQL they submitted.

@@ -1,8 +1,8 @@
-//! The a user analytics shape, end to end: `GROUP BY` a foreign key
+//! A reporting dashboard's shape, end to end: `GROUP BY` a foreign key
 //! while selecting the left-joined dimension's name.
 //!
 //! `MySQL` accepts it because the join equality carries the grouping key onto
-//! `payment_type`'s primary key, and a primary key fixes the rest of the row.
+//! `plan`'s primary key, and a primary key fixes the rest of the row.
 //! Pintail refused it with `ER_WRONG_FIELD_WITH_GROUP`, which took the
 //! dashboard down for every query written this way.
 //!
@@ -21,19 +21,19 @@ use pintail_sql::{Binder, parse_statement};
 use pintail_store::{StoreOptions, TableStore};
 use pintail_types::{Column, DataType, KeyPart, PrimaryKey, StoredRow, TableSchema, Value};
 
-fn enrollment_schema() -> TableSchema {
+fn subscription_schema() -> TableSchema {
     TableSchema::new(
         1,
         vec![
             Column::new(1, "id", DataType::UInt64, false),
-            Column::new(2, "payment_type_id", DataType::Int64, true),
+            Column::new(2, "plan_id", DataType::Int64, true),
             Column::new(3, "status", DataType::Utf8, false),
         ],
     )
     .expect("schema")
 }
 
-fn payment_type_schema() -> TableSchema {
+fn plan_schema() -> TableSchema {
     TableSchema::new(
         1,
         vec![
@@ -45,10 +45,10 @@ fn payment_type_schema() -> TableSchema {
     .expect("schema")
 }
 
-/// `(id, payment_type_id, status)`. Payment type 10 holds three enrollments
+/// `(id, plan_id, status)`. Plan 10 holds three subscriptions
 /// of which two are running, 20 holds two of which one is, and one
-/// enrollment has no payment type at all - the group `MySQL` keys by NULL.
-const ENROLLMENTS: [(u64, Option<i64>, &str); 6] = [
+/// subscription has no plan at all - the group `MySQL` keys by NULL.
+const SUBSCRIPTIONS: [(u64, Option<i64>, &str); 6] = [
     (1, Some(10), "active"),
     (2, Some(10), "completed"),
     (3, Some(20), "active"),
@@ -58,32 +58,32 @@ const ENROLLMENTS: [(u64, Option<i64>, &str); 6] = [
 ];
 
 /// `(id, name, product_id)`. Scholarship is joined by nobody; product 7 is
-/// the one every enrollment above belongs to except Installment's, which
+/// the one every subscription above belongs to except Installment's, which
 /// exists to give the second ON conjunct something to reject.
-const PAYMENT_TYPES: [(i64, &str, i64); 3] = [
+const PLANS: [(i64, &str, i64); 3] = [
     (10, "Full", 7),
     (20, "Installment", 8),
     (30, "Scholarship", 7),
 ];
 
-fn enrollment_store() -> (tempfile::TempDir, TableStore) {
-    let directory = tempfile::tempdir().expect("enrollment directory");
+fn subscription_store() -> (tempfile::TempDir, TableStore) {
+    let directory = tempfile::tempdir().expect("subscription directory");
     let mut store = TableStore::open(
         directory.path(),
-        enrollment_schema(),
+        subscription_schema(),
         StoreOptions::default(),
     )
-    .expect("open enrollment");
+    .expect("open subscription");
     store
         .bulk_ingest_snapshot(
-            ENROLLMENTS
+            SUBSCRIPTIONS
                 .iter()
-                .map(|(id, payment_type, status)| {
+                .map(|(id, plan, status)| {
                     StoredRow::new(
                         PrimaryKey::new(vec![KeyPart::UInt64(*id)]).expect("key"),
                         vec![
                             Value::UInt64(*id),
-                            payment_type.map_or(Value::Null, Value::Int64),
+                            plan.map_or(Value::Null, Value::Int64),
                             Value::Utf8((*status).to_owned()),
                         ],
                         *id,
@@ -92,21 +92,17 @@ fn enrollment_store() -> (tempfile::TempDir, TableStore) {
                 })
                 .collect(),
         )
-        .expect("ingest enrollments");
+        .expect("ingest subscriptions");
     (directory, store)
 }
 
-fn payment_type_store() -> (tempfile::TempDir, TableStore) {
-    let directory = tempfile::tempdir().expect("payment type directory");
-    let mut store = TableStore::open(
-        directory.path(),
-        payment_type_schema(),
-        StoreOptions::default(),
-    )
-    .expect("open payment type");
+fn plan_store() -> (tempfile::TempDir, TableStore) {
+    let directory = tempfile::tempdir().expect("plan directory");
+    let mut store = TableStore::open(directory.path(), plan_schema(), StoreOptions::default())
+        .expect("open plan");
     store
         .bulk_ingest_snapshot(
-            PAYMENT_TYPES
+            PLANS
                 .iter()
                 .map(|(id, name, product)| {
                     StoredRow::new(
@@ -122,13 +118,13 @@ fn payment_type_store() -> (tempfile::TempDir, TableStore) {
                 })
                 .collect(),
         )
-        .expect("ingest payment types");
+        .expect("ingest plans");
     (directory, store)
 }
 
 const DATABASE_ID: DatabaseId = DatabaseId::new(1);
-const ENROLLMENT_ID: TableId = TableId::new(1);
-const PAYMENT_TYPE_ID: TableId = TableId::new(2);
+const SUBSCRIPTION_ID: TableId = TableId::new(1);
+const PLAN_ID: TableId = TableId::new(2);
 
 fn catalog() -> CatalogSnapshot {
     let database = DatabaseEntry::new(
@@ -136,23 +132,23 @@ fn catalog() -> CatalogSnapshot {
         "app",
         [
             TableEntry::new(
-                ENROLLMENT_ID,
-                "enrollment",
-                enrollment_schema(),
-                TableStatistics::with_row_count(ENROLLMENTS.len() as u64),
+                SUBSCRIPTION_ID,
+                "subscription",
+                subscription_schema(),
+                TableStatistics::with_row_count(SUBSCRIPTIONS.len() as u64),
             )
-            .expect("enrollment entry")
+            .expect("subscription entry")
             .with_key_columns([1])
-            .expect("enrollment key"),
+            .expect("subscription key"),
             TableEntry::new(
-                PAYMENT_TYPE_ID,
-                "payment_type",
-                payment_type_schema(),
-                TableStatistics::with_row_count(PAYMENT_TYPES.len() as u64),
+                PLAN_ID,
+                "plan",
+                plan_schema(),
+                TableStatistics::with_row_count(PLANS.len() as u64),
             )
-            .expect("payment type entry")
+            .expect("plan entry")
             .with_key_columns([1])
-            .expect("payment type key"),
+            .expect("plan key"),
         ],
     )
     .expect("database");
@@ -170,14 +166,14 @@ fn render(value: &Value) -> String {
 }
 
 fn run(sql: &str) -> Vec<Vec<String>> {
-    let (_enrollment_directory, enrollment) = enrollment_store();
-    let (_payment_type_directory, payment_type) = payment_type_store();
-    let enrollment_snapshot = enrollment.snapshot();
-    let payment_type_snapshot = payment_type.snapshot();
+    let (_subscription_directory, subscription) = subscription_store();
+    let (_plan_directory, plan) = plan_store();
+    let subscription_snapshot = subscription.snapshot();
+    let plan_snapshot = plan.snapshot();
     let catalog = catalog();
     let provider = SnapshotScanProvider::new([
-        (DATABASE_ID, ENROLLMENT_ID, &enrollment_snapshot),
-        (DATABASE_ID, PAYMENT_TYPE_ID, &payment_type_snapshot),
+        (DATABASE_ID, SUBSCRIPTION_ID, &subscription_snapshot),
+        (DATABASE_ID, PLAN_ID, &plan_snapshot),
     ])
     .expect("provider");
     let statement = parse_statement(sql).expect("parse");
@@ -212,16 +208,16 @@ fn run(sql: &str) -> Vec<Vec<String>> {
 }
 
 /// The reported query, reduced to two of its eight count lanes. Grouping is
-/// by `payment_type_id` alone, so the NULL payment type is one group and the
+/// by `plan_id` alone, so the NULL plan is one group and the
 /// counts belong to the whole group.
 #[test]
 fn a_left_joined_dimension_name_reads_off_the_grouped_foreign_key() {
     let rows = run("SELECT Plan.name AS name, \
          COUNT(DISTINCT CASE WHEN e.status IN ('active', 'completed') THEN e.id END) AS running, \
          COUNT(DISTINCT CASE WHEN e.status = 'active' THEN e.id END) AS active \
-         FROM enrollment e \
-         LEFT JOIN payment_type Plan ON Plan.id = e.payment_type_id \
-         GROUP BY e.payment_type_id ORDER BY name");
+         FROM subscription e \
+         LEFT JOIN plan Plan ON Plan.id = e.plan_id \
+         GROUP BY e.plan_id ORDER BY name");
     assert_eq!(
         rows,
         [
@@ -229,7 +225,7 @@ fn a_left_joined_dimension_name_reads_off_the_grouped_foreign_key() {
             ["Full", "3", "2"],
             ["Installment", "1", "1"],
         ],
-        "one row per payment type, counts over the whole group"
+        "one row per plan, counts over the whole group"
     );
 }
 
@@ -237,7 +233,7 @@ fn a_left_joined_dimension_name_reads_off_the_grouped_foreign_key() {
 /// that row - the shape the limitation entry used to name.
 #[test]
 fn the_primary_key_determines_the_rest_of_its_row() {
-    let rows = run("SELECT e.id, e.status, COUNT(*) FROM enrollment e \
+    let rows = run("SELECT e.id, e.status, COUNT(*) FROM subscription e \
          GROUP BY e.id ORDER BY e.id");
     assert_eq!(
         rows,
@@ -253,8 +249,8 @@ fn the_primary_key_determines_the_rest_of_its_row() {
 }
 
 /// A second ON conjunct the grouping key does not decide - the reported
-/// query's `School.productId = Plan.productId` - does not undo the
-/// first. Payment type 20 fails it, so its rows are NULL-complemented.
+/// query's `store.product_id = Plan.product_id` - does not undo the
+/// first. Plan 20 fails it, so its rows are NULL-complemented.
 ///
 /// The name is deliberately not asserted: within a group whose join matched
 /// for some rows and not others, `MySQL` returns an arbitrary one and so
@@ -262,19 +258,19 @@ fn the_primary_key_determines_the_rest_of_its_row() {
 /// group's whole count beside it, rather than a group split by the name.
 #[test]
 fn an_undecided_join_conjunct_does_not_split_the_group() {
-    let rows = run("SELECT COUNT(*), e.payment_type_id FROM enrollment e \
-         LEFT JOIN payment_type Plan \
-         ON Plan.id = e.payment_type_id AND Plan.product_id = 7 \
-         GROUP BY e.payment_type_id ORDER BY e.payment_type_id");
+    let rows = run("SELECT COUNT(*), e.plan_id FROM subscription e \
+         LEFT JOIN plan Plan \
+         ON Plan.id = e.plan_id AND Plan.product_id = 7 \
+         GROUP BY e.plan_id ORDER BY e.plan_id");
     assert_eq!(rows, [["1", "NULL"], ["3", "10"], ["2", "20"]]);
-    let named = run("SELECT Plan.name, COUNT(*) FROM enrollment e \
-         LEFT JOIN payment_type Plan \
-         ON Plan.id = e.payment_type_id AND Plan.product_id = 7 \
-         GROUP BY e.payment_type_id ORDER BY e.payment_type_id");
+    let named = run("SELECT Plan.name, COUNT(*) FROM subscription e \
+         LEFT JOIN plan Plan \
+         ON Plan.id = e.plan_id AND Plan.product_id = 7 \
+         GROUP BY e.plan_id ORDER BY e.plan_id");
     assert_eq!(
         named.len(),
         3,
-        "three payment-type groups, whatever name each reports: {named:?}"
+        "three plan groups, whatever name each reports: {named:?}"
     );
     let counts: Vec<&str> = named.iter().map(|row| row[1].as_str()).collect();
     assert_eq!(counts, ["1", "3", "2"]);
@@ -286,7 +282,7 @@ fn an_undecided_join_conjunct_does_not_split_the_group() {
 #[test]
 fn an_undetermined_column_is_still_refused() {
     let statement =
-        parse_statement("SELECT e.status, COUNT(*) FROM enrollment e GROUP BY e.payment_type_id")
+        parse_statement("SELECT e.status, COUNT(*) FROM subscription e GROUP BY e.plan_id")
             .expect("parse");
     assert!(
         Binder::new(&catalog(), Some("app"))

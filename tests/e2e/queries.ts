@@ -225,7 +225,7 @@ export const differentialQueries: DifferentialQuery[] = [
     tables: ['orders', 'customers'],
   },
   {
-    // a user PT-1, reduced to this fixture: an ON clause carrying BOTH an
+    // A reported join shape, reduced to this fixture: an ON clause carrying BOTH an
     // equality and a comparison between the two inputs. The equality is what
     // the hash join keys on; the comparison is a residual tested per
     // candidate pair. Pintail rejected the whole join for the residual.
@@ -239,7 +239,7 @@ export const differentialQueries: DifferentialQuery[] = [
     // The half that makes the residual load-bearing rather than cosmetic. An
     // order whose every item fails the residual must SURVIVE as a
     // NULL-extended row; moving the same predicate into WHERE drops it
-    // instead, which is why a user had no semantics-preserving workaround.
+    // instead, which is why the user had no semantics-preserving workaround.
     name: 'left join keeps rows whose only matches fail the residual',
     sql:
       'SELECT o.id, COUNT(i.order_id) AS kept ' +
@@ -405,7 +405,7 @@ export const differentialQueries: DifferentialQuery[] = [
     tables: ['customers', 'orders'],
   },
   {
-    // a user PT-2: an ORDER BY expression over an aggregate. Neither an
+    // A reported shape: an ORDER BY expression over an aggregate. Neither an
     // output name nor a source column, so it needs a hidden projection
     // evaluated after grouping. Their workarounds - ORDER BY alias and
     // ORDER BY ordinal - already worked, which is what proved the aggregate
@@ -1360,7 +1360,7 @@ export const differentialQueries: DifferentialQuery[] = [
     tables: ['orders'],
   },
   {
-    // a user's analytics endpoint, in this corpus's tables: group by the
+    // A dashboard's analytics endpoint, in this corpus's tables: group by the
     // foreign key, read the LEFT JOINed dimension's name. MySQL proves the
     // name single-valued through customers' primary key; Pintail refused the
     // whole family with ER_WRONG_FIELD_WITH_GROUP until it proved the same.
@@ -1543,7 +1543,7 @@ export const differentialQueries: DifferentialQuery[] = [
     tables: ['shipments', 'order_items'],
   },
   {
-    // a user's coll-10: JSON-extracted strings compare utf8mb4_bin, and
+    // A reported collation case: JSON-extracted strings compare utf8mb4_bin, and
     // that collation must survive a derived-table boundary - DISTINCT
     // above it keeps "Google" and "google" apart exactly as MySQL does.
     name: 'json: distinct case variants survive a derived table',

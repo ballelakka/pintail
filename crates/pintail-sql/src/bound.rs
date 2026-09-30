@@ -2233,7 +2233,7 @@ impl BoundQuery {
                 // utf8mb4_bin no matter what flowed in. Without this a
                 // derived table or CTE column built from ->> recorded the
                 // session default, and DISTINCT above the boundary folded
-                // case variants MySQL keeps apart (a user's coll-10).
+                // case variants MySQL keeps apart (a reported collation case).
                 match function {
                     ScalarFunction::Collate { collation }
                     | ScalarFunction::TextCharset(_, collation)

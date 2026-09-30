@@ -9,8 +9,8 @@ use mysql_async::Opts;
 /// `mysql2` spells them this way - so they say nothing about how Pintail
 /// should talk to the source. `mysql_async` does not recognise them and
 /// refuses the whole URL, which meant an operator could not paste the
-/// connection string their application already uses: a user reported
-/// building their pools "from parsed connection-string components with the
+/// connection string their application already uses: one deployment reported
+/// building its pools "from parsed connection-string components with the
 /// query parameters dropped", which is that refusal seen from outside.
 const CLIENT_ONLY_PARAMETERS: &[&str] = &[
     "multiplestatements",
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(named.max_allowed_packet(), Some(4_194_304));
     }
 
-    /// The connection string a user holds in their application.
+    /// A connection string as an application typically holds it.
     const REPORTED: &str =
         "mysql://root:root@127.0.0.1:3306/app_main?multipleStatements=true&dateStrings=date";
 
