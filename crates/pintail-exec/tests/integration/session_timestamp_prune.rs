@@ -150,8 +150,12 @@ fn a_filter_in_a_fixed_offset_session_answers_the_same_rows_and_prunes() {
         (utc_stats.blocks_pruned, utc_stats.blocks_read),
         "an offset session reads what a UTC one reads: {offset_stats:?} against {utc_stats:?}"
     );
+    // Every segment decodes its `seen` block to judge the range, once, and
+    // `id` decodes only where the range kept rows; reading the whole table
+    // decodes both in every segment.
     assert!(
-        offset_stats.blocks_pruned > offset_stats.blocks_read,
+        offset_stats.blocks_decoded < 2 * offset_stats.segments_read
+            && offset_stats.blocks_pruned > 0,
         "a one-day range skips most of the table: {offset_stats:?}"
     );
 }

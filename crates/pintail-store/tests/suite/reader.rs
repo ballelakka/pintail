@@ -154,7 +154,9 @@ fn unselective_filter_first_scans_report_the_probe_decode() {
         .expect("one segment");
 
     assert_eq!(chunk.row_count(), 100);
-    assert_eq!(chunk.stats().blocks_decoded(), 3);
+    // The probe's decode of `label` is reported, and it also serves the
+    // projection: `id` and `label` each decode one block, not `label` twice.
+    assert_eq!(chunk.stats().blocks_decoded(), 2);
 }
 
 #[test]

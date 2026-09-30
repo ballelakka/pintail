@@ -2347,9 +2347,6 @@ impl ProjectedScanStream {
             end,
             &scan_budget,
         )?;
-        let predicate_blocks_read = fetch.blocks_read;
-        let predicate_blocks_pruned = fetch.blocks_pruned;
-        let predicate_blocks_decoded = fetch.blocks_decoded;
         let ranges = select(&fetch.columns, row_count).map_err(StoreError::FormatLimit)?;
         if predicate_ids == self.column_ids {
             return retain_predicate_fetch(
@@ -2360,16 +2357,17 @@ impl ProjectedScanStream {
                 &scan_budget,
             );
         }
-        let predicate_reserved = fetch.reserved_bytes;
-        drop(fetch);
-        scan_budget.release(predicate_reserved);
         let Some(PrewhereRanges { ranges, exact }) = ranges else {
-            let mut chunk =
-                self.decode_column_chunk_rows(segment, start_row, end_row, memory_limit)?;
-            chunk.stats.blocks_read += predicate_blocks_read;
-            chunk.stats.blocks_pruned += predicate_blocks_pruned;
-            chunk.stats.blocks_decoded += predicate_blocks_decoded;
-            return Ok(chunk);
+            return self.project_after_predicates(
+                segment,
+                predicate_ids,
+                fetch,
+                None,
+                KeptRows::Span(start, end),
+                false,
+                usize::from(start_row == 0),
+                &scan_budget,
+            );
         };
         // The selector saw the range's rows from zero; the segment reader
         // wants their positions in the segment.
@@ -2377,42 +2375,176 @@ impl ProjectedScanStream {
             .iter()
             .map(|range| range.start + start..range.end + start)
             .collect::<Vec<_>>();
-        let fetch = segment::read_projected_column_ranges(
-            &self.snapshot.directory,
+        self.project_after_predicates(
             segment,
-            &self.snapshot.schema,
-            &map_projection(&self.column_ids)?,
-            &absolute,
+            predicate_ids,
+            fetch,
+            Some(&ranges),
+            KeptRows::Ranges(&absolute),
+            exact,
+            usize::from(start_row == 0),
             &scan_budget,
-        )?;
+        )
+    }
+
+    /// Finishes a filter-first read once the selector has judged the
+    /// predicate columns: the projection for the kept rows, with every
+    /// projected column the predicate fetch already holds compacted from it
+    /// rather than decoded a second time. Only the other columns are read,
+    /// at `rows`, the kept rows' positions in the segment.
+    ///
+    /// A join key handed to a scan as a runtime filter is both a predicate
+    /// and an output column, so without this every block of it was decoded
+    /// twice - on a scan the filter keeps whole, twice for nothing.
+    ///
+    /// `kept` is relative to the predicate fetch's rows (`None`: all of
+    /// them) and must name the same rows as `rows`.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn project_after_predicates(
+        &self,
+        segment: &segment::SegmentMeta,
+        predicate_ids: &[u32],
+        predicate: segment::ProjectedColumnFetch,
+        kept: Option<&[std::ops::Range<usize>]>,
+        rows: KeptRows<'_>,
+        prefiltered: bool,
+        segments_read: usize,
+        scan_budget: &segment::ScanMemoryBudget<'_>,
+    ) -> Result<ProjectedColumnChunk, StoreError> {
+        let predicate_rows = predicate.columns.first().map(DecodedColumn::len);
+        let row_count = match rows {
+            KeptRows::Span(start, end) => end.saturating_sub(start),
+            KeptRows::Ranges(ranges) => ranges.iter().map(std::iter::ExactSizeIterator::len).sum(),
+        };
+        let reuse = self
+            .column_ids
+            .iter()
+            .map(|id| predicate_ids.iter().position(|predicate| predicate == id))
+            .collect::<Vec<_>>();
+        if let Some(kept) = kept {
+            check_selected_ranges(kept, predicate_rows.unwrap_or(0))?;
+            let selected = kept
+                .iter()
+                .map(std::iter::ExactSizeIterator::len)
+                .sum::<usize>();
+            if selected != row_count {
+                return Err(StoreError::FormatLimit(
+                    "kept predicate rows disagree with the rows to read".into(),
+                ));
+            }
+        } else if predicate_rows.is_some_and(|rows| rows != row_count) {
+            return Err(StoreError::FormatLimit(
+                "predicate rows disagree with the rows to read".into(),
+            ));
+        }
+        // Keep only the predicate columns the projection reuses, compacted
+        // to the kept rows, and hold the budget for just those while the
+        // rest decode: the peak stays what reading them apart cost.
+        let mut predicate_columns = predicate
+            .columns
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut column)| {
+                reuse.contains(&Some(index)).then(|| {
+                    if let Some(kept) = kept {
+                        compact_decoded_column(&mut column, kept, row_count);
+                    }
+                    column
+                })
+            })
+            .collect::<Vec<_>>();
+        let held = predicate_columns
+            .iter()
+            .flatten()
+            .map(DecodedColumn::retained_bytes)
+            .sum::<usize>();
+        scan_budget.release(predicate.reserved_bytes);
+        scan_budget.reserve(held)?;
+        let rest = self
+            .column_ids
+            .iter()
+            .zip(&reuse)
+            .filter(|(_, reused)| reused.is_none())
+            .map(|(id, _)| {
+                self.snapshot
+                    .schema
+                    .columns()
+                    .iter()
+                    .position(|column| column.id() == *id)
+                    .ok_or_else(|| {
+                        StoreError::FormatLimit(format!("unknown projected column id {id}"))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rest = if rest.is_empty() {
+            None
+        } else {
+            Some(match rows {
+                KeptRows::Span(start, end) => segment::read_projected_columns(
+                    &self.snapshot.directory,
+                    segment,
+                    &self.snapshot.schema,
+                    &rest,
+                    start,
+                    end,
+                    scan_budget,
+                )?,
+                KeptRows::Ranges(ranges) => segment::read_projected_column_ranges(
+                    &self.snapshot.directory,
+                    segment,
+                    &self.snapshot.schema,
+                    &rest,
+                    ranges,
+                    scan_budget,
+                )?,
+            })
+        };
+        let mut stats = ScanStats {
+            segments_read,
+            blocks_read: predicate.blocks_read,
+            blocks_pruned: predicate.blocks_pruned,
+            blocks_decoded: predicate.blocks_decoded,
+            ..ScanStats::default()
+        };
+        let mut reserved = held;
+        let mut rest_columns = Vec::new().into_iter();
+        if let Some(fetch) = rest {
+            stats.blocks_read += fetch.blocks_read;
+            stats.blocks_pruned += fetch.blocks_pruned;
+            stats.blocks_decoded += fetch.blocks_decoded;
+            reserved = reserved.saturating_add(fetch.reserved_bytes);
+            rest_columns = fetch.columns.into_iter();
+        }
+        let mut columns = Vec::with_capacity(self.column_ids.len());
+        for (position, reused) in reuse.iter().enumerate() {
+            let column = match reused {
+                Some(index) => {
+                    // A column projected twice takes a copy the second time.
+                    let later = reuse[position + 1..].contains(&Some(*index));
+                    let slot = &mut predicate_columns[*index];
+                    if later { slot.clone() } else { slot.take() }
+                }
+                None => rest_columns.next(),
+            };
+            columns.push(column.ok_or_else(|| {
+                StoreError::FormatLimit("a projected column is missing from its fetch".into())
+            })?);
+        }
         let retained_bytes = size_of::<ProjectedColumnChunk>()
             .saturating_add(
-                fetch
-                    .columns
+                columns
                     .capacity()
                     .saturating_mul(size_of::<DecodedColumn>()),
             )
-            .saturating_add(
-                fetch
-                    .columns
-                    .iter()
-                    .map(DecodedColumn::retained_bytes)
-                    .sum(),
-            );
-        scan_budget.release(fetch.reserved_bytes);
+            .saturating_add(columns.iter().map(DecodedColumn::retained_bytes).sum());
+        scan_budget.release(reserved);
         scan_budget.reserve(retained_bytes)?;
         Ok(ProjectedColumnChunk {
-            prefiltered: exact,
-            columns: fetch.columns,
-            row_count: absolute.iter().map(std::iter::ExactSizeIterator::len).sum(),
-            stats: ScanStats {
-                segments_read: usize::from(start_row == 0),
-                blocks_read: predicate_blocks_read + fetch.blocks_read,
-                blocks_pruned: predicate_blocks_pruned + fetch.blocks_pruned,
-                blocks_decoded: predicate_blocks_decoded + fetch.blocks_decoded,
-                ..ScanStats::default()
-            },
+            columns,
+            row_count,
+            stats,
             retained_bytes,
+            prefiltered,
         })
     }
 
@@ -2567,71 +2699,44 @@ impl ProjectedScanStream {
             .sum::<usize>();
         // Even with no candidates the selector runs, over zero rows: an
         // overlay part places its memtable rows from what it sees there.
-        let (absolute, exact, mut stats) = {
-            let fetch = segment::read_projected_column_ranges(
-                &self.snapshot.directory,
-                segment,
-                &self.snapshot.schema,
-                &map_projection(predicate_ids)?,
-                &candidates,
-                &scan_budget,
-            )?;
-            let stats = ScanStats {
-                blocks_read: fetch.blocks_read,
-                blocks_pruned: fetch.blocks_pruned,
-                blocks_decoded: fetch.blocks_decoded,
-                ..ScanStats::default()
-            };
-            let selected =
-                select(&fetch.columns, candidate_rows).map_err(StoreError::FormatLimit)?;
-            scan_budget.release(fetch.reserved_bytes);
-            drop(fetch);
-            match selected {
-                Some(PrewhereRanges { ranges, exact }) => (
-                    super::side_index::absolute_ranges(&candidates, &ranges),
-                    exact,
-                    stats,
-                ),
-                // The selector judged nothing: the candidates pass only the
-                // lookup's own column test.
-                None => (candidates, false, stats),
-            }
-        };
         let fetch = segment::read_projected_column_ranges(
             &self.snapshot.directory,
             segment,
             &self.snapshot.schema,
-            &map_projection(&self.column_ids)?,
-            &absolute,
+            &map_projection(predicate_ids)?,
+            &candidates,
             &scan_budget,
         )?;
-        let retained_bytes = size_of::<ProjectedColumnChunk>()
-            .saturating_add(
-                fetch
-                    .columns
-                    .capacity()
-                    .saturating_mul(size_of::<DecodedColumn>()),
-            )
-            .saturating_add(
-                fetch
-                    .columns
-                    .iter()
-                    .map(DecodedColumn::retained_bytes)
-                    .sum(),
-            );
-        scan_budget.release(fetch.reserved_bytes);
-        scan_budget.reserve(retained_bytes)?;
-        stats.segments_read = usize::from(start_row == 0);
-        stats.blocks_read += fetch.blocks_read;
-        stats.blocks_pruned += fetch.blocks_pruned;
-        stats.blocks_decoded += fetch.blocks_decoded;
-        Ok(Some(ProjectedColumnChunk {
-            prefiltered: exact,
-            columns: fetch.columns,
-            row_count: absolute.iter().map(std::iter::ExactSizeIterator::len).sum(),
-            stats,
-            retained_bytes,
-        }))
+        let selected = select(&fetch.columns, candidate_rows).map_err(StoreError::FormatLimit)?;
+        let segments_read = usize::from(start_row == 0);
+        let chunk = match selected {
+            Some(PrewhereRanges { ranges, exact }) => {
+                let absolute = super::side_index::absolute_ranges(&candidates, &ranges);
+                self.project_after_predicates(
+                    segment,
+                    predicate_ids,
+                    fetch,
+                    Some(&ranges),
+                    KeptRows::Ranges(&absolute),
+                    exact,
+                    segments_read,
+                    &scan_budget,
+                )?
+            }
+            // The selector judged nothing: the candidates pass only the
+            // lookup's own column test.
+            None => self.project_after_predicates(
+                segment,
+                predicate_ids,
+                fetch,
+                None,
+                KeptRows::Ranges(&candidates),
+                false,
+                segments_read,
+                &scan_budget,
+            )?,
+        };
+        Ok(Some(chunk))
     }
 
     /// Routes one segment through the filter-first path when a predicate
@@ -2685,61 +2790,32 @@ impl ProjectedScanStream {
                 row_count,
                 &scan_budget,
             )?;
-            let predicate_blocks_read = fetch.blocks_read;
-            let predicate_blocks_pruned = fetch.blocks_pruned;
-            let predicate_blocks_decoded = fetch.blocks_decoded;
             let ranges = select(&fetch.columns, row_count).map_err(StoreError::FormatLimit)?;
             if predicate_ids == self.column_ids {
                 return retain_predicate_fetch(fetch, ranges.as_ref(), row_count, 1, &scan_budget);
             }
-            let predicate_reserved = fetch.reserved_bytes;
-            drop(fetch);
-            scan_budget.release(predicate_reserved);
-            if let Some(PrewhereRanges { ranges, exact }) = ranges {
-                let projection = map_projection(&self.column_ids)?;
-                let fetch = segment::read_projected_column_ranges(
-                    &self.snapshot.directory,
+            return match ranges {
+                Some(PrewhereRanges { ranges, exact }) => self.project_after_predicates(
                     &segment,
-                    &self.snapshot.schema,
-                    &projection,
-                    &ranges,
+                    predicate_ids,
+                    fetch,
+                    Some(&ranges),
+                    KeptRows::Ranges(&ranges),
+                    exact,
+                    1,
                     &scan_budget,
-                )?;
-                let retained_bytes = size_of::<ProjectedColumnChunk>()
-                    .saturating_add(
-                        fetch
-                            .columns
-                            .capacity()
-                            .saturating_mul(size_of::<DecodedColumn>()),
-                    )
-                    .saturating_add(
-                        fetch
-                            .columns
-                            .iter()
-                            .map(DecodedColumn::retained_bytes)
-                            .sum(),
-                    );
-                scan_budget.release(fetch.reserved_bytes);
-                scan_budget.reserve(retained_bytes)?;
-                return Ok(ProjectedColumnChunk {
-                    prefiltered: exact,
-                    columns: fetch.columns,
-                    row_count: ranges.iter().map(std::iter::ExactSizeIterator::len).sum(),
-                    stats: ScanStats {
-                        segments_read: 1,
-                        blocks_read: predicate_blocks_read + fetch.blocks_read,
-                        blocks_pruned: predicate_blocks_pruned + fetch.blocks_pruned,
-                        blocks_decoded: predicate_blocks_decoded + fetch.blocks_decoded,
-                        ..ScanStats::default()
-                    },
-                    retained_bytes,
-                });
-            }
-            let mut chunk = self.decode_column_chunk(segment, memory_limit)?;
-            chunk.stats.blocks_read += predicate_blocks_read;
-            chunk.stats.blocks_pruned += predicate_blocks_pruned;
-            chunk.stats.blocks_decoded += predicate_blocks_decoded;
-            return Ok(chunk);
+                ),
+                None => self.project_after_predicates(
+                    &segment,
+                    predicate_ids,
+                    fetch,
+                    None,
+                    KeptRows::Span(0, row_count),
+                    false,
+                    1,
+                    &scan_budget,
+                ),
+            };
         }
         self.decode_column_chunk(segment, memory_limit)
     }
@@ -3520,17 +3596,24 @@ fn rows_to_columns(
     Ok(columns)
 }
 
-/// The predicate projection already decoded every output column. Compact
-/// those buffers before the prefetch round retains them, preserving native
-/// values, text arenas and dictionary codes instead of decoding them again.
-#[allow(clippy::too_many_lines)]
-fn retain_predicate_fetch(
-    mut fetch: segment::ProjectedColumnFetch,
-    selection: Option<&PrewhereRanges>,
-    rows: usize,
-    segments_read: usize,
-    memory: &segment::ScanMemoryBudget<'_>,
-) -> Result<ProjectedColumnChunk, StoreError> {
+/// Where a filter-first read finds its kept rows in the segment.
+#[derive(Clone, Copy)]
+enum KeptRows<'ranges> {
+    /// Every row of `start..end`.
+    Span(usize, usize),
+    /// These ordered, disjoint row ranges.
+    Ranges(&'ranges [std::ops::Range<usize>]),
+}
+
+/// Keeps only the rows `ranges` names in one decoded column, in place:
+/// native values, text arenas and dictionary codes are moved down rather
+/// than decoded again. `ranges` must be ordered, disjoint and in bounds, and
+/// `selected` their total length.
+fn compact_decoded_column(
+    column: &mut DecodedColumn,
+    ranges: &[std::ops::Range<usize>],
+    selected: usize,
+) {
     fn compact<T: Copy>(values: &mut Vec<T>, ranges: &[std::ops::Range<usize>]) {
         let mut written = 0;
         for range in ranges {
@@ -3540,89 +3623,108 @@ fn retain_predicate_fetch(
         values.truncate(written);
         values.shrink_to_fit();
     }
+    let validity = match column {
+        DecodedColumn::Int64 { values, validity }
+        | DecodedColumn::NativeUnits {
+            values, validity, ..
+        } => {
+            compact(values, ranges);
+            validity
+        }
+        DecodedColumn::UInt64 { values, validity }
+        | DecodedColumn::Float64 {
+            bits: values,
+            validity,
+        } => {
+            compact(values, ranges);
+            validity
+        }
+        DecodedColumn::DictionaryUtf8 {
+            codes, validity, ..
+        } => {
+            compact(codes, ranges);
+            validity
+        }
+        DecodedColumn::Utf8 {
+            heap,
+            offsets,
+            validity,
+        } => {
+            let mut written_rows = 0;
+            let mut written_bytes = 0;
+            for range in ranges {
+                for row in range.clone() {
+                    let start = offsets[row];
+                    let end = offsets[row + 1];
+                    heap.copy_within(start..end, written_bytes);
+                    offsets[written_rows] = written_bytes;
+                    written_bytes += end - start;
+                    written_rows += 1;
+                }
+            }
+            offsets[written_rows] = written_bytes;
+            offsets.truncate(written_rows + 1);
+            heap.truncate(written_bytes);
+            offsets.shrink_to_fit();
+            heap.shrink_to_fit();
+            validity
+        }
+        DecodedColumn::Values(values) => {
+            let mut row = 0;
+            let mut range_index = 0;
+            values.retain(|_| {
+                while range_index < ranges.len() && row >= ranges[range_index].end {
+                    range_index += 1;
+                }
+                let keep = ranges
+                    .get(range_index)
+                    .is_some_and(|range| range.contains(&row));
+                row += 1;
+                keep
+            });
+            values.shrink_to_fit();
+            return;
+        }
+    };
+    match validity {
+        ColumnValidity::AllValid(count) => *count = selected,
+        ColumnValidity::Bytes(bits) => compact(bits, ranges),
+    }
+}
+
+/// Checks a selector's ranges before anything indexes by them: a selector
+/// is an API callback.
+fn check_selected_ranges(ranges: &[std::ops::Range<usize>], rows: usize) -> Result<(), StoreError> {
+    if ranges
+        .iter()
+        .any(|range| range.start > range.end || range.end > rows)
+        || ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+    {
+        return Err(StoreError::FormatLimit(
+            "invalid predicate row ranges".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The predicate projection already decoded every output column. Compact
+/// those buffers before the prefetch round retains them, preserving native
+/// values, text arenas and dictionary codes instead of decoding them again.
+fn retain_predicate_fetch(
+    mut fetch: segment::ProjectedColumnFetch,
+    selection: Option<&PrewhereRanges>,
+    rows: usize,
+    segments_read: usize,
+    memory: &segment::ScanMemoryBudget<'_>,
+) -> Result<ProjectedColumnChunk, StoreError> {
     let ranges = selection.map(|selection| selection.ranges.as_slice());
     let selected = ranges.map_or(rows, |ranges| {
         ranges.iter().map(std::iter::ExactSizeIterator::len).sum()
     });
     if let Some(ranges) = ranges {
-        // A selector is an API callback; validate before indexing or copying.
-        if ranges
-            .iter()
-            .any(|range| range.start > range.end || range.end > rows)
-            || ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
-        {
-            return Err(StoreError::FormatLimit(
-                "invalid predicate row ranges".to_owned(),
-            ));
-        }
+        check_selected_ranges(ranges, rows)?;
         for column in &mut fetch.columns {
-            let validity = match column {
-                DecodedColumn::Int64 { values, validity }
-                | DecodedColumn::NativeUnits {
-                    values, validity, ..
-                } => {
-                    compact(values, ranges);
-                    validity
-                }
-                DecodedColumn::UInt64 { values, validity }
-                | DecodedColumn::Float64 {
-                    bits: values,
-                    validity,
-                } => {
-                    compact(values, ranges);
-                    validity
-                }
-                DecodedColumn::DictionaryUtf8 {
-                    codes, validity, ..
-                } => {
-                    compact(codes, ranges);
-                    validity
-                }
-                DecodedColumn::Utf8 {
-                    heap,
-                    offsets,
-                    validity,
-                } => {
-                    let mut written_rows = 0;
-                    let mut written_bytes = 0;
-                    for range in ranges {
-                        for row in range.clone() {
-                            let start = offsets[row];
-                            let end = offsets[row + 1];
-                            heap.copy_within(start..end, written_bytes);
-                            offsets[written_rows] = written_bytes;
-                            written_bytes += end - start;
-                            written_rows += 1;
-                        }
-                    }
-                    offsets[written_rows] = written_bytes;
-                    offsets.truncate(written_rows + 1);
-                    heap.truncate(written_bytes);
-                    offsets.shrink_to_fit();
-                    heap.shrink_to_fit();
-                    validity
-                }
-                DecodedColumn::Values(values) => {
-                    let mut row = 0;
-                    let mut range_index = 0;
-                    values.retain(|_| {
-                        while range_index < ranges.len() && row >= ranges[range_index].end {
-                            range_index += 1;
-                        }
-                        let keep = ranges
-                            .get(range_index)
-                            .is_some_and(|range| range.contains(&row));
-                        row += 1;
-                        keep
-                    });
-                    values.shrink_to_fit();
-                    continue;
-                }
-            };
-            match validity {
-                ColumnValidity::AllValid(count) => *count = selected,
-                ColumnValidity::Bytes(bits) => compact(bits, ranges),
-            }
+            compact_decoded_column(column, ranges, selected);
         }
     }
     let retained_bytes = size_of::<ProjectedColumnChunk>()
