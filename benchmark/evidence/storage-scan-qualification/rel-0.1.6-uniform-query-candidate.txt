@@ -1,0 +1,4 @@
+numeric-filter: median_ms=23.391 min_ms=21.671 result=19956522
+text-filter: median_ms=19.842 min_ms=18.847 result=2500000
+text-all: median_ms=28.275 min_ms=27.299 result=20000000
+wide-expression: median_ms=12072.359 min_ms=12030.453 result=55200000460000000
