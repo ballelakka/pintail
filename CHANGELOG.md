@@ -4,6 +4,40 @@ All notable changes to Pintail are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.6] - 2026-09-30
+
+Everything in 0.1.6-rc1 through rc3, gated with the full stable chain: fmt,
+typecheck, unit, parser corpus, oracle, MTR, E2E on MySQL 8.4 and 8.0,
+migrations, browser, compose, BI clients, the 20M-row benchmark, TPC-H,
+acceptance, then freshness and acceptance again on the banked tree.
+
+The release was measured against a real reporting workload replayed on
+both engines with every answer diffed against MySQL: across 300 queries
+Pintail answered the same rows (231 identical, 66 differing only in the
+order of an unordered result, and 3 plan-dependent cases already known),
+raised no errors, and finished the set in 11.5 s against MySQL's 93.9 s.
+
+Benchmark evidence for this release was taken on 8-vCPU hosts and is not
+comparable with the figures banked for 0.1.5, which came from different
+hardware. The release-against-release studies ran both versions on the same
+host, one after the other: TPC-H SF1 Q03 is 2.0× faster than 0.1.5, Q05
+1.48× and Q10 1.42×, and Q05 holds a 290 ms median at the default spill
+limits. Every answer in every run matched MySQL exactly.
+
+### Known regressions
+
+- On the 20M-row analytical benchmark with the result memo off, Q8 (join
+  users and orders) is 17% slower than 0.1.5 by median and 13% by minimum;
+  Q1 (full count) is about 0.3 ms slower on a 2 ms query. Answers are
+  unaffected.
+- Scans that test a dense text column on every row are about 23% slower
+  than in 0.1.5 on the uniform 20M probes; mixed-selectivity and numeric
+  filters are 7% and 13% slower. The same blocks are decoded in both
+  versions, so the cost is per row, not extra I/O.
+- The TPC-H Q05 profile decodes 2,132 fact blocks where 0.1.5 decoded
+  1,684 on the same replica. Its time still improved; the cause is being
+  investigated for the next release.
+
 ## [0.1.6-rc3] - 2026-09-30
 
 Listing a source's tables no longer scans it, a side index answers point
