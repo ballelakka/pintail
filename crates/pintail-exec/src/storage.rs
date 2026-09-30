@@ -990,6 +990,10 @@ struct PrewhereSpec {
     /// this index: rows it rejects are not decoded. The join's own key
     /// filter still tests every row, so this only narrows the decode.
     membership: Option<(usize, crate::execution::IntegerMembership)>,
+    /// Whether the scan projects a wide column. Merging nearby surviving
+    /// runs then decodes wide values for every row between them that the
+    /// predicates rejected, which costs more than the merge saves.
+    wide_projection: bool,
 }
 
 /// A join key span pushed into a scan on a column that is not the table's
@@ -1103,6 +1107,7 @@ impl SnapshotStream {
         if !is_integer_type(data_type) {
             return None;
         }
+        let wide_projection = self.types.iter().copied().any(is_wide_prewhere_type);
         let spec = self.prewhere.get_or_insert_with(|| PrewhereSpec {
             predicate_ids: Vec::new(),
             predicates: Vec::new(),
@@ -1113,6 +1118,7 @@ impl SnapshotStream {
             complete: true,
             runtime_range: None,
             membership: None,
+            wide_projection,
         });
         let index = if let Some(index) = spec.predicate_ids.iter().position(|id| *id == column_id) {
             index
@@ -1907,6 +1913,14 @@ fn build_prewhere_spec(
         .map(|predicate| crate::expression::CompiledExpr::compile(predicate, &layout, collation))
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
+    let wide_projection = scan.projected_column_ids.iter().any(|id| {
+        snapshot
+            .schema()
+            .columns()
+            .iter()
+            .find(|column| column.id() == *id)
+            .is_some_and(|column| is_wide_prewhere_type(column.data_type()))
+    });
     Some(PrewhereSpec {
         predicate_ids,
         predicates,
@@ -1917,6 +1931,7 @@ fn build_prewhere_spec(
         complete,
         runtime_range: None,
         membership: None,
+        wide_projection,
     })
 }
 
@@ -2275,7 +2290,11 @@ fn prewhere_ranges(
             row += 1;
         }
         match ranges.last_mut() {
-            Some(last) if !exact_ranges && start.saturating_sub(last.end) < COALESCE_GAP => {
+            Some(last)
+                if !exact_ranges
+                    && !spec.wide_projection
+                    && start.saturating_sub(last.end) < COALESCE_GAP =>
+            {
                 last.end = row;
                 coalesced = true;
             }
