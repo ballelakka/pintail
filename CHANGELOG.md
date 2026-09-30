@@ -4,6 +4,92 @@ All notable changes to Pintail are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.6-rc2] - 2026-09-30
+
+Measured against a real reporting workload replayed on both engines, with
+every answer diffed against MySQL: joins, scans and sorts got faster on the
+report shapes that trailed, several wrong-answer and restart faults were
+fixed, and the control-plane metadata is now checked and backed up.
+
+### Fixed
+
+- A LEFT join whose table name was reused inside a derived table could be
+  treated as an inner join and lose its unmatched rows.
+- The settled-answer memo keyed on only part of a query's filters and join
+  conditions, so two queries differing in one condition could share an
+  answer. It now keys on every one of them.
+- Calendar date parts (year, month, day) no longer share the packed group
+  key of time units, which merged groups that differ.
+- Filter-first scan predicates compile under the query's table alias.
+- A narrowed key-range scan keeps its overlay key, so rows changed since the
+  last flush are not lost from it.
+- SIGTERM always completes: shutdown is bounded even while event streams
+  are open.
+- A first snapshot interrupted by a restart resumes as a snapshot rather
+  than as a table repair, and one that copied every table but never handed
+  off is handed off at the next start. Tables are restored at restart only
+  for a database that handed off.
+- A table left half-copied by a failed job is quarantined instead of being
+  served.
+- A resumed snapshot copy retires the chunks it reads again.
+- Comparisons across column collations resolve by charset, then binary.
+- Dates a lenient source stores are kept instead of being read as NULL.
+- Hex literals read as numbers where a number is wanted, including in an
+  IN list and under negation; negated text and truth values read as
+  numbers.
+- A decorrelated subquery joins after every comma-list item its condition
+  reads.
+- Columns leading a non-unique index report `MUL`.
+- Spatial results carry MySQL's column metadata; `PI()` declares six
+  decimals.
+- A query waits on a full shared memory budget instead of failing.
+- The metadata file is migrated when it is behind the schema, not only the
+  first file opened, and is never reopened outside SQLite while live.
+
+### Added
+
+- The server takes exclusive ownership of its data directory at boot.
+- The metadata file is integrity-checked, copied and pruned, and watched
+  for changes.
+- The table catalog is reconciled against the source; the dashboard lists
+  upstream tables and adds them to the mirror.
+- DECIMAL up to 65 digits replicates as an exact decimal.
+- Spatial functions over replicated geometry.
+- `GROUP BY ... WITH ROLLUP`, row constructor comparisons, row membership
+  in a subquery, compound intervals from expressions, TIME as a duration,
+  recursive CTE members, week and quarter intervals, regex position,
+  occurrence and match type, SOUNDEX, trigonometry, microsecond EXTRACT
+  units and BIT results.
+- Text compared with JSON; MIN/MAX and window keys order by the JSON rules.
+- Truncation and invalid-date warnings reach the diagnostics area.
+- HTTP queries take a time zone and a timestamp.
+
+### Performance
+
+- Joins: a LEFT join turns inner when the WHERE rejects its null rows; an
+  EXISTS semi join runs below the joins it does not read; a LEFT join's
+  keyed bridge joins first; correlated EXISTS, IN and nullable NOT IN
+  become semi and anti joins; inequality joins search a sorted input and
+  semi/anti joins read its span in place; an ON clause's one-input
+  conjuncts run in that input's scan; a join's probe keys filter the build
+  scan and narrow it to the key span; a resident hash join probes a round
+  of batches at a time on the pool; an oversized probe side is peeked
+  before building.
+- Scans: DATE and DATETIME ranges, including ones written through a cast
+  or against `DATE(literal)`, bound the scan; wide columns are tested only
+  on the rows narrow tests keep; scattered updates layer over their base
+  segments; compacted segments stay on the layered scan path.
+- Sorts and limits: each top-k batch is cut at its own k-th key; key-ordered
+  groups stream under a limit; a short sorted prefix reads its other columns
+  by key; a LEFT JOIN's preserved table is cut to the limit first.
+- Aggregates: a large relation aggregates below its inner joins; a LEFT
+  branch keyed by grouping columns folds first; aggregate rounds size to
+  the memory the query has left; DISTINCT groups before sorting.
+- Storage: segment format v5 stores large text blocks as independently
+  compressed frames, so reading a few rows of a wide text column no longer
+  decodes its whole block. Segments written by this release are not
+  readable by earlier releases.
+
 ## [0.1.6-rc1] - 2026-09-27
 
 Replication that survives a source upgrade, plus two query faults: a tight
