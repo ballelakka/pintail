@@ -2,8 +2,8 @@
   "workload": "tpch-v1",
   "profile": "smoke",
   "scale": 0.0005,
-  "startedAt": "2026-09-25T18:18:42.270Z",
-  "finishedAt": "2026-09-25T18:19:57.925Z",
+  "startedAt": "2026-09-30T13:12:30.556Z",
+  "finishedAt": "2026-09-30T13:15:11.873Z",
   "counts": {
     "region": 5,
     "nation": 25,
@@ -19,8 +19,8 @@
       "id": "q01-pricing-summary",
       "class": "scan-aggregate",
       "status": "ok",
-      "mysqlMs": 7,
-      "pintailMs": 9,
+      "mysqlMs": 4,
+      "pintailMs": 72,
       "rows": 6
     },
     {
@@ -28,7 +28,7 @@
       "class": "join-topn",
       "status": "ok",
       "mysqlMs": 2,
-      "pintailMs": 3,
+      "pintailMs": 4,
       "rows": 2
     },
     {
@@ -44,7 +44,7 @@
       "class": "join-high-cardinality",
       "status": "ok",
       "mysqlMs": 1,
-      "pintailMs": 2,
+      "pintailMs": 3,
       "rows": 13
     }
   ],
