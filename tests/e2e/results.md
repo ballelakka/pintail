@@ -1,6 +1,6 @@
 # Pintail end-to-end differential gate
 
-Measured 2026-09-30T20:42:27.971Z.
+Measured 2026-09-30T23:18:39.774Z.
 
 Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh container.
 
@@ -3801,12 +3801,12 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | restart | query:where: an unsigned column against a negative literal | PASS |  |
 | restart | query:where: a string number against an integer column | PASS |  |
 | restart | query:where: a general_ci column under PAD SPACE | PASS |  |
-| activity-history | activity-history:the history is in the control plane pintail reads | PASS | 150027 sync_runs rows for db_eac2a33435edcb309b7d32c8b620e1fe |
+| activity-history | activity-history:the history is in the control plane pintail reads | PASS | 150026 sync_runs rows for db_edcabcf8fb155d860bd3e9b42af34db0 |
 | activity-history | activity-history:the feed pages the full history | PASS | limit=200 returned 200 |
-| activity-history | activity-history:scoped feed stays fast over a large history | PASS | p50 2ms p95 2ms over 150000 rows |
-| activity-history | activity-history:workspace feed stays fast over a large history | PASS | p50 2ms p95 2ms |
-| activity-history | activity-history:25 concurrent feed reads do not pile up | PASS | p50 23ms p99 37ms |
-| activity-history | activity-history:health answers while the feed is hammered | PASS | health p95 24ms |
+| activity-history | activity-history:scoped feed stays fast over a large history | PASS | p50 1ms p95 2ms over 150000 rows |
+| activity-history | activity-history:workspace feed stays fast over a large history | PASS | p50 1ms p95 2ms |
+| activity-history | activity-history:25 concurrent feed reads do not pile up | PASS | p50 15ms p99 27ms |
+| activity-history | activity-history:health answers while the feed is hammered | PASS | health p95 21ms |
 | activity-history | converge:Dim | PASS |  |
 | activity-history | converge:Event | PASS |  |
 | activity-history | converge:Fact | PASS |  |
@@ -4056,10 +4056,10 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | activity-history | query:where: an unsigned column against a negative literal | PASS |  |
 | activity-history | query:where: a string number against an integer column | PASS |  |
 | activity-history | query:where: a general_ci column under PAD SPACE | PASS |  |
-| poll-storm | poll-storm:no request fails under 25 open dashboards | PASS | 0 failed of 4905 |
-| poll-storm | poll-storm:latency stays bounded | PASS | 4905 requests: p50 1ms p99 11ms |
+| poll-storm | poll-storm:no request fails under 25 open dashboards | PASS | 0 failed of 4935 |
+| poll-storm | poll-storm:latency stays bounded | PASS | 4935 requests: p50 1ms p99 7ms |
 | poll-storm | poll-storm:health never stalls | PASS | health p99 2ms |
-| poll-storm | poll-storm:replication keeps pace under the storm | PASS | orders replica 10070 vs source 10070 |
+| poll-storm | poll-storm:replication keeps pace under the storm | PASS | orders replica 10488 vs source 10488 |
 | poll-storm | converge:Dim | PASS |  |
 | poll-storm | converge:Event | PASS |  |
 | poll-storm | converge:Fact | PASS |  |
@@ -5342,7 +5342,7 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | drop-table-polling | polling:fixtures replicate before the mode switch | PASS |  |
 | drop-table-polling | polling:database is healthy before the drop | PASS |  |
 | drop-table-polling | polling:TRUNCATE empties the replica | PASS |  |
-| drop-table-polling | polling:one dropped table does not stop the other tables | WARN | the whole poll cycle aborts on the first table that fails, so every other table stops replicating too: {"database":{"restored_backup_created_at":null,"data_age_seconds":null,"id":"db_eac2a33435edcb309b7d32c8b620e1fe","name":"e2e_db","mode":"polling","effective_mode":"polling","state":"error","include_tables":[],"exclude_tables":[],"poll_interval_seconds":5,"reconcile_interval_seconds":600,"keyless_policy":"quarantine","created_at":"2026-09-30T20:37:23.587516906+00:00","updated_at":"2026-09-30T20:41:38.961710296+00:00"},"tables":30,"rows":13983} |
+| drop-table-polling | polling:one dropped table does not stop the other tables | WARN | the whole poll cycle aborts on the first table that fails, so every other table stops replicating too: {"database":{"restored_backup_created_at":null,"data_age_seconds":null,"id":"db_edcabcf8fb155d860bd3e9b42af34db0","name":"e2e_db","mode":"polling","effective_mode":"polling","state":"error","include_tables":[],"exclude_tables":[],"poll_interval_seconds":5,"reconcile_interval_seconds":600,"keyless_policy":"quarantine","created_at":"2026-09-30T23:13:40.215362956+00:00","updated_at":"2026-09-30T23:17:53.808553357+00:00"},"tables":30,"rows":14401} |
 | drop-table-polling | polling:re-probe restores replication for the surviving tables | PASS |  |
 | drop-table-polling | converge:Dim | PASS |  |
 | drop-table-polling | converge:Event | PASS |  |
@@ -6105,13 +6105,13 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | restart-during-resync | query:where: a string number against an integer column | PASS |  |
 | restart-during-resync | query:where: a general_ci column under PAD SPACE | PASS |  |
 | memory-pressure | memory-pressure:a CDC table with a secondary UNIQUE key streams under the ceiling | PASS | pintail 40, source 40 |
-| memory-pressure | memory-pressure:the process survives the storm | PASS | wire 240 ok, http 88 ok, dashboards 138 ok; no errors |
+| memory-pressure | memory-pressure:the process survives the storm | PASS | wire 240 ok, http 83 ok, dashboards 132 ok; no errors |
 | memory-pressure | memory-pressure:every failure is a designed refusal | PASS | only refusals; 0 dashboard requests failed |
-| memory-pressure | memory-pressure:work still gets done | PASS | wire 240 of 240, http 88 |
-| memory-pressure | memory-pressure:wire queries are not starved by the HTTP surface | PASS | wire p50 265ms p99 1101ms over 240 queries |
-| memory-pressure | memory-pressure:health never stalls | PASS | health p99 14ms over 10 samples |
-| memory-pressure | memory-pressure:the process stays inside its ceiling | PASS | peak RSS 132MB with a 256MB budget |
-| memory-pressure | memory-pressure:the replica catches up after the storm | PASS | big 201000 vs source 201000 |
+| memory-pressure | memory-pressure:work still gets done | PASS | wire 240 of 240, http 83 |
+| memory-pressure | memory-pressure:wire queries are not starved by the HTTP surface | PASS | wire p50 269ms p99 1334ms over 240 queries |
+| memory-pressure | memory-pressure:health never stalls | PASS | health p99 14ms over 9 samples |
+| memory-pressure | memory-pressure:the process stays inside its ceiling | PASS | peak RSS 120MB with a 256MB budget |
+| memory-pressure | memory-pressure:the replica catches up after the storm | PASS | big 200900 vs source 200900 |
 | memory-pressure | memory-pressure:queries recover once the storm passes | PASS | 3 of 3 sequential queries succeeded |
 | memory-pressure | converge:Dim | PASS |  |
 | memory-pressure | converge:Event | PASS |  |
@@ -6366,8 +6366,8 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 | reconcile-memory | reconcile-memory:the source holds the large child table | PASS | 2000000 rows |
 | reconcile-memory | reconcile-memory:every child row arrives | PASS | 2000000 of 2000000 |
 | reconcile-memory | reconcile-memory:the cascade removed the deleted parents' children | PASS | 1800000 remain |
-| reconcile-memory | reconcile-memory:reconciliation converges the replica on the source | PASS | child 1800000 vs source 1800000 after 4.3s |
-| reconcile-memory | reconcile-memory:reconciliation is bounded in memory | PASS | RSS 54MB before, peak 194MB during (margin 768MB) |
+| reconcile-memory | reconcile-memory:reconciliation converges the replica on the source | PASS | child 1800000 vs source 1800000 after 2.3s |
+| reconcile-memory | reconcile-memory:reconciliation is bounded in memory | PASS | RSS 55MB before, peak 145MB during (margin 768MB) |
 | reconcile-memory | converge:Dim | PASS |  |
 | reconcile-memory | converge:Event | PASS |  |
 | reconcile-memory | converge:Fact | PASS |  |
@@ -7131,32 +7131,32 @@ Source: `mysql:8.4` (server 8.4.11), `binlog_row_metadata=MINIMAL`, fresh contai
 
 | Phase | run s | converge s | corpus s |
 |---|---|---|---|
-| snapshot | 0.0 | 0.1 | 0.5 |
-| orm-compat | 2.0 | 0.0 | 0.5 |
-| crud | 0.0 | 0.3 | 0.5 |
-| composite-keys | 0.0 | 2.1 | 0.5 |
-| type-edges | 0.0 | 2.1 | 0.5 |
-| ddl | 6.9 | 2.6 | 0.4 |
-| schema-drift-minimal | 0.0 | 2.1 | 0.4 |
-| schema-drift-unseen | 0.0 | 2.1 | 0.4 |
-| churn | 0.1 | 2.1 | 0.4 |
-| contention | 19.9 | 0.1 | 1.3 |
-| execution-budget | 0.0 | 0.1 | 1.4 |
-| spill | 7.4 | 0.9 | 1.2 |
-| pooling | 0.2 | 0.6 | 1.2 |
-| local-database | 0.0 | 0.1 | 1.6 |
-| restart | 0.5 | 1.7 | 1.6 |
-| activity-history | 1.2 | 0.8 | 1.5 |
-| poll-storm | 21.7 | 0.1 | 1.5 |
-| control-plane | 32.1 | 0.1 | 1.3 |
+| snapshot | 0.0 | 0.1 | 0.4 |
+| orm-compat | 1.8 | 0.0 | 0.4 |
+| crud | 0.0 | 0.8 | 0.4 |
+| composite-keys | 0.0 | 2.1 | 0.4 |
+| type-edges | 0.0 | 2.1 | 0.4 |
+| ddl | 7.1 | 2.9 | 0.4 |
+| schema-drift-minimal | 0.0 | 1.8 | 0.4 |
+| schema-drift-unseen | 0.0 | 2.1 | 0.3 |
+| churn | 0.1 | 2.3 | 0.3 |
+| contention | 19.1 | 0.1 | 1.3 |
+| execution-budget | 0.0 | 0.1 | 1.1 |
+| spill | 7.5 | 0.8 | 1.1 |
+| pooling | 0.1 | 0.8 | 1.1 |
+| local-database | 0.0 | 0.1 | 1.4 |
+| restart | 0.5 | 1.6 | 1.2 |
+| activity-history | 1.1 | 0.8 | 1.1 |
+| poll-storm | 22.1 | 0.1 | 1.3 |
+| control-plane | 32.2 | 0.1 | 1.2 |
 | snapshot-ddl-window | 5.0 | 0.1 | 0.6 |
-| drop-table-cdc | 9.9 | 0.1 | 1.3 |
-| drop-table-recreate | 10.9 | 0.1 | 1.3 |
-| drop-table-polling | 104.0 | 0.1 | 0.6 |
-| restart-during-snapshot | 1.4 | 0.1 | 0.6 |
-| restart-during-resync | 3.4 | 0.1 | 0.6 |
-| memory-pressure | 8.2 | 0.1 | 0.6 |
-| reconcile-memory | 15.4 | 0.1 | 0.6 |
-| drop-database | 10.4 | 0.1 | 0.6 |
-| ddl-documented-gaps | 0.0 | 0.1 | 0.5 |
-| total | 260.7 | 18.7 | 24.0 |
+| drop-table-cdc | 10.1 | 0.1 | 1.2 |
+| drop-table-recreate | 11.1 | 0.1 | 1.2 |
+| drop-table-polling | 104.1 | 0.1 | 0.5 |
+| restart-during-snapshot | 1.3 | 0.1 | 0.6 |
+| restart-during-resync | 3.4 | 0.1 | 0.5 |
+| memory-pressure | 8.1 | 0.1 | 0.6 |
+| reconcile-memory | 12.3 | 0.1 | 0.5 |
+| drop-database | 11.1 | 0.1 | 0.6 |
+| ddl-documented-gaps | 0.0 | 0.1 | 0.6 |
+| total | 258.2 | 19.3 | 21.0 |
