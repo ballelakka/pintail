@@ -24,6 +24,9 @@ use crate::collation::Collation;
 
 use crate::{RecordBatch, expression::mysql_f64};
 
+/// Finished-row bytes a finalizing partition gathers before charging them.
+const FINALIZE_CHARGE_SLICE: usize = 256 << 10;
+
 /// Per-aggregate scatter payload for the two-pass partitioned aggregate.
 #[derive(Clone, Copy)]
 pub(super) enum TwoPassLane {
@@ -587,20 +590,16 @@ pub(super) fn build_streaming_two_pass_aggregate(
         reserved: 0,
         collation,
     });
-    // Distinct lanes stay on the classic path: dense per-worker partials
-    // would replicate each group's distinct set per thread and pay a
-    // drain-and-reinsert merge that costs more than the scatter it saves
-    // (n4 585ms -> 768ms when measured on 2026-08-02).
-    let mut dense = lanes
-        .iter()
-        .all(|lane| !matches!(lane, TwoPassLane::Distinct { .. }))
-        .then(|| dense_slot_count(keys))
-        .flatten()
-        .map(|slots| {
-            let mut table: DenseGroupSlots = Vec::new();
-            table.resize_with(slots, || None);
-            table
-        });
+    // Distinct lanes take the dense slots too: each worker's partial holds
+    // its own copy of a group's distinct set, and the partials merge by
+    // unioning those sets - word by word for bitmaps - rather than by
+    // replaying every member, which is what once made this path lose to
+    // the scatter.
+    let mut dense = dense_slot_count(keys).map(|slots| {
+        let mut table: DenseGroupSlots = Vec::new();
+        table.resize_with(slots, || None);
+        table
+    });
     if let Some(slots) = &dense {
         let slab = dense_reservation(keys, slots.len(), aggregates.len());
         if memory.reserve(slab).is_ok() {
@@ -1039,6 +1038,11 @@ pub(super) fn build_streaming_two_pass_aggregate(
         .map(|map| -> Result<(Vec<Vec<Value>>, usize), ExecError> {
             let mut rows = Vec::with_capacity(map.len());
             let mut payload = 0_usize;
+            // Charged in slices rather than per row: every partition's
+            // worker charging each of a hundred thousand rows on the shared
+            // counters cost more than finishing the rows. A slice bounds
+            // how far a partition runs past the ceiling before it refuses.
+            let mut uncharged = 0_usize;
             for ((bits, null), states) in map {
                 let mut row = two_pass_key_values(
                     keys,
@@ -1053,10 +1057,15 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     row.push(state.finish(memory)?);
                 }
                 let bytes = estimated_row_payload_bytes(&row);
-                memory.reserve(bytes)?;
+                uncharged = uncharged.saturating_add(bytes);
+                if uncharged >= FINALIZE_CHARGE_SLICE {
+                    memory.reserve(uncharged)?;
+                    uncharged = 0;
+                }
                 payload = payload.saturating_add(bytes);
                 rows.push(row);
             }
+            memory.reserve(uncharged)?;
             Ok((rows, payload))
         })
         .collect::<Result<Vec<_>, _>>();
@@ -1090,14 +1099,12 @@ fn two_pass_scatter_batch(
     // Packed integer keys read their bits straight from storage; the cell
     // path below would materialize the whole key column to return them.
     let packed_key = match group_values.typed() {
-        Some((crate::batch::TypedValues::Int64(values), validity)) => Some((
-            PackedInts::Signed(values.as_slice()),
-            validity,
-        )),
-        Some((crate::batch::TypedValues::UInt64(values), validity)) => Some((
-            PackedInts::Unsigned(values.as_slice()),
-            validity,
-        )),
+        Some((crate::batch::TypedValues::Int64(values), validity)) => {
+            Some((PackedInts::Signed(values.as_slice()), validity))
+        }
+        Some((crate::batch::TypedValues::UInt64(values), validity)) => {
+            Some((PackedInts::Unsigned(values.as_slice()), validity))
+        }
         _ => None,
     };
     if let Some((values, validity)) = packed_key {
@@ -1483,7 +1490,10 @@ impl PackedInts<'_> {
 enum LaneReader<'a> {
     CountStar,
     /// Scaled decimal units from a packed decimal column.
-    Units(&'a crate::batch::DecimalUnits, &'a crate::array::ValidityMask),
+    Units(
+        &'a crate::batch::DecimalUnits,
+        &'a crate::array::ValidityMask,
+    ),
     Int64(&'a [i64], &'a crate::array::ValidityMask),
     UInt64(&'a [u64], &'a crate::array::ValidityMask),
     /// Any other representation takes the per-row reader.
@@ -1695,8 +1705,19 @@ fn drain_two_pass_window(
         .par_iter()
         .map(
             |(morsel, translations)| -> Result<Vec<TwoPassBucket>, ExecError> {
-                let mut buckets: Vec<TwoPassBucket> =
-                    (0..partitions).map(|_| TwoPassBucket::default()).collect();
+                // Sized for an even spread up front: growing every bucket
+                // from empty by doubling copied each morsel's scatter output
+                // about once more. A skewed key still grows the buckets it
+                // lands in, as before.
+                let expected = morsel.selected_count().div_ceil(partitions);
+                let expected = expected.saturating_add(expected / 8);
+                let mut buckets: Vec<TwoPassBucket> = (0..partitions)
+                    .map(|_| TwoPassBucket {
+                        keys: Vec::with_capacity(expected),
+                        masks: Vec::with_capacity(expected),
+                        lanes: Vec::with_capacity(expected.saturating_mul(lanes.len())),
+                    })
+                    .collect();
                 match keys {
                     TwoPassKeySource::Int { column, .. } => {
                         two_pass_scatter_batch(morsel, column, lanes, partitions, &mut buckets)?;
@@ -2358,12 +2379,13 @@ fn dense_packed_chunk(
     keys: TwoPassKeySource,
     columns: &[usize],
     lanes: &[TwoPassLane],
-    packed: &[PackedLane],
+    packed: &[Option<PackedLane>],
     aggregates: &[CompiledAggregate],
     acc: &mut DenseGroupSlots,
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
     let lane_count = lanes.len();
+    let unpacked = packed.iter().any(Option::is_none);
     let slot_count = acc.len();
     let mut cells = vec![PackedCell::default(); slot_count * lane_count];
     let mut present = vec![false; slot_count];
@@ -2387,8 +2409,27 @@ fn dense_packed_chunk(
             present[slot] = true;
             let group_cells = &mut cells[slot * lane_count..(slot + 1) * lane_count];
             for ((cell, reader), lane) in group_cells.iter_mut().zip(&readers).zip(packed) {
-                if let Some(bits) = reader.bits(row) {
+                if let Some(lane) = lane
+                    && let Some(bits) = reader.bits(row)
+                {
                     cell.add(*lane, bits)?;
+                }
+            }
+            if unpacked {
+                let states = acc[slot]
+                    .get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
+                for (index, (((state, reader), lane), aggregate)) in states
+                    .iter_mut()
+                    .zip(&readers)
+                    .zip(lanes)
+                    .zip(aggregates)
+                    .enumerate()
+                {
+                    if packed[index].is_none()
+                        && let Some(bits) = reader.bits(row)
+                    {
+                        apply_two_pass_lane(state, lane, aggregate, bits, memory)?;
+                    }
                 }
             }
         }
@@ -2400,12 +2441,14 @@ fn dense_packed_chunk(
         let states =
             acc[slot].get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
         for (lane_index, (lane, aggregate)) in packed.iter().zip(aggregates).enumerate() {
-            cells[slot * lane_count + lane_index].commit(
-                *lane,
-                &mut states[lane_index],
-                aggregate,
-                memory,
-            )?;
+            if let Some(lane) = lane {
+                cells[slot * lane_count + lane_index].commit(
+                    *lane,
+                    &mut states[lane_index],
+                    aggregate,
+                    memory,
+                )?;
+            }
         }
     }
     Ok(())
@@ -2520,15 +2563,16 @@ fn dense_text_window(
         .iter()
         .zip(aggregates)
         .map(|(lane, aggregate)| packed_lane(lane, aggregate))
-        .collect::<Option<Vec<_>>>();
+        .collect::<Vec<_>>();
+    let any_packed = packed.iter().any(Option::is_some);
     let outcome = (|| {
         let partials = window
             .par_chunks(chunk_size)
             .map(|chunk| {
                 let mut acc = vec![None; slot_count];
-                if let Some(packed) = &packed {
+                if any_packed {
                     dense_packed_chunk(
-                        chunk, keys, columns, lanes, packed, aggregates, &mut acc, memory,
+                        chunk, keys, columns, lanes, &packed, aggregates, &mut acc, memory,
                     )?;
                     return Ok(acc);
                 }

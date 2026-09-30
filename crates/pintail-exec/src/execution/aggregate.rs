@@ -382,18 +382,21 @@ impl DistinctSeen {
             return Ok(());
         };
         let IntsSeen { set, min, max } = ints.as_mut();
+        // Windows start on a multiple of 64 so two bitmaps' words line up
+        // and a merge can union them word by word.
+        let base = *min - min.rem_euclid(64);
         let span =
-            usize::try_from(*max - *min).expect("checked under DISTINCT_BITMAP_MAX_SPAN") + 1;
+            usize::try_from(*max - base).expect("checked under DISTINCT_BITMAP_MAX_SPAN") + 1;
         let words = span.div_ceil(64);
         memory.reserve(words.saturating_mul(size_of::<u64>()))?;
         let mut bits = vec![0_u64; words];
         let count = set.len();
         for key in set.iter() {
-            let offset = usize::try_from(key - *min).expect("within the span just computed");
+            let offset = usize::try_from(key - base).expect("within the span just computed");
             bits[offset / 64] |= 1_u64 << (offset % 64);
         }
         *self = Self::Bitmap(Box::new(BitmapSeen {
-            min: *min,
+            min: base,
             bits,
             count,
         }));
@@ -414,6 +417,7 @@ impl DistinctSeen {
             return Ok(());
         };
         let BitmapSeen { min, bits, count } = bitmap.as_mut();
+        let new_min = new_min - new_min.rem_euclid(64);
         let new_words = usize::try_from(new_max - new_min + 1)
             .expect("checked span")
             .div_ceil(64);
@@ -519,6 +523,69 @@ impl DistinctSeen {
         }
         *self = Self::Values(set);
         Ok(())
+    }
+
+    /// Takes every member of another integer-keyed set, returning how many
+    /// were new here, or hands `other` back when either side holds values
+    /// (the caller then takes the general per-value merge). Two bitmaps
+    /// union word by word: their windows start on multiples of 64, so a
+    /// word of one lines up with a word of the other. Replaying members
+    /// one at a time through a `Value` each was the whole cost of merging
+    /// parallel partials of a `COUNT(DISTINCT)`.
+    fn union_ints(
+        &mut self,
+        other: Self,
+        memory: &MemoryTracker,
+        collation: Collation,
+    ) -> Result<Result<u64, Self>, ExecError> {
+        if matches!(self, Self::Values(_)) || matches!(other, Self::Values(_)) {
+            return Ok(Err(other));
+        }
+        if let (Self::Bitmap(mine), Self::Bitmap(theirs)) = (&mut *self, &other)
+            && mine.min.rem_euclid(64) == 0
+            && theirs.min.rem_euclid(64) == 0
+        {
+            let span = |bitmap: &BitmapSeen| {
+                i128::try_from(bitmap.bits.len().saturating_mul(64)).unwrap_or(i128::MAX)
+            };
+            let low = mine.min.min(theirs.min);
+            let high = (mine.min + span(mine)).max(theirs.min + span(theirs));
+            if high - low <= DISTINCT_BITMAP_MAX_SPAN + 64 {
+                if low < mine.min || high > mine.min + span(mine) {
+                    let words = usize::try_from((high - low) / 64).expect("checked span");
+                    memory.reserve(
+                        words
+                            .saturating_sub(mine.bits.len())
+                            .saturating_mul(size_of::<u64>()),
+                    )?;
+                    let mut bits = vec![0_u64; words];
+                    let shift = usize::try_from((mine.min - low) / 64).expect("aligned offset");
+                    bits[shift..shift + mine.bits.len()].copy_from_slice(&mine.bits);
+                    mine.bits = bits;
+                    mine.min = low;
+                }
+                let shift = usize::try_from((theirs.min - mine.min) / 64).expect("aligned offset");
+                let mut added = 0_u64;
+                for (word, incoming) in mine.bits[shift..].iter_mut().zip(&theirs.bits) {
+                    added += u64::from((incoming & !*word).count_ones());
+                    *word |= incoming;
+                }
+                mine.count += usize::try_from(added).expect("count fits usize");
+                return Ok(Ok(added));
+            }
+        }
+        let members: Box<dyn Iterator<Item = i128> + '_> = match &other {
+            Self::Ints(ints) => Box::new(ints.set.iter().copied()),
+            Self::Bitmap(bitmap) => Box::new(bitmap_members(bitmap.min, &bitmap.bits)),
+            Self::Values(_) => unreachable!("checked above"),
+        };
+        let mut added = 0_u64;
+        for key in members {
+            if self.insert_int(key, memory, collation)? {
+                added += 1;
+            }
+        }
+        Ok(Ok(added))
     }
 
     fn drain_values(self) -> Vec<Value> {
@@ -1109,7 +1176,20 @@ impl AggregateState {
             return Ok(());
         }
         if aggregate.distinct {
-            if let Some(seen) = other.seen.take() {
+            if let Some(mut seen) = other.seen.take() {
+                // COUNT(DISTINCT) over integer sets: each key new to this
+                // set counts once, which is what absorbing it did.
+                if let (AggregateValue::Count(count), Some(mine)) =
+                    (&mut self.value, &mut self.seen)
+                {
+                    match mine.union_ints(seen, memory, self.collation)? {
+                        Ok(added) => {
+                            *count = count.checked_add(added).ok_or(ExecError::NumericOverflow)?;
+                            return Ok(());
+                        }
+                        Err(returned) => seen = returned,
+                    }
+                }
                 for key in seen.drain_values() {
                     self.absorb_distinct(aggregate, &key, memory)?;
                 }
@@ -1496,7 +1576,8 @@ impl AggregateState {
                 scale: existing,
                 count,
             } if *existing == scale => {
-                let widened = ExactUnits::from_int(units, digits).ok_or(ExecError::NumericOverflow)?;
+                let widened =
+                    ExactUnits::from_int(units, digits).ok_or(ExecError::NumericOverflow)?;
                 *total = total.plus(&widened)?;
                 *count = count.checked_add(rows).ok_or(ExecError::NumericOverflow)?;
                 Ok(())
@@ -6426,6 +6507,7 @@ mod fold_cache_tests {
 mod distinct_bitmap_tests {
     use super::{
         DISTINCT_BITMAP_MAX_SPAN, DISTINCT_BITMAP_MIN_COUNT, DistinctSeen, IntsSeen, MemoryTracker,
+        int_key_value,
     };
     use crate::collation::Collation;
     use pintail_types::Value;
@@ -6565,6 +6647,66 @@ mod distinct_bitmap_tests {
                 .expect("re-insert"),
             "a key already in the bitmap must report itself as not new"
         );
+    }
+
+    fn seen_of(keys: impl IntoIterator<Item = i128>) -> DistinctSeen {
+        let memory = MemoryTracker::new(usize::MAX);
+        let mut seen = ints();
+        for key in keys {
+            seen.insert_int(key, &memory, Collation::default())
+                .expect("insert");
+        }
+        seen
+    }
+
+    #[test]
+    fn a_union_counts_exactly_the_members_new_to_it() {
+        let memory = MemoryTracker::new(usize::MAX);
+        // Overlapping bitmaps whose windows start at unrelated keys, a
+        // bitmap that must widen on both sides to take the other, and a
+        // hashed set on either side.
+        let cases: Vec<(Vec<i128>, Vec<i128>)> = vec![
+            (
+                (1_000..3_000).collect(),
+                (2_500..9_000).step_by(3).collect(),
+            ),
+            ((5_000..5_200).collect(), (17..40_017).step_by(7).collect()),
+            ((0..100).collect(), vec![5, 7, 1 << 40, -3]),
+            (vec![-9, 1 << 41], (0..500).collect()),
+        ];
+        for (left, right) in cases {
+            let mut mine = seen_of(left.iter().copied());
+            let theirs = seen_of(right.iter().copied());
+            let before = left.iter().collect::<HashSet<_>>();
+            let expected = right
+                .iter()
+                .collect::<HashSet<_>>()
+                .difference(&before)
+                .count();
+            let added = mine
+                .union_ints(theirs, &memory, Collation::default())
+                .expect("union")
+                .unwrap_or_else(|_| panic!("integer sets union in place"));
+            assert_eq!(added, expected as u64);
+            let mut drained: Vec<Value> = mine.drain_values();
+            drained.sort_by_key(|value| match value {
+                Value::Int64(value) => i128::from(*value),
+                Value::UInt64(value) => i128::from(*value),
+                other => panic!("unexpected value {other:?}"),
+            });
+            let mut union = left
+                .iter()
+                .chain(&right)
+                .copied()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            union.sort_unstable();
+            assert_eq!(
+                drained,
+                union.into_iter().map(int_key_value).collect::<Vec<_>>()
+            );
+        }
     }
 }
 
