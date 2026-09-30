@@ -4,6 +4,44 @@ All notable changes to Pintail are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.6-rc3] - 2026-09-30
+
+Listing a source's tables no longer scans it, a side index answers point
+and join-key lookups inside segments, and the planner reads pinned keys
+and constant lists before it chooses a join order.
+
+### Fixed
+
+- Listing a source's upstream tables, adding tables from it, and the
+  supervisor's periodic drift check ran `COUNT(*)` on every source table:
+  up to 30 seconds of index scan per table and 300 per probe, repeated on
+  each visit and each reconciliation. They now read the source's row
+  estimates from `information_schema.TABLES` and issue no count; the
+  counts they report are marked as estimates. Registering a database and
+  the re-probe before a snapshot or repair still count exactly.
+
+### Performance
+
+- Segments can carry a side index over an integer column: per-value row
+  postings that answer an equality, an `IN` list or a join's key set by
+  reading only the rows they name. It is on by default, built on first use
+  and persisted in the segment file (segment format 6; formats 1-5 still
+  read). A probe naming more than a quarter of a segment reads it whole
+  instead.
+- An inner join run with three or more tables reads a relation pinned by
+  its primary key first, so its keys filter the rest; row estimates count
+  a relation's own filters.
+- A small probe key set filters a build side beneath a join or an
+  integer-keyed DISTINCT on that side, down to the table the key comes
+  from.
+- `column IN (constants)` on an integer or date column bounds the scan by
+  the list's span, so segments outside it are skipped.
+
+### Changed
+
+- Segments written by this release use format 6 and are not readable by
+  earlier releases.
+
 ## [0.1.6-rc2] - 2026-09-30
 
 Measured against a real reporting workload replayed on both engines, with
