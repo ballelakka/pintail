@@ -1569,11 +1569,19 @@ impl BatchStream for SnapshotStream {
         let column_ids = stream.column_ids().to_vec();
         let new_start = PrimaryKey::new(vec![new_start]).expect("one-part key");
         let new_end = PrimaryKey::new(vec![new_end]).expect("one-part key");
-        if let Ok(Some(rebuilt)) =
+        if let Ok(Some(mut rebuilt)) =
             stream
                 .snapshot()
                 .scan_projected_range_stream(&new_start, &new_end, &column_ids)
         {
+            // The narrower range covers its end segments only in part. The
+            // stream locates the rows it selects there by the key columns
+            // the overlay names; a rebuild without them fell back to
+            // merging each such segment whole from its row headers, which
+            // a tight ceiling cannot hold and cannot slice.
+            if let Some(key_ids) = stream.memtable_overlay_key() {
+                rebuilt.enable_memtable_overlay(key_ids);
+            }
             self.stream = Some(rebuilt);
         }
         // On decline or error the original stream stays: best-effort pruning.

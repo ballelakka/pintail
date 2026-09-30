@@ -3186,6 +3186,13 @@ impl ProjectedScanStream {
         }
     }
 
+    /// The key columns [`Self::enable_memtable_overlay`] accepted, so a
+    /// stream rebuilt over a narrower range can be given the same.
+    #[must_use]
+    pub fn memtable_overlay_key(&self) -> Option<&[u32]> {
+        self.overlay_key.as_deref()
+    }
+
     #[must_use]
     pub fn key_range(&self) -> (&PrimaryKey, &PrimaryKey) {
         (&self.start, &self.end)
