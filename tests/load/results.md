@@ -18,7 +18,7 @@ Measured 2026-09-07 using `LOAD_PROFILE=isolation bun run tests/load/run.ts`.
 Both binaries used the recovery profile, 16 admission slots, a 64 MiB per-query
 memory limit, and a 200,000-row replicated table. Fourteen report clients and
 two point-lookup clients each issued 40 queries, after warming the replica.
-The baseline was commit `626ea40`; the comparison changes admission costing.
+The baseline was commit `9a38a3d`; the comparison changes admission costing.
 Runs were sequential with separately created source containers.
 
 | Classifier | Point lookups completed | Failed | Point lookup p95 ms | All requests completed | Failed |

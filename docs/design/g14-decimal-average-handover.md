@@ -1,6 +1,6 @@
 # G14: decimal AVG rounds its quotient twice
 
-Implemented in `bbc456f` on 2026-09-08. The formerly ignored reproduction
+Implemented in `cfd7491` on 2026-09-08. The formerly ignored reproduction
 is enabled, and all 15 tests in `decimal_average_exactness` pass. The full
 RC profile passed (`2026-09-08T16-39-19-997Z-rc`), followed by two additional
 complete e2e passes on each MySQL version. Each of the six e2e runs recorded

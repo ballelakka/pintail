@@ -2,7 +2,7 @@
   "scope": "Auditor kit smoke only; not published performance evidence",
   "provenance": {
     "schemaVersion": 1,
-    "commit": "cdee845de511b30c261e133e503be7cb22e128a3",
+    "commit": "ba9523516ad68d725f074c05a74abb1160c18e9d",
     "mode": "smoke-not-published-evidence",
     "startedAt": "2026-09-05T16:54:48.801Z",
     "tools": {

@@ -8,7 +8,7 @@ No production engine code changed, and no release was made.
 Command: `bun run scripts/validate.ts --profile development`
 
 - Run: `2026-09-07T20-36-55-405Z-development`.
-- Checked HEAD: `4594ace`, clean at launch.
+- Checked HEAD: `140d851`, clean at launch.
 - rustc 1.97.0; cargo 1.97.0; bun 1.3.14.
 - Formatting, workspace/all-target Clippy with `-D warnings`, and README table: PASS.
 - Dashboard frozen install and typecheck: PASS.

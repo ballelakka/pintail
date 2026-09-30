@@ -1,6 +1,6 @@
 {
-  "baseline": "3d291477e81ceb1920a4bd9ff85c996c00c19dc1",
-  "candidate": "05a199a2e483df5979221214de4c5ebc9645f08b",
+  "baseline": "2d328f8e2ed5681c0189607cbea424867faa869b",
+  "candidate": "8b343370ca9741b94d04012c88ffdd6dd330e24e",
   "requalification": {
     "kind": "release requalification: previous stable release (baseline) against the 0.1.6 release tree (candidate)",
     "baseline_tag": "v0.1.5",
@@ -138,7 +138,7 @@
   "release_gate": {
     "status": "PASS",
     "run": "release chain validation for 0.1.6",
-    "head": "a1e5d532bdca73079d13ce5068bfbca2a85a8cd2",
+    "head": "374d75103eaa8b5bde44918f0e3155ecabf385d2",
     "engine_identical_to_candidate": true,
     "oracle_queries": 1948,
     "e2e_84": {
@@ -161,8 +161,8 @@
       "products": 10000,
       "orders": 20000000
     },
-    "baseline_checkout": "3d291477",
-    "candidate_checkout": "05a199a2",
+    "baseline_checkout": "2d328f8e",
+    "candidate_checkout": "8b343370",
     "host_fingerprint": "61c4f1848366b99c582568f821e2bb98347792118151cfa135cb1bb85ce6b63e",
     "host_fingerprint_matches_baseline_run": true,
     "logical_cpus": 8,
@@ -587,8 +587,8 @@
   },
   "previous_requalifications": {
     "0.1.5": {
-      "baseline": "477ef1cb24f410075418101fab29a1ec90e86f3d",
-      "candidate": "7ce8559c87a4d1eed81cea70d0d6faedacde13d6",
+      "baseline": "a36e18abff0c9344a0dc14d30f159aac081b272e",
+      "candidate": "c7fde2b7cb2fdf473340d21c30924645a21899ec",
       "requalification": {
         "kind": "release requalification: previous stable release (baseline) against the 0.1.5 release tree (candidate)",
         "baseline_tag": "v0.1.4",
@@ -706,7 +706,7 @@
         "status": "PASS",
         "profile": "stable (heavy stages)",
         "run": "2026-09-25T17-35-18-368Z-stable",
-        "head": "a6d5810257493274c5eb2549a9b16da42188a8ab",
+        "head": "6bf9a853581852a13eeb7c19084654c38311633f",
         "engine_identical_to_candidate": true,
         "oracle_queries": 1908,
         "e2e_84": {
@@ -729,8 +729,8 @@
           "products": 10000,
           "orders": 20000000
         },
-        "baseline_checkout": "477ef1cb",
-        "candidate_checkout": "7ce8559c",
+        "baseline_checkout": "a36e18ab",
+        "candidate_checkout": "c7fde2b7",
         "host_fingerprint": "2c89ea593c54a6dc3dcd61e20ea00deee006c814ec7ff47e3e2712dd3edf2913",
         "host_fingerprint_matches_baseline_run": true,
         "logical_cpus": 16,
@@ -993,8 +993,8 @@
   },
   "historical": {
     "note": "The original change qualification this file recorded before the 0.1.5 requalification.",
-    "baseline": "26f4c9f2cca79d137b20a3e54072a3550be46234",
-    "candidate": "b2cb6f5bea0cb9bdfddae0815da4f11b2773bab3",
+    "baseline": "2dc08de1c8f8901544a1e5748e74598faa163bc0",
+    "candidate": "24d5049be12b0dbf92125524d3eb5b7694ec6554",
     "target": {
       "threshold_ms": 1000,
       "runs": 15,
@@ -1062,7 +1062,7 @@
       "status": "PASS",
       "profile": "rc",
       "run": "2026-09-10T06-49-01-037Z-rc",
-      "head": "b2cb6f5bea0cb9bdfddae0815da4f11b2773bab3",
+      "head": "24d5049be12b0dbf92125524d3eb5b7694ec6554",
       "report": "q05-join-rc.md",
       "oracle_queries": 1231,
       "unit_passed": 1039,

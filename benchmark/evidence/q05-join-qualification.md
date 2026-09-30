@@ -10,8 +10,8 @@ scale factors. The separate eight-query fixture contains 20,000,000 rows.
 This evidence was re-run for the 0.1.6 stable release. The baseline is the
 previous stable release, tag `v0.1.5` (tag object
 `c8077a0dd15211ceb93b6c0a9b365d581665af1e`, commit
-`3d291477e81ceb1920a4bd9ff85c996c00c19dc1`). The candidate is the 0.1.6
-release tree (`05a199a2e483df5979221214de4c5ebc9645f08b`). Both releases
+`2d328f8e2ed5681c0189607cbea424867faa869b`). The candidate is the 0.1.6
+release tree (`8b343370ca9741b94d04012c88ffdd6dd330e24e`). Both releases
 contain the Q05 join change this file first qualified, so this pair measures
 what every engine change between the two releases did to it, including the
 side index that 0.1.6 turns on by default. It does not isolate any single
@@ -176,10 +176,10 @@ threshold. It is not a cross-revision regression gate.
 ### Release gate
 
 The release chain banked the correctness gate separately; it was not re-run
-here. Its validation at `a1e5d532` passed with 1,948 oracle cases byte-exact
+here. Its validation at `374d7510` passed with 1,948 oracle cases byte-exact
 against MySQL 8.4, and 7,061 E2E checks passed with 0 failed, 6
 documented-gap warnings and 49 skipped against both MySQL 8.4 and 8.0. The
-commits between `a1e5d532` and the candidate only bank evidence; the engine
+commits between `374d7510` and the candidate only bank evidence; the engine
 crates and the benchmark harness are identical.
 
 ### Deviations from the original procedure
@@ -214,9 +214,9 @@ only.
 
 This evidence was re-run for the 0.1.5 stable release. The baseline is the
 previous stable release, tag `v0.1.4`
-(`477ef1cb24f410075418101fab29a1ec90e86f3d`). The candidate is the 0.1.5
-release tree (`7ce8559c87a4d1eed81cea70d0d6faedacde13d6`). `v0.1.4` was cut
-before the Q05 join change this file first qualified (`b2cb6f5b`) merged, so
+(`a36e18abff0c9344a0dc14d30f159aac081b272e`). The candidate is the 0.1.5
+release tree (`c7fde2b7cb2fdf473340d21c30924645a21899ec`). `v0.1.4` was cut
+before the Q05 join change this file first qualified (`24d5049b`) merged, so
 the baseline still has the old join order. The pair covers that change and
 every other engine change between the two releases. It does not isolate any
 single commit.
@@ -341,10 +341,10 @@ threshold. It is not a cross-revision regression gate.
 ### Release gate
 
 The release chain banked the correctness gate separately; it was not re-run
-here. That stable-profile run at `a6d58102` passed with 1,908 oracle cases
+here. That stable-profile run at `6bf9a853` passed with 1,908 oracle cases
 byte-exact against MySQL 8.4, and 7,015 E2E checks passed with 0 failed, 29
 documented-gap warnings and 44 skipped against both MySQL 8.4 and 8.0. The
-commits between `a6d58102` and the candidate only bank evidence; the engine
+commits between `6bf9a853` and the candidate only bank evidence; the engine
 crates and the benchmark harness are identical.
 
 ### Deviations from the original procedure
@@ -367,9 +367,9 @@ crates and the benchmark harness are identical.
 This section records the change study for the Q05 join fix, before the 0.1.5
 requalification above. Its numbers describe those revisions only.
 
-The baseline executable was built from `26f4c9f2cca79d137b20a3e54072a3550be46234`,
-whose engine sources are identical to its parent `3046f545`. The candidate
-executable was built from `b2cb6f5bea0cb9bdfddae0815da4f11b2773bab3`. Both arms
+The baseline executable was built from `2dc08de1c8f8901544a1e5748e74598faa163bc0`,
+whose engine sources are identical to its parent `28fb8320`. The candidate
+executable was built from `24d5049be12b0dbf92125524d3eb5b7694ec6554`. Both arms
 used a 4 GiB query-memory ceiling, a 4 GiB MySQL buffer pool and the same
 spill settings as above. The measurement host had 16 logical CPUs and 60 GiB
 of RAM, and no competing builds or harnesses ran during it.
@@ -391,14 +391,14 @@ and [target](q05-join-qualification/supplementary-target.json) replays from a
 busier 32-logical-CPU host.
 
 That study's 20M pair ran on a shared 16-logical-CPU, 30 GiB host. It
-compared control checkout `20ef46cc` with candidate checkout `415aaa2c`, and
+compared control checkout `20ef46cc` with candidate checkout `ff0d54be`, and
 measured an 8.2% Q4 median increase. See
 [baseline](q05-join-qualification/eight-query-shared-baseline.json),
 [candidate](q05-join-qualification/eight-query-shared-candidate.json) and
 [load samples](q05-join-qualification/background-load.json). An earlier
 [baseline report](q05-join-qualification/eight-query-baseline.json) is also
 kept. Its final concurrency result was excluded because another oracle
-overlapped it. That study's rc gate passed at `b2cb6f5b`
+overlapped it. That study's rc gate passed at `24d5049b`
 ([report](q05-join-rc.md)).
 
 ## Historical Q05 spill disclosure

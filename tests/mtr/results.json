@@ -5,7 +5,7 @@
   "ref": "99960bf74fa919347e4f4e3ca47672f333d6e91f",
   "mysqlVersion": "8.4.11",
   "provenance": {
-    "sourceCommit": "a1e5d532bdca73079d13ce5068bfbca2a85a8cd2",
+    "sourceCommit": "374d75103eaa8b5bde44918f0e3155ecabf385d2",
     "sourceDirty": false,
     "binarySha256": "d217e0b6d6ed86119658f41ddd8a450a7d0973e0d7f12c5a1ba5b400e005899a"
   },

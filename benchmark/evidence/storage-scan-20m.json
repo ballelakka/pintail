@@ -1,5 +1,5 @@
 {
-  "baseline_engine_commit": "40486955",
+  "baseline_engine_commit": "2428a639",
   "candidate_engine_commit": "70c6cddf",
   "probe_source_commit": "70c6cddf",
   "fixture": {

@@ -2,7 +2,7 @@
 
 Measured 2026-09-30T13:02:16.143Z: `mysql-test/t` from mysql/mysql-server at `99960bf74fa9`, oracle MySQL 8.4.11, 633 files.
 
-Replay mode: local. Source commit: a1e5d532bdca73079d13ce5068bfbca2a85a8cd2; source dirty: false. Binary SHA-256: d217e0b6d6ed86119658f41ddd8a450a7d0973e0d7f12c5a1ba5b400e005899a.
+Replay mode: local. Source commit: 374d75103eaa8b5bde44918f0e3155ecabf385d2; source dirty: false. Binary SHA-256: d217e0b6d6ed86119658f41ddd8a450a7d0973e0d7f12c5a1ba5b400e005899a.
 
 **9,192 of 9,302 compared SELECTs match MySQL byte-for-byte** (98.8%), **out of 23,119 SELECTs replayed** - 13,817 never reached a comparison, so this is a share of what could be compared and not of the suite. 110 differ in rows, 0 in column names only. 5,222 SELECTs Pintail could not run, 6,093 were not compared because their tables were changed by statements a local database cannot follow, 525 failed on MySQL itself, 1,977 depend on the clock, session or server and were not compared. 0 waited past the replication deadline, 0 read unsettled replica tables. Fixtures: 20,224 accepted, 1,173 rejected by Pintail, 18,050 outside the replayed subset.
 

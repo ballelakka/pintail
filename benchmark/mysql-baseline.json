@@ -2,7 +2,7 @@
   "fingerprint": "27f86a7e2a93c60691396a2409b8cc4da20e618abca1d49365fc81f85e00d280",
   "hostFingerprint": "18b29ce7d6d90e2ff3c90e6f3c4410d8f4d06b9f10e59317330ea8d40b0cd640",
   "measuredAt": "2026-09-30T13:16:45.785Z",
-  "gitCommit": "a1e5d532bdca73079d13ce5068bfbca2a85a8cd2",
+  "gitCommit": "374d75103eaa8b5bde44918f0e3155ecabf385d2",
   "queries": {
     "Q1: Full table count": {
       "ms": 740,

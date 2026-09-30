@@ -25,17 +25,17 @@ twenty million rows are roughly 2 GB of source data.
 "Repair" is wall-clock from the parent deletes to the replica matching the
 source; the supervisor rows include waiting for its next five-second
 cycle. The gate row predates the single-stream merge and the plain-ingest
-repair (commits b199dfb and 630d6dd); the first attempt at twenty million
+repair (commits 7a82eaa and 3f1560c); the first attempt at twenty million
 rows with the per-page reopen and the scan ingest had not converged after
 34 minutes. Seeding and snapshotting the twenty million rows took under
 five minutes of each run.
 
 Two bugs surfaced on the way and are fixed in the same series: a
 compacted segment larger than the scan budget was refused instead of
-sliced (8702b15, 05ad1dc), and creating a database dropped the reconcile
+sliced (85bc4bd, 9eb651c), and creating a database dropped the reconcile
 interval it was given, so the supervisor's second pass waited the default
 ten minutes and every early measurement read as six hundred seconds
-(da492ef).
+(390f903).
 
 ## What the numbers say
 

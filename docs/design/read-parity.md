@@ -79,7 +79,7 @@ change comparison rules or remove them to improve the percentage.
 
 ## Verified outcome
 
-The complete rc profile passed at `b0018f48`: all twelve stages, including
+The complete rc profile passed at `d6d107b3`: all twelve stages, including
 both MySQL versions, schema migrations, browser, compose and BI clients.
 The workspace test stage passed 1,245 tests with 56 skipped. E2E stages now
 install locked dependencies and generate their ORM client on a fresh tree.

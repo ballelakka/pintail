@@ -6,15 +6,15 @@ branch's ancestry, not introduce its prototype into the current engine.
 
 ## History that determines the merge
 
-- `experiment/snapshot-throughput` contains `a2b28a9` and `18165c6`.
-- `8029a8f` already brought the experiment onto `dev`. Its stable patch ID
-  matches `a2b28a9` exactly: `8d13d70982f111710539f7635ea0af98f283bd98`.
-- `f6fdf7e` then replaced dedicated worker threads with cancellable tasks,
+- `experiment/snapshot-throughput` contains `feebfac` and `0513c55`.
+- `2c8e704` already brought the experiment onto `dev`. Its stable patch ID
+  matches `feebfac` exactly: `8d13d70982f111710539f7635ea0af98f283bd98`.
+- `59560ea` then replaced dedicated worker threads with cancellable tasks,
   made expanded composite-key seeks the normal path, folded chunk timings
   into debug logging, and moved the experiment under
   `experiments/snapshot-throughput/`.
 - The original branch was 188 commits behind before the handover commit,
-  and 189 behind at `5d5d6e9`. It remained unmerged in Git's ancestry even
+  and 189 behind at `a5dbe95`. It remained unmerged in Git's ancestry even
   though its patch and subsequent refinements were present.
 
 Read `git diff dev...experiment/snapshot-throughput` to see the branch's
@@ -30,7 +30,7 @@ new work.
 
 ## Merge resolution
 
-Merge `cc165c3` (`--no-ff`) reconciles the two original commits with `dev`.
+Merge `279ff97` (`--no-ff`) reconciles the two original commits with `dev`.
 Both `crates/pintail-snapshot/src/lib.rs` and the independently added
 `crates/pintail-snapshot/examples/throughput.rs` had conflicts.
 
@@ -43,7 +43,7 @@ The merge does not resurrect `benchmark/snapshot-throughput.py`, the old
 `benchmark/snapshot-throughput/` evidence directory, or
 `docs/experiments/snapshot-throughput.md`. The current harness and writeup
 already live at the paths below. All five incoming evidence files,
-including `18165c6`'s development validation report, match their current
+including `0513c55`'s development validation report, match their current
 copies byte-for-byte.
 
 - [Current experiment writeup](../../experiments/snapshot-throughput/README.md)
@@ -55,7 +55,7 @@ copies byte-for-byte.
 
 ## Defaults already in effect
 
-There is no new defaults decision in this reconciliation. `f6fdf7e` already
+There is no new defaults decision in this reconciliation. `59560ea` already
 removed the three prototype switches:
 
 - Snapshot workers use the existing runtime's `JoinSet`; conversion and
@@ -89,7 +89,7 @@ rows. The historical development report alone is not an RC gate.
 
 ## Verification for this reconciliation
 
-Completed on merge commit `cc165c3`:
+Completed on merge commit `279ff97`:
 
 - `cargo clippy -p pintail-snapshot --all-targets -- -D warnings`: PASS.
 - `cargo test -p pintail-snapshot --lib`: all six tests PASS.

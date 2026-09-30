@@ -30,7 +30,7 @@ SELECT ROUND(CAST(50.00 AS DECIMAL(4,2)) + 0.00, -2);
 MySQL returns `100`; Pintail returned floating-point `0`. SQL represents `-2`
 as unary minus over literal `2`, but the binder recognized only a bare positive
 literal as a fixed digit count. Exact DECIMAL therefore fell through to the
-approximate nearest-even path. Commit `dd440ba` recognizes signed constant
+approximate nearest-even path. Commit `3924112` recognizes signed constant
 expressions, retains exact half-away-from-zero rounding, and adds positive and
 negative tie regressions plus exact TRUNCATE coverage.
 
@@ -42,15 +42,15 @@ SELECT ROUND(CAST(949.86 AS DECIMAL(5,2)) + 0.00, -2);
 ```
 
 Pintail returned `1000`; MySQL returns `900`. The exact path rounded to scale
-zero first (`949.86 → 950`) and then rounded hundreds. Commit `0fe300c` rounds
-the original scaled units once, and commit `66efc0a` permanently adds `949.86`
+zero first (`949.86 → 950`) and then rounded hundreds. Commit `7821946` rounds
+the original scaled units once, and commit `868292b` permanently adds `949.86`
 to the generated fixture. The final 2,500-case confirmation above and both
 164-query MySQL 8.4/8.0 E2E ledgers pass with the boundary present.
 
 The MySQL 8.0 fixed-corpus run also exposed an invalid oracle assumption:
 case-insensitive `INTERSECT` chose `alpha` as its representative where 8.4 and
 Pintail chose `Alpha`. Both are collated-equal and MySQL does not define the
-representative spelling. Commit `981e0d1` folds the projected key with `UPPER`,
+representative spelling. Commit `ee35821` folds the projected key with `UPPER`,
 so the case now tests set membership rather than version-specific scan order.
 
 ## Boundary

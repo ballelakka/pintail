@@ -6,11 +6,11 @@ MySQL oracle byte-exact at every step.
 
 ## Where the gap is
 
-Source: a corpus run at 5256ec63 (before the per-query-cost and correlated
+Source: a corpus run at b47ac948 (before the per-query-cost and correlated
 fixes). [`benchmark/corpus/results.csv`](../../benchmark/corpus/results.csv)
-holds the newest run - the closing one, at 56e254b5; the traced baseline
-this program's progress is measured against, at a2c22194, is that file at
-commit 75f9968f.
+holds the newest run - the closing one, at b911b8e8; the traced baseline
+this program's progress is measured against, at d2aafaac, is that file at
+commit abed1f1a.
 
 | | Scale 1 | Scale 10,000 |
 |---|---:|---:|
@@ -130,7 +130,7 @@ program and gets its own gate and live-CDC coverage.
 
 ## Progress
 
-Closed at 56e254b5. Measured against the traced baseline at a2c22194,
+Closed at b911b8e8. Measured against the traced baseline at d2aafaac,
 over the same 1,895 cases on the same idle host:
 
 | | Scale 1 | Scale 10,000 |
@@ -149,7 +149,7 @@ copies produce, which MySQL leaves unspecified, and they are the same
 cases as before this program.
 
 - [x] Phase 0 — per-query trace (`PINTAIL_QUERY_TRACE`) and the traced
-  baseline at a2c22194, banked at 75f9968f. At scale 1 the
+  baseline at d2aafaac, banked at abed1f1a. At scale 1 the
   server-side time splits into freshness checks and short-query
   classification (about half), then execution, session handling, binding,
   parsing and plan start.

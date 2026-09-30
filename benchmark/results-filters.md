@@ -1,6 +1,6 @@
 # Filter-level benchmark: Pintail against MySQL
 
-Measured 2026-09-10T10:18:39.068Z at `47cfd1e5` with 20,000,000 rows.
+Measured 2026-09-10T10:18:39.068Z at `82d9eac5` with 20,000,000 rows.
 
 Both engines run on the docker host under identical limits (8 CPUs, 8 GB). MySQL 8.4
 has a 4 GB buffer pool and secondary indexes on `created_at`, `scheduled_at`,

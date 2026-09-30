@@ -23,19 +23,19 @@ The July engine-research reports and existing experiments already investigate ty
 execution, caching, buffer recycling, and compression. Repeating those proposals
 without checking adoption would not identify new work.
 
-- `0486c3d` retains packed predicate survivors; `d6cf654` folds packed aggregate
-  lanes; `1385555` batches the dense aggregate window. Keep these fast paths.
-- `607c855` finalizes join builds into dense tables. The current
+- `8418e0e` retains packed predicate survivors; `6013237` folds packed aggregate
+  lanes; `870d2d9` batches the dense aggregate window. Keep these fast paths.
+- `1e00431` finalizes join builds into dense tables. The current
   [join payload](../../crates/pintail-exec/src/execution/join.rs) still contains
   `HashMap<JoinHashKey, Vec<Vec<Value>>>`. The experiment isolates payload
   storage, not hash-table design, partition selection, or the whole join.
-- `81f0787` added dependent subquery memoization. Its
+- `33e5d10` added dependent subquery memoization. Its
   [memo entries](../../crates/pintail-exec/src/execution/memo.rs) still own
   vector keys and results. Frozen payloads are a possible second target, with
   the existing query budget and volatile-expression exclusions preserved.
 - [#12](https://github.com/chittihq/pintail/issues/12) is closed: bounded
-  spilling exists. Recent spill changes include `4cdacd2`, `95ace90`, and
-  `be93b79`. Compact payloads should reduce pressure on those paths, not
+  spilling exists. Recent spill changes include `4381383`, `8b2c0a0`, and
+  `1bb67f1`. Compact payloads should reduce pressure on those paths, not
   bypass reservation, disk quotas, or skew handling.
 - [#27](https://github.com/chittihq/pintail/issues/27) is closed: adaptive
   per-block compression was adopted after cross-target evidence. Global

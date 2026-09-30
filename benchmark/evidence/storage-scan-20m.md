@@ -24,7 +24,7 @@ arithmetic aggregate shows no material improvement.
 - Warm OS page cache. Both binaries read the same persisted files; seeding
   occurs in a separate process and is excluded from query measurements.
 - Identical probe sources from `70c6cddf` for both binaries. Baseline engine:
-  `40486955`; candidate engine: `70c6cddf` (the runtime changes are `2b8175a8`
+  `2428a639`; candidate engine: `70c6cddf` (the runtime changes are `2b8175a8`
   and `d421aba9`). Release builds, rustc/cargo 1.97.0, Linux x86_64.
 - Three process pairs, ordered baseline/candidate, candidate/baseline,
   baseline/candidate. Each process performs two warmups and three measured

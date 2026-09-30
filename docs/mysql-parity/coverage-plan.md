@@ -4,7 +4,7 @@ Proposed on 2026-09-09 after reviewing the MySQL 8.4 Reference Manual and the
 existing corpus, parity ledger, and limitations. This is a testing plan, not
 an expansion of the product's supported scope.
 
-The corpus at `2794303` contains 1,373 MySQL-valid queries. The latest run
+The corpus at `b610ce1` contains 1,373 MySQL-valid queries. The latest run
 matched 1,368 and failed five cases: empty-subquery membership with NULL,
 decimal BETWEEN, enum numeric comparison, enum casts/arithmetic, and a string
 boundary query containing both SUBSTRING and LPAD differences. These are

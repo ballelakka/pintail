@@ -1,6 +1,6 @@
 # Snapshot throughput experiment
 
-An isolated experiment based on commit `d267f05fead0af30d50a7f16162d3088c329be68`.
+An isolated experiment based on commit `93a2e648ec393de379e7f9b8d31e7bb25a824749`.
 No deployment or production dataset was used. All edits, builds, MySQL queries,
 and measurements ran on one Linux machine with 16 logical CPUs, about 61 GiB RAM,
 and NVMe storage. Rust 1.97.0, release profile, MySQL 8.4.11, 4 GiB source buffer pool.
@@ -91,7 +91,7 @@ was quiescent; concurrent DDL, live CDC overlap and process-kill recovery were n
 exercised by these experiments.
 
 The six snapshot unit tests and touched-crate clippy passed. Full development
-validation passed at code commit `a2b28a9`: formatting, workspace clippy, dashboard
+validation passed at code commit `feebfac`: formatting, workspace clippy, dashboard
 type checking, and workspace unit tests. The full result is banked in
 `evidence/validation.md`. This is not an rc/stable gate.
 

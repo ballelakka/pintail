@@ -234,7 +234,7 @@ coalesce misses for one validity token and reuse completed results while that
 token remains valid. That combination has not been measured here.
 
 The engine has evolved after the archived base. Rebase any integration onto
-current behavior and remeasure: these numbers belong to `73303d2` plus the
+current behavior and remeasure: these numbers belong to `a04e692` plus the
 recorded standalone sources, not subsequent engine commits.
 
 Raw corrected readings: [raw.jsonl](evidence/raw.jsonl),

@@ -1,5 +1,5 @@
 {
-  "base_commit": "1562ab5193d8bb9b35f634c7d8d1523467b683ea",
+  "base_commit": "62b7ed36952405569bc218995023ad8cb7fc48fc",
   "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
   "machine": "x86_64",
   "logical_cpus": 32,

@@ -1,6 +1,6 @@
 {
-  "baseline": "3d291477e81ceb1920a4bd9ff85c996c00c19dc1",
-  "candidate": "05a199a2e483df5979221214de4c5ebc9645f08b",
+  "baseline": "2d328f8e2ed5681c0189607cbea424867faa869b",
+  "candidate": "8b343370ca9741b94d04012c88ffdd6dd330e24e",
   "requalification": {
     "kind": "release requalification: previous stable release (baseline) against the 0.1.6 release tree (candidate)",
     "baseline_tag": "v0.1.5",
@@ -109,7 +109,7 @@
   "rc": {
     "status": "PASS",
     "run": "release chain validation for 0.1.6",
-    "head": "a1e5d532bdca73079d13ce5068bfbca2a85a8cd2",
+    "head": "374d75103eaa8b5bde44918f0e3155ecabf385d2",
     "engine_identical_to_candidate": true,
     "oracle_queries": 1948,
     "e2e_84": {
@@ -132,8 +132,8 @@
       "products": 10000,
       "orders": 20000000
     },
-    "baseline_checkout": "3d291477",
-    "candidate_checkout": "05a199a2",
+    "baseline_checkout": "2d328f8e",
+    "candidate_checkout": "8b343370",
     "host_fingerprint": "61c4f1848366b99c582568f821e2bb98347792118151cfa135cb1bb85ce6b63e",
     "host_fingerprint_matches_baseline_run": true,
     "logical_cpus": 8,
@@ -855,8 +855,8 @@
   },
   "previous_requalifications": {
     "0.1.5": {
-      "baseline": "477ef1cb24f410075418101fab29a1ec90e86f3d",
-      "candidate": "7ce8559c87a4d1eed81cea70d0d6faedacde13d6",
+      "baseline": "a36e18abff0c9344a0dc14d30f159aac081b272e",
+      "candidate": "c7fde2b7cb2fdf473340d21c30924645a21899ec",
       "requalification": {
         "kind": "release requalification: previous stable release (baseline) against the 0.1.5 release tree (candidate)",
         "baseline_tag": "v0.1.4",
@@ -875,7 +875,7 @@
         "note": "Same generator and parameters as the original study. segment_bytes is this run's whole fixture directory total (segments, manifest and WAL); the original study recorded 1,509,148,456."
       },
       "probe_sources": {
-        "baseline": "storage_adversarial_probe, storage_scan_probe and storage_query_probe as of 26f4c9f2 (the original probe revision), copied into the v0.1.4 checkout; the store API at v0.1.4 predates the range type the current examples use.",
+        "baseline": "storage_adversarial_probe, storage_scan_probe and storage_query_probe as of 2dc08de1 (the original probe revision), copied into the v0.1.4 checkout; the store API at v0.1.4 predates the range type the current examples use.",
         "candidate": "The same three examples as they exist in the candidate tree. The only source difference is the predicate-range return type (Vec<Range> versus the newer range wrapper); fixtures, predicates, projections and checks are identical."
       },
       "comparison": {
@@ -965,7 +965,7 @@
         "status": "PASS",
         "profile": "stable (heavy stages)",
         "run": "2026-09-25T17-35-18-368Z-stable",
-        "head": "a6d5810257493274c5eb2549a9b16da42188a8ab",
+        "head": "6bf9a853581852a13eeb7c19084654c38311633f",
         "engine_identical_to_candidate": true,
         "oracle_queries": 1908,
         "e2e_84": {
@@ -1516,8 +1516,8 @@
     }
   },
   "historical": {
-    "baseline": "b019dae22463783c574352e472d4abc3c75f1e30",
-    "candidate": "26f4c9f2cca79d137b20a3e54072a3550be46234",
+    "baseline": "a05e9e547357908e19fda43f85af6307c13de786",
+    "candidate": "2dc08de1c8f8901544a1e5748e74598faa163bc0",
     "fixture": {
       "rows": 20000000,
       "batch_rows": 524288,
@@ -1614,7 +1614,7 @@
       "status": "PASS",
       "profile": "rc",
       "run": "2026-09-09T18-23-08-345Z-rc",
-      "head": "26f4c9f2cca79d137b20a3e54072a3550be46234",
+      "head": "2dc08de1c8f8901544a1e5748e74598faa163bc0",
       "oracle_queries": 1231,
       "unit_passed": 1034,
       "unit_skipped": 43,

@@ -12,7 +12,7 @@ memo off.
 | Pintail ÷ ClickHouse | 2.4× faster | 3.44× slower |
 | Pintail failures where MySQL answered | 3 | 50 (37 timeouts, 13 errors) |
 
-The rerun on `dev` at 5256ec63, after items 1 to 8, on an idle docker host:
+The rerun on `dev` at b47ac948, after items 1 to 8, on an idle docker host:
 Pintail ÷ MySQL 2.29× and 2.79× slower, Pintail ÷ ClickHouse 2.4× faster
 and 3.37× slower. Pintail fails 0 and 4 cases where MySQL answers, and
 answers 12 at scale 10,000 that MySQL times out on.
@@ -48,7 +48,7 @@ first, then the fix, clippy and the touched crates' unit tests, and a commit.
 4. [ ] **Joins MySQL answers.** Remove the cross-join safety estimate (10
    refusals) and fix the theta, null-safe and quantified-subquery join
    timeouts (most of 37). Fold in join-proof.
-   Done: the estimate is gone (c3ff1de6), and constant ON conjuncts,
+   Done: the estimate is gone (38f751d4), and constant ON conjuncts,
    exact-decimal IN keys, self-join and null-safe EXISTS decorrelation and
    the anti join's first-match stop cleared 16 of the 19 join and
    subquery timeouts at scale 10,000. On `perf/correlated-leftovers`, a
@@ -88,7 +88,7 @@ first, then the fix, clippy and the touched crates' unit tests, and a commit.
    (`GROUP_CONCAT`, `JSON_ARRAYAGG` and `JSON_OBJECTAGG` without
    `ORDER BY`, and `ROW_NUMBER`, `FIRST_VALUE` and `LAST_VALUE` over tied
    sort keys). The one real difference was a DOUBLE printed without
-   MySQL's exponent notation (`POW` over large ids), fixed in 565ff396.
+   MySQL's exponent notation (`POW` over large ids), fixed in 3e9f0b3b.
 8. [x] **Parity gaps.** `CASE` decimal branch scale, `GROUP BY` with a
    trailing no-break space, DECIMAL wider than 38 digits.
 9. [x] **Lifecycle replay.** Rerun `tests/e2e/parity-replay.ts`; 33 wire and
@@ -107,5 +107,5 @@ first, then the fix, clippy and the touched crates' unit tests, and a commit.
    MINIMAL:FULL scope boundary.
 10. [x] **Gate and remeasure.** Full rc gate on the branch, merge to `dev`,
    rerun the corpus benchmark and commit the CSV. The gate passed at
-   d787d3a6, the branch merged as 5256ec63, and the rerun's CSV is
-   3bc2054b.
+   5212f9f3, the branch merged as b47ac948, and the rerun's CSV is
+   bb76943a.

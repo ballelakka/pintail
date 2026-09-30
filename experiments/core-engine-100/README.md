@@ -3,7 +3,7 @@
 Status: the 100-approach changing-data screen and independent confirmations are
 complete. [Results and resource failures](RESULTS.md) include native SQL follow-ups
 and transactional MySQL checks. No production engine path is changed. The measured
-engine base is `51665c5`; each evidence directory records its experiment commit.
+engine base is `9b48bce`; each evidence directory records its experiment commit.
 
 Workloads, in execution order:
 1. Filter and project a columnar scan.
@@ -94,7 +94,7 @@ The other nine cases consume the already resolved current snapshot. The join's
 small side is a mutable subset of the same source table, so mutations can change
 both join inputs and duplicate multiplicity.
 
-The source base was advanced to `51665c5` before timed runs to include the newly
+The source base was advanced to `9b48bce` before timed runs to include the newly
 landed overlapping-pair compaction fix. Builds and measurements use an isolated
 checkout; `provenance.json` records actual source/binary hashes and the measurement
 commit. The experiment lockfile is independent of the release lockfile.

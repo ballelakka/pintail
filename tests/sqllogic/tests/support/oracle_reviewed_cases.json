@@ -1,7 +1,7 @@
 {
   "fixtureSha256": "93cafb85b926dd15179737d4ce535a0df2831bd7a79c8e8afc0bee5eddfbb101",
   "provenance": {
-    "commit": "2794303b8aadee63ab7c0f667e57a9e242a7d6b1",
+    "commit": "b610ce1ee36e7c6246ebea911d0b76d738c6ebf3",
     "fixtureSha256": "93cafb85b926dd15179737d4ce535a0df2831bd7a79c8e8afc0bee5eddfbb101",
     "image": "mysql@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb",
     "session": {

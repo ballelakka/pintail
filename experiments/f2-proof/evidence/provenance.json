@@ -1,5 +1,5 @@
 {
-  "head": "84a5fa2480799637571f058a7c228e69e3ec8238",
+  "head": "672cc96fefef48590bac18fc9ee8fa3d2f063c0f",
   "binary_sha256": "cb2ca3465f75aa315d50bd679e55f756ca70e5ae549c460d40dd70c5e473dd44",
   "source_sha256": {
     "crates/pintail/src/config.rs": "355e17b69b38a571a293fe4053423c57b4e956b0ad38f282b86740324c58af7e",

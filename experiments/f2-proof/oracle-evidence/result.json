@@ -1,7 +1,7 @@
 {
   "mysql_version": "8.4.11",
   "image": "sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb",
-  "head": "84a5fa2480799637571f058a7c228e69e3ec8238",
+  "head": "672cc96fefef48590bac18fc9ee8fa3d2f063c0f",
   "proof_binary_sha256": "cb2ca3465f75aa315d50bd679e55f756ca70e5ae549c460d40dd70c5e473dd44",
   "checks": [
     {

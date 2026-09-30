@@ -10,8 +10,8 @@ storage work.
 
 This evidence was re-run for the 0.1.6 stable release. The baseline is the
 previous stable release, tag `v0.1.5` (commit
-`3d291477e81ceb1920a4bd9ff85c996c00c19dc1`). The candidate is the 0.1.6
-release tree (`05a199a2e483df5979221214de4c5ebc9645f08b`). Both releases
+`2d328f8e2ed5681c0189607cbea424867faa869b`). The candidate is the 0.1.6
+release tree (`8b343370ca9741b94d04012c88ffdd6dd330e24e`). Both releases
 contain this change and the later Q05 join change, so the pair measures what
 every other engine change between the two releases did to them. That
 includes the 0.1.6 storage work: the segment side index, turned on by
@@ -168,9 +168,9 @@ are in the Q05 raw directory:
 ### Release gate
 
 The release chain banked the correctness gate separately; it was not re-run
-here. Its validation at `a1e5d532` passed all stages, including 1,948 oracle
+here. Its validation at `374d7510` passed all stages, including 1,948 oracle
 cases byte-exact against MySQL 8.4 and 7,061 E2E checks with 0 failures (6
-warnings, 49 skipped) on MySQL 8.4 and 8.0. Commits after `a1e5d532` up to the
+warnings, 49 skipped) on MySQL 8.4 and 8.0. Commits after `374d7510` up to the
 candidate only bank evidence.
 
 ### Deviations from the original procedure
@@ -209,10 +209,10 @@ only.
 
 This evidence was re-run for the 0.1.5 stable release. The baseline is the
 previous stable release, tag `v0.1.4`
-(`477ef1cb24f410075418101fab29a1ec90e86f3d`). The candidate is the 0.1.5
-release tree (`7ce8559c87a4d1eed81cea70d0d6faedacde13d6`). `v0.1.4` branched
-from `b019dae2`, which is this change's original baseline, and contains
-neither this change (`26f4c9f2`) nor the later Q05 join change. The pair
+(`a36e18abff0c9344a0dc14d30f159aac081b272e`). The candidate is the 0.1.5
+release tree (`c7fde2b7cb2fdf473340d21c30924645a21899ec`). `v0.1.4` branched
+from `a05e9e54`, which is this change's original baseline, and contains
+neither this change (`2dc08de1`) nor the later Q05 join change. The pair
 therefore spans both changes and every other engine change between the two
 releases.
 
@@ -267,7 +267,7 @@ so they must not be read as a percentage of the fixture's blocks.
 
 **Probe source.** The `v0.1.4` store API predates the range wrapper that the
 current examples return. The baseline therefore used the probe sources as of
-`26f4c9f2`, the original probe revision, copied into the `v0.1.4` checkout
+`2dc08de1`, the original probe revision, copied into the `v0.1.4` checkout
 and removed after the build. The candidate used the examples in its own tree.
 The only difference between the two sources is the return type of the
 predicate range. The fixture, predicates, projections and checks are
@@ -379,10 +379,10 @@ in the Q05 raw directory:
 ### Release gate
 
 The release chain banked the correctness gate separately; it was not re-run
-here. The stable-profile run at `a6d58102` passed all stages, including 1,908
+here. The stable-profile run at `6bf9a853` passed all stages, including 1,908
 oracle cases byte-exact against MySQL 8.4 and 7,015 E2E checks with 0
 failures (29 warnings, 44 skipped) on MySQL 8.4 and 8.0. Commits after
-`a6d58102` up to the candidate only bank evidence.
+`6bf9a853` up to the candidate only bank evidence.
 
 ### Deviations from the original procedure
 
@@ -390,7 +390,7 @@ failures (29 warnings, 44 skipped) on MySQL 8.4 and 8.0. Commits after
   change with its parent.
 - The probes and Pintail ran on a 32-logical-CPU build host, and neither host
   was idle.
-- The baseline probe sources are the `26f4c9f2` versions, unmodified;
+- The baseline probe sources are the `2dc08de1` versions, unmodified;
   the candidate's differ only in the range return type.
 - A watcher outside the repository set the TPC-H buffer pool; it was confirmed
   on every pass.
@@ -398,7 +398,7 @@ failures (29 warnings, 44 skipped) on MySQL 8.4 and 8.0. Commits after
 ## Historical: original change qualification (superseded)
 
 This section records the change study at candidate
-`26f4c9f2cca79d137b20a3e54072a3550be46234` against baseline `b019dae2`,
+`2dc08de1c8f8901544a1e5748e74598faa163bc0` against baseline `a05e9e54`,
 before the 0.1.5 requalification. Its numbers describe those revisions only.
 It ran on an idle 16-logical-CPU measurement machine.
 
@@ -417,7 +417,7 @@ It ran on an idle 16-logical-CPU measurement machine.
   `storage-scan-qualification/eight-query-{baseline,candidate}.json`. One
   earlier baseline attempt was discarded after a separate native benchmark
   started during its timed queries.
-- The rc gate passed at `26f4c9f2` ([report](storage-scan-rc.md)).
+- The rc gate passed at `2dc08de1` ([report](storage-scan-rc.md)).
 
 **Capacity disclosure (historical, still true of `v0.1.4`).** The unchanged
 baseline failed Q05 with the default 1 GiB query spill quota. That

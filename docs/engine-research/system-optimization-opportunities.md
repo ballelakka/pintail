@@ -1,6 +1,6 @@
 # System optimization opportunities from engineering blogs
 
-Research date: 2026-09-07. Code inspected across `ce240a0`–`b72db77` while
+Research date: 2026-09-07. Code inspected across `2e319db`–`03c9dcc` while
 independent work continued in this checkout. These are proposals, not engine
 changes or measured Pintail speedups. This expands beyond allocation layout.
 

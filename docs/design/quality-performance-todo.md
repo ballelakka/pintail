@@ -113,7 +113,7 @@ serialized and uses only containers created by this repository's harnesses.
   by cancellation and preserves readable diagnostics. Eight benchmark unit
   tests and strict TypeScript checking pass.
 
-- Final resumed measurement at `bcafb06`: the 20-million-order benchmark
+- Final resumed measurement at `804dc27`: the 20-million-order benchmark
   passed all 20 query comparisons against MySQL across repeated, novel and
   memo-disabled tracks. Both engines recorded zero concurrency errors at
   1/4/8/16 clients. Acceptance passed all 24 query outcomes (12 queries on
@@ -143,10 +143,10 @@ serialized and uses only containers created by this repository's harnesses.
    both E2E legs and the oracle evidence. No tag is requested.
 
 The complete rc profile **passed** in one invocation at clean source commit
-`5c295ec2629fdd16887242b9790695a494304df7`, from
+`dc647681354d6877394c43fb81990c284a290581`, from
 2026-09-05T21:02:14Z to 2026-09-05T21:24:07Z (about 22 minutes):
 `bun run scripts/validate.ts --profile rc`. The E2E and oracle artifacts are
-banked together in `01d689e`; the completeness ledger links that bank.
+banked together in `2b7346b`; the completeness ledger links that bank.
 
 | Stage | Result |
 |---|---|
@@ -195,7 +195,7 @@ raced a replication cycle for its job slot. The harness now uses its bounded
 cycle can finish. This attempt is not claimed as a profile PASS.
 
 
-The next rc attempt at `ae0329b` passed both E2E legs, including every
+The next rc attempt at `ebe3028` passed both E2E legs, including every
 restart-during-resync assertion, but the browser gate exposed another harness
 race. Its Reset check accepted a queued toast plus the old streaming badge as
 completion, allowing the next Resync check to overlap the pending Reset. The

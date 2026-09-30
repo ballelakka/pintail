@@ -12,7 +12,7 @@ across the whole key range and flushed: one newer segment overlapping every
 base segment, which is the shape a replicated table keeps while its source
 is written to.
 
-| Filter | Before (`8312adf8`) | After (`4af9901b`) |
+| Filter | Before (`f0402f8d`) | After (`d6a400f1`) |
 |---|---:|---:|
 | One day: `COUNT(*)`, `SUM(amount)` | 21,671 ms | 1,156 ms |
 | One day: newest 50 rows | 25,857 ms | 1,480 ms |

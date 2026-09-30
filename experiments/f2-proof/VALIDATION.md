@@ -1,6 +1,6 @@
 # Validation
 
-Final development profile passed on committed source `df68ed2`:
+Final development profile passed on committed source `0d60fbf`:
 
 `bun run scripts/validate.ts --profile development`
 

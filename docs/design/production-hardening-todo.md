@@ -31,7 +31,7 @@ per-query ceiling and a 9 GiB shared budget.
 
 - [x] **B1. The container shipped a desktop descriptor limit.** Docker's
   default soft limit is 1024. `docker-compose.yml` set no `ulimits`, so the
-  shipped deployment ran a columnar engine under it. Fixed in `f394111`
+  shipped deployment ran a columnar engine under it. Fixed in `df09851`
   and recorded in `docs/limitations.md`. Reaches a deployment only on its
   next redeploy. The review found that fix incomplete: `scripts/install.sh`
   generates its own compose file, which also had no `ulimits`, and a
@@ -397,7 +397,7 @@ prints.
   Verification: all 15 `decimal_average_exactness` tests pass, including
   the formerly ignored reproduction; executor/store suites and workspace
   clippy pass. RC run `2026-09-08T16-39-19-997Z-rc` passed all nine stages
-  at `bbc456f`. Three complete e2e passes per MySQL version (8.4 and 8.0)
+  at `cfd7491`. Three complete e2e passes per MySQL version (8.4 and 8.0)
   each recorded 5,446 passes and zero failures, with the existing
   documented warnings and skips. The final ledgers are banked in
   `tests/e2e/results.md` and `tests/e2e/results-mysql80.md`.
@@ -487,7 +487,7 @@ G2 and G3 above are their own brief; this section is everything else the
   retire it to the retained-data state at probe time).
 - Capped exponential backoff with jitter for pending keyless copy retries.
 - `docs/design/quality-performance-todo.md` item 4: the instruction gate
-  never passed in CI until `3b12ba5`.
+  never passed in CI until `596afe8`.
 - A source whose binlog retention is shorter than a full snapshot takes
   will resnapshot in a loop. Unrelated to these three failures, and a
   deployment note rather than an engine defect.

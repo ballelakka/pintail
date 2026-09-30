@@ -89,7 +89,7 @@ the core runner passed 22 SQL/spill tests, 180 storage/fault tests and seven
 reuse prototype tests. The SQL runner passed the fixed MySQL 8.4 corpus,
 40 generated comparisons (40 unique SQL, zero skips), and 94 equivalence
 comparisons over 20 generated bases (zero skips). Core evidence names
-`3d31c63`; the subsequent SQL smoke names `7ddae3f`.
+`9663b6e`; the subsequent SQL smoke names `f6feeb3`.
 
 These are local harness-validation results on the authorized build machine,
 not a completed GitHub Actions release matrix. The 8.0 leg, full generated

@@ -11690,7 +11690,7 @@
     }
   ],
   "cleanTree": true,
-  "commit": "a1e5d532bdca73079d13ce5068bfbca2a85a8cd2",
+  "commit": "374d75103eaa8b5bde44918f0e3155ecabf385d2",
   "comparator": "typed NULL and bytes; approximate types on both sides only: tolerance 16 * f64::EPSILON * max(1, abs(actual), abs(expected)); ordered rows compared in order, otherwise as bags",
   "corpusSha256": "d3f5c2aa1e543128b465f53cc5c9f3e359a1b979fa6d4a4aae75cf2204d9ff88",
   "expectedCases": 1948,

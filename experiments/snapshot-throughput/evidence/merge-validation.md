@@ -3,7 +3,7 @@
 Verdict: **PASS**
 Profile: **rc** — complete
 Claim when complete: rc correctness gates passed, on both MySQL majors the release claims to cover
-HEAD: cc165c3 merge(snapshot): reconcile throughput experiment ancestry — clean tree
+HEAD: 279ff97 merge(snapshot): reconcile throughput experiment ancestry — clean tree
 Toolchain: rustc 1.97.0 (2d8144b78 2026-07-07), cargo 1.97.0 (c980f4866 2026-06-30), bun 1.3.14
 Requested stages: fmt, typecheck, unit, oracle, e2e, e2e-mysql80, browser, compose, bi-clients
 Stages not requested: freshness (runs after banking, in the release chain's closing pass), recovery, soak (opt-in: hours, by design), memsoak (opt-in: hours, by design), bench, accept

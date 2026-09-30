@@ -2130,7 +2130,7 @@ the query would see — the same gap already observed between the profiling
 harness and the server benchmark.
 
 DIRECTLY ACTIONABLE: the engine stores date units as Vec<i64> (days since epoch
-needs 16 bits) and, after e3f4cbc, decimal units as i64 (a DECIMAL(10,2) of
+needs 16 bits) and, after bab4035, decimal units as i64 (a DECIMAL(10,2) of
 cents needs 32). Narrowing those carriers to 32-bit is the same change that
 already paid when decimals went i128 to i64, applied one step further, and this
 says it is worth about 1.7x on the aggregate loop at production thread counts.
@@ -2409,14 +2409,14 @@ two-pass paths are unchanged within the host's noise.
 ## e67 — Historical memory and concurrent-query screening (2M rows, memo off)
 
 **Verdict: keep the findings and compact evidence; discard the experiment
-code.** These measurements were taken on `d267f05`, before the chunk-capacity
-fix (`73dc0fa`) and morsel aggregation (`abb79e2`). The fused-workspace finding
+code.** These measurements were taken on `93a2e64`, before the chunk-capacity
+fix (`2f4e633`) and morsel aggregation (`b69fef1`). The fused-workspace finding
 is already fixed unconditionally on `dev`; the experimental alternative adds
 nothing to that implementation. No engine switches, Python harness, separate
 validation image, or compressed raw request stream land with this entry.
 
 **Every RSS comparison below is historical.** The measured tree still had the
-sliced-prefix capacity retention defect fixed by `73dc0fa`. In particular, the
+sliced-prefix capacity retention defect fixed by `2f4e633`. In particular, the
 4.88 GB prefix-consumption result cannot establish a cost of prefix consumption
 on current `dev`. Re-measure on the corrected engine before using any of these
 memory, throughput, or latency observations to choose a policy. This entry makes
@@ -2449,7 +2449,7 @@ or increased failure rate. No candidate met every criterion.
 The old fused join aggregate requested 620,800,000 bytes of local workspace
 despite having only 100 build-side groups. The experimental candidate estimated
 workspace from the known groups with allocation headroom. On current `dev`,
-`abb79e2` instead reserves per-morsel, per-plan-group storage based on what the
+`b69fef1` instead reserves per-morsel, per-plan-group storage based on what the
 builder allocates, with a per-row allowance for growing states. The old
 env-gated estimate and its regression test are not part of this change.
 
@@ -3848,7 +3848,7 @@ so it needs a measurement rather than another guess.
 
 ## e95 — G14 confirmed, by gating a branch that predates its fix
 
-The `AVG`-on-decimal defect was guarded in `ab69a20` without ever being
+The `AVG`-on-decimal defect was guarded in `a3cc711` without ever being
 reproduced: eight in-process arms - every shape, magnitude, group count and
 live-row mix a hand-built catalog can produce, plus four non-terminating
 quotients whose answers came from MySQL 8.4 - all took the exact lane and
