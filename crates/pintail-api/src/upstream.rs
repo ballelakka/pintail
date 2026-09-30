@@ -22,7 +22,7 @@ use axum::{
 use chrono::Utc;
 use mysql_async::Pool;
 use pintail_meta::{DatabaseRecord, DatabaseUpdate, TableRecord};
-use pintail_probe::{ProbeReport, SourceTable, probe};
+use pintail_probe::{ProbeReport, RowCounts, SourceTable, probe_with};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -540,7 +540,9 @@ async fn probe_source(state: &ApiState, record: &DatabaseRecord) -> Result<Probe
     let opts = crate::dsn::source_opts(&dsn)
         .map_err(|error| ApiError::bad_request(format!("invalid MySQL DSN: {error}")))?;
     let pool = Pool::new(opts);
-    let report = probe(&pool, &record.name).await;
+    // Listing and adding need names and shapes; the counts shown are the
+    // source's own estimates, never a `COUNT(*)` of every table.
+    let report = probe_with(&pool, &record.name, RowCounts::Estimated).await;
     let _ = pool.disconnect().await;
     report.map_err(|error| ApiError::unavailable(format!("could not probe the source: {error}")))
 }

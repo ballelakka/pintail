@@ -564,13 +564,40 @@ async fn count_if_budget_remains(
     counted
 }
 
-/// Probes one database through a real `mysql_async` connection.
+/// How a probe fills each table's row count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowCounts {
+    /// `COUNT(*)` each table inside the probe's budget, falling back to the
+    /// storage engine's estimate once the budget runs out.
+    Exact,
+    /// Take `information_schema.TABLES.TABLE_ROWS` only. `COUNT(*)` on
+    /// `InnoDB` scans an index end to end, so a probe that only needs the
+    /// table list and shapes - listing what the source has, or checking
+    /// for drift on a cadence - must not pay it on every table every time.
+    Estimated,
+}
+
+/// Probes one database through a real `mysql_async` connection, counting
+/// each table exactly within the probe's budget.
+///
+/// # Errors
+///
+/// Returns a protocol error or rejects inconsistent source metadata.
+pub async fn probe(pool: &Pool, database: &str) -> Result<ProbeReport, ProbeError> {
+    probe_with(pool, database, RowCounts::Exact).await
+}
+
+/// Probes one database, filling row counts as `counts` says.
 ///
 /// # Errors
 ///
 /// Returns a protocol error or rejects inconsistent source metadata.
 #[allow(clippy::too_many_lines)] // one linear walk: identity, then table by table
-pub async fn probe(pool: &Pool, database: &str) -> Result<ProbeReport, ProbeError> {
+pub async fn probe_with(
+    pool: &Pool,
+    database: &str,
+    counts: RowCounts,
+) -> Result<ProbeReport, ProbeError> {
     if database.is_empty() {
         return Err(ProbeError::InvalidMetadata(
             "database name cannot be empty".to_owned(),
@@ -634,16 +661,21 @@ pub async fn probe(pool: &Pool, database: &str) -> Result<ProbeReport, ProbeErro
         // than hiding inside one aggregate duration.
         let table_started = std::time::Instant::now();
         let probed_name = name.clone();
-        let counted = count_if_budget_remains(
-            pool,
-            &mut connection,
-            connection_id,
-            database,
-            &name,
-            flavor,
-            &mut counting_spent,
-        )
-        .await;
+        let counted = match counts {
+            RowCounts::Exact => {
+                count_if_budget_remains(
+                    pool,
+                    &mut connection,
+                    connection_id,
+                    database,
+                    &name,
+                    flavor,
+                    &mut counting_spent,
+                )
+                .await
+            }
+            RowCounts::Estimated => None,
+        };
         let table = probe_table(
             &mut connection,
             database,

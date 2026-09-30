@@ -562,9 +562,15 @@ async fn run_cycle(state: &ApiState, database: &DatabaseRecord) -> Result<u64, S
                 // ADD COLUMN, silently hiding the drift from row checksums.
                 // Probe at reconciliation cadence and hand changed shapes to
                 // the same repair policy used for other quarantined tables.
-                let refreshed = pintail_probe::probe(&pool, &database.name)
-                    .await
-                    .map_err(display)?;
+                // Shapes only: counting every table exactly on this cadence
+                // would scan the source's indexes end to end each time.
+                let refreshed = pintail_probe::probe_with(
+                    &pool,
+                    &database.name,
+                    pintail_probe::RowCounts::Estimated,
+                )
+                .await
+                .map_err(display)?;
                 let changed = targets
                     .iter()
                     .filter(|target| {
