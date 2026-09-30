@@ -2455,6 +2455,7 @@ impl ProjectedScanStream {
         let Some(candidates) = postings.candidate_ranges(&lookup.probe, start, end) else {
             return Ok(None);
         };
+        super::side_index::note_useful(&self.snapshot.directory, lookup.column_id);
         let map_projection = |ids: &[u32]| -> Result<Vec<usize>, StoreError> {
             ids.iter()
                 .map(|id| {

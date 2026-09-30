@@ -114,7 +114,7 @@ Publication writes and synchronizes `.manifest.ptm.tmp`, atomically renames
 it to `manifest.ptm`, then synchronizes the table directory. A snapshot holds
 an `Arc` to one immutable decoded generation.
 
-## Segment (`PTSEG`, version 5)
+## Segment (`PTSEG`, version 6)
 
 Readers accept all published segment versions. Version 1 stores the original
 text carriers and always-compressed blocks. Version 2 adds fixed-width native
@@ -123,7 +123,8 @@ payloads when LZ4 cannot save at least 5%; the other framing and all prior
 compression tags remain readable. Version 4 adds a footer digest over the
 header and every column descriptor, the only bytes no block or footer
 checksum covered. Version 5 adds the framed compression layout for wide plain
-UTF-8 blocks.
+UTF-8 blocks. Version 6 adds an optional directory of side-index
+postings sections, written between the last column chunk and the footer.
 
 ### Header
 
@@ -231,6 +232,8 @@ u32 sparse_key_count |
     repeated (u64 row_ordinal, composite_key key)
 bytes primary_key_bloom_filter
 u64 descriptor_digest       # version 4 and later
+u32 postings_count |        # version 6 and later
+    repeated (u32 column_id, u64 offset, u64 length, u64 xxh3(section))
 u64 xxh3(footer bytes above)
 u64 footer_start_offset
 ```
@@ -250,6 +253,14 @@ before accepting the segment. Every visited block verifies the checksum of
 its complete payload—including null bits, codec metadata, compressed values,
 zone maps, and HLL—before its statistics can prune or its values can decode.
 Failures report the segment path and byte offset.
+
+A postings section lists one integer column's non-NULL values with the rows
+holding them: `u8 layout (1) | varint entry_count`, then per distinct value
+in ascending order a varint zigzag delta from the previous value (the first
+from zero, wrapping), a varint row count, and the rows ascending as a varint
+first row then varint gaps. Sections are an access path only: a reader that
+finds none, finds a damaged one, or reads the segment under a schema other
+than the one it was written with reads the column itself instead.
 
 ## Flush and recovery ordering
 

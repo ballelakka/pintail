@@ -27,13 +27,14 @@ use crate::{
 
 const MAGIC: &[u8; 5] = b"PTSEG";
 const FOOTER_MAGIC: &[u8; 5] = b"PTFTR";
-const FORMAT_VERSION: u8 = 5;
+const FORMAT_VERSION: u8 = 6;
 
 /// Segment versions this reader understands: v1 stores text carriers for
 /// every Utf8-storage column; v2 additionally stores fixed-width native
 /// units (wire type Int64) for eligible Decimal/Date32/DateTime64 columns;
 /// v3 permits raw block payloads when LZ4 cannot save at least 5%;
-/// v5 stores wide plain text blocks as independently compressed frames.
+/// v5 stores wide plain text blocks as independently compressed frames;
+/// v6 adds a footer directory of optional side-index postings sections.
 /// Header bytes after the magic: format version, schema version, schema
 /// fingerprint, row count, column count and target block rows.
 const HEADER_LENGTH: usize = MAGIC.len() + 1 + 4 + 8 + 8 + 4 + 4;
@@ -45,6 +46,11 @@ const COLUMN_DESCRIPTOR_LENGTH: usize = 4 + 1 + 4;
 const DESCRIPTOR_DIGEST_VERSION: u8 = 4;
 /// The first format whose blocks may carry the framed compression layout.
 const FRAMED_BLOCK_VERSION: u8 = 5;
+
+/// The first format whose footer carries a directory of side-index postings
+/// sections, written between the last column chunk and the footer. An empty
+/// directory is valid, and older segments simply have none.
+const POSTINGS_VERSION: u8 = 6;
 
 /// The digest a version 4 footer records over the fields no block checksum
 /// covers. Those fields decide how many rows a read allocates and which
@@ -75,7 +81,7 @@ fn written_format_version() -> u8 {
 }
 
 const fn format_version_supported(version: u8) -> bool {
-    matches!(version, 1..=5)
+    matches!(version, 1..=6)
 }
 
 fn read_format_version(path: &Path, decoder: &mut FileDecoder) -> Result<u8, StoreError> {
@@ -915,6 +921,23 @@ pub(crate) fn write(
             .map_err(|error| StoreError::io(format!("write {}", temporary.display()), error))?;
         position = position.saturating_add(column.len());
     }
+    let mut postings = Vec::new();
+    if format_version >= POSTINGS_VERSION {
+        for (column_id, index) in crate::store::side_index::persisted_columns(directory, schema) {
+            let Some(section) = crate::store::side_index::encode_row_postings(rows, index) else {
+                continue;
+            };
+            postings.push(PostingsEntry {
+                column_id,
+                offset: position as u64,
+                length: section.len() as u64,
+                checksum: xxh3_64(&section),
+            });
+            file.write_all(&section)
+                .map_err(|error| StoreError::io(format!("write {}", temporary.display()), error))?;
+            position = position.saturating_add(section.len());
+        }
+    }
 
     let footer_offset = position as u64;
     let mut footer = Encoder::new();
@@ -940,6 +963,15 @@ pub(crate) fn write(
     footer.bytes(&bloom, "primary-key bloom filter")?;
     if format_version >= DESCRIPTOR_DIGEST_VERSION {
         footer.u64(descriptor_digest(&header[MAGIC.len()..], &descriptors));
+    }
+    if format_version >= POSTINGS_VERSION {
+        footer.length(postings.len(), "side-index postings directory")?;
+        for entry in &postings {
+            footer.u32(entry.column_id);
+            footer.u64(entry.offset);
+            footer.u64(entry.length);
+            footer.u64(entry.checksum);
+        }
     }
     let footer_checksum = xxh3_64(footer.as_slice());
     footer.u64(footer_checksum);
@@ -1737,6 +1769,42 @@ pub(crate) fn read_footer_layout(
 ) -> Result<FooterLayout, StoreError> {
     let (footer, footer_offset, header) = read_verified_footer(path)?;
     parse_footer_body(path, &footer, footer_offset, meta, header[MAGIC.len()])
+}
+
+/// The checksum-verified bytes of the side-index postings a segment carries
+/// for `column_id`, or `None` when it carries none (every segment before
+/// format version 5, and columns no flush chose to index).
+pub(crate) fn read_postings_section(
+    directory: &Path,
+    meta: &SegmentMeta,
+    column_id: u32,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let path = directory.join(&meta.file_name);
+    let layout = read_footer_layout(&path, meta)?;
+    let Some(entry) = layout
+        .postings
+        .iter()
+        .find(|entry| entry.column_id == column_id)
+    else {
+        return Ok(None);
+    };
+    let length = usize::try_from(entry.length)
+        .map_err(|_| StoreError::FormatLimit("postings section exceeds usize".into()))?;
+    let mut file = File::open(&path)
+        .map_err(|error| StoreError::io(format!("open segment {}", path.display()), error))?;
+    file.seek(SeekFrom::Start(entry.offset))
+        .map_err(|error| StoreError::io("seek side-index postings", error))?;
+    let mut bytes = vec![0_u8; length];
+    file.read_exact(&mut bytes)
+        .map_err(|error| StoreError::io("read side-index postings", error))?;
+    if xxh3_64(&bytes) != entry.checksum {
+        return Err(corrupt(
+            &path,
+            usize::try_from(entry.offset).unwrap_or(usize::MAX),
+            "side-index postings checksum mismatch",
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 /// The contiguous run of blocks whose keys can fall in `start..=end`, from
@@ -4805,6 +4873,18 @@ pub(crate) struct FooterLayout {
     pub(crate) sparse: Vec<(u64, PrimaryKey)>,
     /// The header and column-descriptor digest, from format version 4.
     pub(crate) descriptor_digest: Option<u64>,
+    /// Side-index postings sections, from format version 5.
+    pub(crate) postings: Vec<PostingsEntry>,
+}
+
+/// Where one column's side-index postings sit in a segment file, and the
+/// checksum that guards them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PostingsEntry {
+    pub(crate) column_id: u32,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) checksum: u64,
 }
 
 fn parse_footer_body(
@@ -4900,6 +4980,11 @@ fn parse_footer_body(
     } else {
         None
     };
+    let postings = if format_version >= POSTINGS_VERSION {
+        parse_postings_directory(path, &mut decoder, footer_offset)?
+    } else {
+        Vec::new()
+    };
     decoder
         .finish()
         .map_err(|reason| corrupt(path, footer_offset, reason))?;
@@ -4907,7 +4992,50 @@ fn parse_footer_body(
         column_offsets,
         sparse,
         descriptor_digest,
+        postings,
     })
+}
+
+/// Reads the side-index postings directory a version 5 footer ends with,
+/// holding every section inside the segment body.
+fn parse_postings_directory(
+    path: &Path,
+    decoder: &mut Decoder<'_>,
+    footer_offset: usize,
+) -> Result<Vec<PostingsEntry>, StoreError> {
+    let at = |decoder: &Decoder<'_>| footer_offset + decoder.position();
+    let count = decoder
+        .u32()
+        .map_err(|reason| corrupt(path, at(decoder), reason))?;
+    let mut postings = Vec::new();
+    for _ in 0..count {
+        let column_id = decoder
+            .u32()
+            .map_err(|reason| corrupt(path, at(decoder), reason))?;
+        let offset = decoder
+            .u64()
+            .map_err(|reason| corrupt(path, at(decoder), reason))?;
+        let length = decoder
+            .u64()
+            .map_err(|reason| corrupt(path, at(decoder), reason))?;
+        let checksum = decoder
+            .u64()
+            .map_err(|reason| corrupt(path, at(decoder), reason))?;
+        if offset.saturating_add(length) > footer_offset as u64 {
+            return Err(corrupt(
+                path,
+                at(decoder),
+                "side-index postings section is outside the segment body",
+            ));
+        }
+        postings.push(PostingsEntry {
+            column_id,
+            offset,
+            length,
+            checksum,
+        });
+    }
+    Ok(postings)
 }
 
 fn build_bloom(rows: &[StoredRow]) -> Result<Vec<u8>, StoreError> {

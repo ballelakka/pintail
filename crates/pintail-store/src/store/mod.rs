@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod lifecycle_tests;
 mod scan;
-mod side_index;
+pub(crate) mod side_index;
 mod snapshot;
 
 pub use scan::{

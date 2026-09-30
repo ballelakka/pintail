@@ -29,7 +29,7 @@ fn flush_publishes_a_versioned_segment_and_reopen_reads_it_without_wal_rows() {
 
     let bytes = std::fs::read(&segment_path).expect("segment bytes");
     assert_eq!(&bytes[..5], b"PTSEG");
-    assert_eq!(bytes[5], 5, "writer stamps PTSEG v5");
+    assert_eq!(bytes[5], 6, "writer stamps PTSEG v6");
     assert_eq!(
         std::fs::metadata(directory.path().join("table.wal"))
             .expect("WAL metadata")

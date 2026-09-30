@@ -16,14 +16,14 @@
 //! as it masks them among all rows.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, atomic::AtomicUsize},
     time::Instant,
 };
 
-use pintail_types::TableSchema;
+use pintail_types::{StoredRow, TableSchema, Value};
 
 use super::scan::DecodedColumn;
 use crate::{StoreError, segment};
@@ -92,9 +92,10 @@ impl Postings {
         self.values.capacity() * size_of::<i64>() + self.rows.capacity() * size_of::<u32>()
     }
 
-    fn rows_between(&self, lower: i128, upper: i128, out: &mut Vec<u32>) {
+    /// The run of postings entries whose value lies in `[lower, upper]`.
+    fn entries_between(&self, lower: i128, upper: i128) -> Range<usize> {
         if lower > upper {
-            return;
+            return 0..0;
         }
         let start = self
             .values
@@ -102,9 +103,7 @@ impl Postings {
         let end = self
             .values
             .partition_point(|value| i128::from(*value) <= upper);
-        if start < end {
-            out.extend_from_slice(&self.rows[start..end]);
-        }
+        start..end.max(start)
     }
 
     /// The rows of `[start, end)` whose value the probe admits, coalesced
@@ -116,22 +115,37 @@ impl Postings {
         start: usize,
         end: usize,
     ) -> Option<Vec<Range<usize>>> {
-        let mut rows = Vec::new();
-        match probe {
-            IndexProbe::Values(values) => {
-                for value in values {
-                    self.rows_between(*value, *value, &mut rows);
-                }
-            }
-            IndexProbe::Span(lower, upper) => self.rows_between(*lower, *upper, &mut rows),
-        }
+        let runs = match probe {
+            IndexProbe::Values(values) => values
+                .iter()
+                .map(|value| self.entries_between(*value, *value))
+                .filter(|run| !run.is_empty())
+                .collect::<Vec<_>>(),
+            IndexProbe::Span(lower, upper) => vec![self.entries_between(*lower, *upper)],
+        };
         let slice_rows = end.saturating_sub(start);
-        rows.retain(|row| {
+        let limit = slice_rows / MAX_CANDIDATE_SHARE;
+        let in_slice = |row: &u32| {
             let row = *row as usize;
             row >= start && row < end
-        });
-        if rows.len().saturating_mul(MAX_CANDIDATE_SHARE) > slice_rows {
-            return None;
+        };
+        // Counted before anything is collected, and abandoned as soon as the
+        // share is passed: a wide span declines at the cost of that count.
+        let total = runs.iter().map(ExactSizeIterator::len).sum::<usize>();
+        if total > limit {
+            let mut counted = 0_usize;
+            for run in &runs {
+                for row in &self.rows[run.clone()] {
+                    counted += usize::from(in_slice(row));
+                    if counted > limit {
+                        return None;
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::with_capacity(total.min(limit.max(1)));
+        for run in runs {
+            rows.extend(self.rows[run].iter().copied().filter(|row| in_slice(row)));
         }
         rows.sort_unstable();
         let mut ranges: Vec<Range<usize>> = Vec::new();
@@ -356,6 +370,207 @@ pub(crate) fn postings(
     Ok(built.clone())
 }
 
+/// Columns, per table directory, whose index a scan found selective enough
+/// to use: the ones the next flush or compaction of that table writes
+/// postings for, so a restart or a new segment does not rebuild them.
+fn useful_columns() -> &'static Mutex<HashMap<PathBuf, BTreeSet<u32>>> {
+    static USEFUL: OnceLock<Mutex<HashMap<PathBuf, BTreeSet<u32>>>> = OnceLock::new();
+    USEFUL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records that a scan of the table in `directory` used the index on
+/// `column_id`.
+pub(crate) fn note_useful(directory: &Path, column_id: u32) {
+    let mut useful = useful_columns()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(columns) = useful.get_mut(directory) {
+        columns.insert(column_id);
+    } else {
+        useful.insert(directory.to_path_buf(), BTreeSet::from([column_id]));
+    }
+}
+
+/// The integer columns, with their schema positions, a segment written to
+/// `directory` carries postings for: every column a scan has used the index
+/// on, and every column `PINTAIL_SECONDARY_INDEX_COLUMNS` (a comma list of
+/// column names) names for every table. None while the index is off.
+pub(crate) fn persisted_columns(directory: &Path, schema: &TableSchema) -> Vec<(u32, usize)> {
+    static NAMED: OnceLock<Vec<String>> = OnceLock::new();
+    if !side_index_enabled() {
+        return Vec::new();
+    }
+    let named = NAMED.get_or_init(|| {
+        std::env::var("PINTAIL_SECONDARY_INDEX_COLUMNS")
+            .map(|list| {
+                list.split(',')
+                    .map(|name| name.trim().to_ascii_lowercase())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let useful = useful_columns()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(directory)
+        .cloned()
+        .unwrap_or_default();
+    schema
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| is_integer(column.data_type()))
+        .filter(|(_, column)| {
+            useful.contains(&column.id())
+                || named
+                    .iter()
+                    .any(|name| column.name().eq_ignore_ascii_case(name))
+        })
+        .map(|(position, column)| (column.id(), position))
+        .collect()
+}
+
+const fn is_integer(data_type: pintail_types::DataType) -> bool {
+    use pintail_types::DataType;
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+/// Layout tag of a postings section; a reader meeting another declines it.
+const POSTINGS_LAYOUT: u8 = 1;
+
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(u8::try_from(value & 0x7f).unwrap_or(0) | 0x80);
+        value >>= 7;
+    }
+    out.push(u8::try_from(value).unwrap_or(0));
+}
+
+fn take_varint(bytes: &[u8], position: &mut usize) -> Result<u64, String> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes
+            .get(*position)
+            .ok_or_else(|| "postings end inside a number".to_owned())?;
+        *position += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("postings number is too long".to_owned())
+}
+
+/// The postings section for the column at schema position `index` of
+/// `rows`, as a segment writes it: the non-NULL values grouped, each group
+/// as its value's zigzag delta from the previous group's, its row count,
+/// and its rows as ascending deltas. `None` when a value is not a plain
+/// integer the index can hold, which leaves the column unindexed.
+pub(crate) fn encode_row_postings(rows: &[StoredRow], index: usize) -> Option<Vec<u8>> {
+    let postings = Postings::from_pairs(row_pairs(rows, index)?);
+    let mut out = Vec::with_capacity(postings.rows.len() * 3 + 16);
+    out.push(POSTINGS_LAYOUT);
+    put_varint(&mut out, postings.rows.len() as u64);
+    let mut previous_value = 0_i64;
+    let mut entry = 0_usize;
+    while entry < postings.values.len() {
+        let value = postings.values[entry];
+        let end = entry + postings.values[entry..].partition_point(|other| *other == value);
+        let delta = value.wrapping_sub(previous_value);
+        put_varint(&mut out, ((delta << 1) ^ (delta >> 63)).cast_unsigned());
+        put_varint(&mut out, (end - entry) as u64);
+        let mut previous_row = 0_u32;
+        for (offset, row) in postings.rows[entry..end].iter().enumerate() {
+            let step = if offset == 0 {
+                *row
+            } else {
+                row - previous_row
+            };
+            put_varint(&mut out, u64::from(step));
+            previous_row = *row;
+        }
+        previous_value = value;
+        entry = end;
+    }
+    Some(out)
+}
+
+fn row_pairs(rows: &[StoredRow], index: usize) -> Option<Vec<(i64, u32)>> {
+    let mut pairs = Vec::with_capacity(rows.len());
+    for (row, stored) in rows.iter().enumerate() {
+        let row = u32::try_from(row).ok()?;
+        match stored.values().get(index)? {
+            Value::Null => {}
+            Value::Int64(value) => pairs.push((*value, row)),
+            Value::UInt64(value) => pairs.push((i64::try_from(*value).ok()?, row)),
+            _ => return None,
+        }
+    }
+    Some(pairs)
+}
+
+/// Reads a postings section back, holding every row to the segment's
+/// `row_count` and the groups to ascending order.
+fn decode_postings(bytes: &[u8], row_count: usize) -> Result<Postings, String> {
+    if bytes.first() != Some(&POSTINGS_LAYOUT) {
+        return Err("unknown postings layout".to_owned());
+    }
+    let mut position = 1_usize;
+    let entries = usize::try_from(take_varint(bytes, &mut position)?)
+        .map_err(|_| "postings entry count does not fit".to_owned())?;
+    if entries > row_count {
+        return Err("more postings than rows".to_owned());
+    }
+    let mut values = Vec::with_capacity(entries);
+    let mut rows = Vec::with_capacity(entries);
+    let mut previous_value = 0_i64;
+    while rows.len() < entries {
+        let zigzag = take_varint(bytes, &mut position)?;
+        let delta = (zigzag >> 1).cast_signed() ^ -((zigzag & 1).cast_signed());
+        let value = previous_value.wrapping_add(delta);
+        if !values.is_empty() && value <= previous_value {
+            return Err("postings values out of order".to_owned());
+        }
+        let count = usize::try_from(take_varint(bytes, &mut position)?)
+            .map_err(|_| "postings group size does not fit".to_owned())?;
+        if count == 0 || count > entries - rows.len() {
+            return Err("postings group size is out of range".to_owned());
+        }
+        let mut row = 0_u64;
+        for offset in 0..count {
+            let step = take_varint(bytes, &mut position)?;
+            if offset > 0 && step == 0 {
+                return Err("postings rows out of order".to_owned());
+            }
+            row = row
+                .checked_add(step)
+                .ok_or_else(|| "postings row overflows".to_owned())?;
+            let row = u32::try_from(row)
+                .ok()
+                .filter(|row| (*row as usize) < row_count)
+                .ok_or_else(|| "postings row is outside the segment".to_owned())?;
+            values.push(value);
+            rows.push(row);
+        }
+        previous_value = value;
+    }
+    if position != bytes.len() {
+        return Err("trailing bytes after postings".to_owned());
+    }
+    Ok(Postings { values, rows })
+}
+
 fn record_build(
     meta: &segment::SegmentMeta,
     column_id: u32,
@@ -399,6 +614,26 @@ fn build(
     };
     if u32::try_from(row_count).is_err() {
         return Ok(None);
+    }
+    // Postings a flush or compaction wrote describe the file under the schema
+    // it was written with; after a schema change the decode below applies
+    // the column's evolution instead. Damaged postings are an index lost,
+    // not an answer lost: the build below reads the column itself.
+    if meta.schema_fingerprint == segment::schema_fingerprint(schema) {
+        match segment::read_postings_section(directory, meta, column_id) {
+            Ok(Some(bytes)) => match decode_postings(&bytes, row_count) {
+                Ok(postings) => return Ok(Some(postings)),
+                Err(reason) => pintail_log::log_error!(
+                    "side index postings unreadable file={} column={column_id}: {reason}",
+                    meta.file_name
+                ),
+            },
+            Ok(None) => {}
+            Err(error) => pintail_log::log_error!(
+                "side index postings unreadable file={} column={column_id}: {error}",
+                meta.file_name
+            ),
+        }
     }
     let used = AtomicUsize::new(0);
     let budget = segment::ScanMemoryBudget::new(&used, usize::MAX);
@@ -534,6 +769,119 @@ mod tests {
             ..key(5)
         };
         assert_ne!(typed, key(5));
+    }
+
+    fn owner_rows(count: u64) -> Vec<StoredRow> {
+        use pintail_types::{KeyPart, PrimaryKey};
+        (0..count)
+            .map(|id| {
+                StoredRow::new(
+                    PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
+                    vec![
+                        Value::UInt64(id),
+                        if id % 11 == 0 {
+                            Value::Null
+                        } else {
+                            // Scattered, negative and extreme values.
+                            Value::Int64(match id % 5 {
+                                0 => i64::MIN + i64::try_from(id % 3).expect("small"),
+                                1 => i64::MAX - i64::try_from(id % 3).expect("small"),
+                                _ => i64::try_from(id * 7_919 % 257).expect("small") - 128,
+                            })
+                        },
+                    ],
+                    1,
+                    id % 13 == 0,
+                )
+            })
+            .collect()
+    }
+
+    fn owner_schema() -> TableSchema {
+        use pintail_types::{Column, DataType};
+        TableSchema::new(
+            1,
+            vec![
+                Column::new(1, "id", DataType::UInt64, false),
+                Column::new(2, "owner", DataType::Int64, true),
+            ],
+        )
+        .expect("schema")
+    }
+
+    #[test]
+    fn postings_sections_round_trip_and_refuse_damage() {
+        let rows = owner_rows(2_000);
+        let section = encode_row_postings(&rows, 1).expect("integer column");
+        let built = Postings::from_pairs(row_pairs(&rows, 1).expect("pairs"));
+        let decoded = decode_postings(&section, rows.len()).expect("decode");
+        assert_eq!(decoded.values, built.values);
+        assert_eq!(decoded.rows, built.rows);
+        // Well under the twelve bytes a resident entry takes.
+        assert!(section.len() < built.rows.len() * 4, "{}", section.len());
+        assert!(decode_postings(&section, 1_000).is_err());
+        assert!(decode_postings(&section[..section.len() - 1], rows.len()).is_err());
+        let mut longer = section.clone();
+        longer.push(0);
+        assert!(decode_postings(&longer, rows.len()).is_err());
+        let empty = encode_row_postings(&owner_rows(0), 1).expect("empty");
+        assert!(decode_postings(&empty, 0).expect("empty").rows.is_empty());
+        // A text value leaves the column unindexed.
+        let mut text = owner_rows(3);
+        text.push(StoredRow::new(
+            pintail_types::PrimaryKey::new(vec![pintail_types::KeyPart::UInt64(9)]).expect("key"),
+            vec![Value::UInt64(9), Value::Utf8("9".into())],
+            1,
+            false,
+        ));
+        assert!(encode_row_postings(&text, 1).is_none());
+    }
+
+    #[test]
+    fn segments_carry_postings_for_useful_columns_and_old_ones_build_them() {
+        override_side_index(Some(true));
+        let schema = owner_schema();
+        let rows = owner_rows(3_000);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let write = |id| {
+            segment::write(
+                directory.path(),
+                id,
+                &schema,
+                &rows,
+                256,
+                segment::Compression::Lz4,
+                true,
+            )
+            .expect("write segment")
+        };
+        let plain = write(1);
+        assert!(
+            segment::read_postings_section(directory.path(), &plain, 2)
+                .expect("read")
+                .is_none()
+        );
+        note_useful(directory.path(), 2);
+        let indexed = write(2);
+        let section = segment::read_postings_section(directory.path(), &indexed, 2)
+            .expect("read")
+            .expect("persisted postings");
+        assert!(section.len() < rows.len() * 4);
+        let persisted = postings(directory.path(), &indexed, &schema, 2)
+            .expect("postings")
+            .expect("integer column");
+        let rebuilt = postings(directory.path(), &plain, &schema, 2)
+            .expect("postings")
+            .expect("integer column");
+        assert_eq!(persisted.values, rebuilt.values);
+        assert_eq!(persisted.rows, rebuilt.rows);
+        // The segment itself still reads as before.
+        segment::verify(directory.path(), &indexed, &schema).expect("verify");
+        assert_eq!(
+            segment::read(directory.path(), &indexed, &schema).expect("rows"),
+            rows
+        );
+        override_side_index(None);
     }
 
     #[test]
