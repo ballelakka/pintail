@@ -249,8 +249,8 @@ pub(super) fn top_k(
     let mut reserved = 0_usize;
     let mut cutoff = None;
     while let Some(mut batch) = input.next_batch(memory)? {
-        if let (Some(cutoff), Some(key)) = (&cutoff, keys.first()) {
-            narrow(&mut batch, cutoff, *key)?;
+        if let Some(key) = keys.first() {
+            narrow(&mut batch, cutoff.as_ref(), *key, k)?;
         }
         let visible = batch.visible_row_count();
         if visible == 0 {
@@ -342,25 +342,55 @@ impl Cutoff {
     }
 }
 
-/// Leaves out of `batch` the rows whose first key orders after the cutoff.
-/// A column that does not order as units leaves the batch whole.
-fn narrow(batch: &mut RecordBatch, cutoff: &Cutoff, key: BoundOrderKey) -> Result<(), ExecError> {
+/// Leaves out of `batch` the rows whose first key orders after the
+/// cutoff, or after the batch's own `k`-th first key when it holds more
+/// than twice `k` rows: a row ordering after that has k rows of the same
+/// batch strictly ahead of it and cannot be among the first k. Input
+/// arriving against the sort's direction - newest last, sorted newest
+/// first - otherwise passes the cutoff of the batches before it whole.
+/// Equal keys stay, so ties still resolve by arrival. A column that does
+/// not order as units leaves the batch whole.
+fn narrow(
+    batch: &mut RecordBatch,
+    cutoff: Option<&Cutoff>,
+    key: BoundOrderKey,
+    k: usize,
+) -> Result<(), ExecError> {
     let Some(column) = batch.column(key.index) else {
         return Ok(());
     };
-    if column.data_type() != cutoff.data_type {
+    let order = |left: &Option<i128>, right: &Option<i128>| {
+        null_order(key, left.is_none(), right.is_none())
+            .unwrap_or_else(|| directed(left.cmp(right), key))
+    };
+    let years = four_digit_years(column.data_type());
+    let rows = batch.selection().selected_rows().collect::<Vec<_>>();
+    let Some(units) = rows
+        .iter()
+        .map(|row| units_at(column, *row, key, years.as_ref()).ok())
+        .collect::<Option<Vec<_>>>()
+    else {
         return Ok(());
+    };
+    let mut bound = cutoff
+        .filter(|cutoff| cutoff.data_type == column.data_type())
+        .map(|cutoff| cutoff.units);
+    if k > 0 && units.len() > k.saturating_mul(2) {
+        let mut ranked = units.clone();
+        let (_, own, _) = ranked.select_nth_unstable_by(k - 1, order);
+        let own = *own;
+        bound = Some(match bound {
+            Some(earlier) if order(&earlier, &own).is_lt() => earlier,
+            _ => own,
+        });
     }
-    let years = four_digit_years(cutoff.data_type);
+    let Some(bound) = bound else {
+        return Ok(());
+    };
     let mut selection = batch.selection().clone();
-    for row in batch.selection().selected_rows() {
-        let Ok(units) = units_at(column, row, key, years.as_ref()) else {
-            return Ok(());
-        };
-        let ordering = null_order(key, units.is_none(), cutoff.units.is_none())
-            .unwrap_or_else(|| directed(units.cmp(&cutoff.units), key));
-        if ordering.is_gt() {
-            selection.set(row, false)?;
+    for (row, units) in rows.iter().zip(&units) {
+        if order(units, &bound).is_gt() {
+            selection.set(*row, false)?;
         }
     }
     batch.set_selection(selection)?;
