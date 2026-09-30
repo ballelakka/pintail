@@ -27,6 +27,7 @@ pub(crate) use aggregate::sma_fold_hits;
 pub use budget::{MemoryBudget, MemoryScope};
 pub use error::{ExecError, SpatialError};
 pub use join::compare_collated_text;
+pub(crate) use order::integer_type as integer_key_type;
 
 use aggregate::{AggregateState, CompiledAggregate, build_hash_aggregate};
 use join::{

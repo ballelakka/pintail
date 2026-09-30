@@ -111,7 +111,7 @@ fn push_top_k_below_left_joins(plan: &mut LogicalPlan) {
                 && scan.limit.is_none()
                 && let Some(ordered) = sort_scan_prefix(scan, &key_columns, &keys, rows)
             {
-                *spine = ordered;
+                *spine = deferred_scan_prefix(scan, &key_columns, &keys, rows).unwrap_or(ordered);
             }
         }
     }
@@ -711,6 +711,150 @@ fn sort_scan_prefix(
             count: rows,
         },
     })
+}
+
+/// Rows a sorted prefix may hold for its other columns to be read by key
+/// afterwards rather than beside the sort columns of every row. Matches the
+/// most keys a key lookup join accepts from a bounded driving input.
+const DEFERRED_PREFIX_ROWS: u64 = 64;
+
+/// The scan's first `rows` rows under `keys`, as `sort_scan_prefix` gives
+/// them, with only the sort columns and the primary key read for every
+/// row: those are sorted and cut, and the rest of the row is then read by
+/// key for the few rows that survive. A wide table otherwise decodes every
+/// column of every row to keep a handful.
+///
+/// The sorted side reads the table under a relation name no query can
+/// spell, so the columns above still resolve to the joined, full rows. It
+/// keeps the scan's predicates; the rows it names by key already passed
+/// them, so the full read carries none. Each surviving row finds exactly
+/// its own row by key in the same snapshot, so the LEFT join adds and drops
+/// nothing, and it emits in the sorted side's order, arrival ties included.
+fn deferred_scan_prefix(
+    scan: &Scan,
+    key_columns: &[BoundColumn],
+    keys: &[BoundOrderKey],
+    rows: u64,
+) -> Option<LogicalPlan> {
+    if rows == 0 || rows > DEFERRED_PREFIX_ROWS {
+        return None;
+    }
+    let [primary] = scan.table.key_column_ids.as_slice() else {
+        return None;
+    };
+    let primary_column = scan
+        .table
+        .columns
+        .iter()
+        .find(|column| column.column_id == *primary)?;
+    if !crate::execution::integer_key_type(Some(primary_column.data_type))
+        || !scan.projected_column_ids.contains(primary)
+    {
+        return None;
+    }
+    // The predicates are evaluated over the scan's own columns, so the
+    // columns they read stay beside the key and the sort columns.
+    let mut read = BTreeSet::new();
+    for predicate in &scan.predicates {
+        collect_expr_columns(predicate, &mut read);
+    }
+    let narrow_ids = scan
+        .projected_column_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            id == primary
+                || key_columns.iter().any(|column| column.column_id == *id)
+                || read.iter().any(|(_, _, _, column)| column == id)
+        })
+        .collect::<Vec<_>>();
+    if narrow_ids.len() >= scan.projected_column_ids.len() {
+        return None;
+    }
+    let relation = format!("<ordered {}>", scan.table.relation_name);
+    let mut narrow = scan.clone();
+    narrow.projected_column_ids = narrow_ids;
+    let identity = (scan.table.database_id, scan.table.table_id);
+    let original = scan.table.relation_name.clone();
+    for column in &mut narrow.table.columns {
+        relation.clone_into(&mut column.relation_name);
+    }
+    relation.clone_into(&mut narrow.table.relation_name);
+    for predicate in &mut narrow.predicates {
+        if !rename_relation(predicate, identity, &original, &relation) {
+            return None;
+        }
+    }
+    let narrow_keys = key_columns
+        .iter()
+        .map(|column| {
+            let mut column = column.clone();
+            relation.clone_into(&mut column.relation_name);
+            column
+        })
+        .collect::<Vec<_>>();
+    let narrow_primary = narrow
+        .table
+        .columns
+        .iter()
+        .find(|column| column.column_id == *primary)?
+        .clone();
+    let ordered = sort_scan_prefix(&narrow, &narrow_keys, keys, rows)?;
+    let mut wide = scan.clone();
+    wide.predicates.clear();
+    let column_expr = |column: BoundColumn| BoundExpr {
+        data_type: Some(column.data_type),
+        nullable: column.nullable,
+        kind: BoundExprKind::Column(column),
+    };
+    let condition = BoundExpr {
+        data_type: Some(DataType::Boolean),
+        nullable: false,
+        kind: BoundExprKind::Binary {
+            op: BinaryOp::Equal,
+            left: Box::new(column_expr(narrow_primary)),
+            right: Box::new(column_expr(primary_column.clone())),
+        },
+    };
+    Some(LogicalPlan::Join {
+        left: Box::new(ordered),
+        right: Box::new(LogicalPlan::Scan(wide)),
+        kind: BoundJoinKind::Left,
+        condition: Some(condition),
+    })
+}
+
+/// Gives the columns of `identity` under `relation` in `expr` the relation
+/// name `renamed`; false when the expression holds anything it cannot walk.
+fn rename_relation(
+    expr: &mut BoundExpr,
+    identity: (DatabaseId, TableId),
+    relation: &str,
+    renamed: &str,
+) -> bool {
+    match &mut expr.kind {
+        BoundExprKind::Column(column) => {
+            if !column.outer
+                && column.relation_name.eq_ignore_ascii_case(relation)
+                && (column.database_id, column.table_id) == identity
+            {
+                renamed.clone_into(&mut column.relation_name);
+            }
+            true
+        }
+        BoundExprKind::Unary { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+            rename_relation(expr, identity, relation, renamed)
+        }
+        BoundExprKind::Binary { left, right, .. } => {
+            rename_relation(left, identity, relation, renamed)
+                && rename_relation(right, identity, relation, renamed)
+        }
+        BoundExprKind::Scalar { args, .. } => args
+            .iter_mut()
+            .all(|argument| rename_relation(argument, identity, relation, renamed)),
+        BoundExprKind::Literal(_) => true,
+        _ => false,
+    }
 }
 
 /// Drops the columns of a derived table that nothing above it reads, with

@@ -149,6 +149,12 @@ impl Fixture {
 
     /// Ordered rows and the rows the lowest join was fed, from a profiled run.
     fn run(&self, sql: &str) -> (Vec<String>, u64) {
+        let (rows, joined, _) = self.run_labelled(sql);
+        (rows, joined)
+    }
+
+    /// `run`, with the label of every operator the plan ran.
+    fn run_labelled(&self, sql: &str) -> (Vec<String>, u64, Vec<String>) {
         let events = self.events.snapshot();
         let people = self.people.snapshot();
         let provider = SnapshotScanProvider::new([
@@ -192,7 +198,12 @@ impl Fixture {
             .map(|node| node.rows)
             .max()
             .unwrap_or(0);
-        (rows, joined)
+        let labels = profile
+            .operators
+            .iter()
+            .map(|node| node.label.clone())
+            .collect();
+        (rows, joined, labels)
     }
 }
 
@@ -233,4 +244,35 @@ fn a_filter_above_the_joins_keeps_the_limit_where_it_was() {
     let (rows, joined) = fixture.run(query);
     assert_eq!(rows.len(), 20);
     assert!(joined >= EVENTS - EVENTS / 17 - 1, "{joined}");
+}
+
+#[test]
+fn a_short_prefix_reads_the_rest_of_its_rows_by_key() {
+    let fixture = Fixture::new();
+    // Every column of the table, and a predicate on it: the sort reads the
+    // key and the sort column, and the full rows of the survivors are read
+    // by key after the cut.
+    let query = "SELECT e.*, a.label AS actor FROM events e \
+         LEFT JOIN people a ON a.person = e.actor \
+         WHERE e.note <> 'n5' AND e.subject IS NOT NULL \
+         ORDER BY $AT DESC LIMIT 20 OFFSET $OFFSET";
+    for offset in ["0", "40"] {
+        let query = query.replace("$OFFSET", offset);
+        let (deferred, _, labels) = fixture.run_labelled(&query.replace("$AT", "e.at"));
+        let (whole, _) = fixture.run(&query.replace("$AT", "e.at + INTERVAL 0 SECOND"));
+        assert_eq!(deferred.len(), 20, "offset {offset}");
+        assert_eq!(deferred, whole, "offset {offset}");
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("KeyLookupJoin")),
+            "offset {offset}: {labels:?}"
+        );
+    }
+    // Ascending ties resolve by arrival as well.
+    let query = "SELECT e.* FROM events e LEFT JOIN people a ON a.person = e.actor \
+         ORDER BY $AT LIMIT 30 OFFSET 7";
+    let (deferred, _) = fixture.run(&query.replace("$AT", "e.at"));
+    let (whole, _) = fixture.run(&query.replace("$AT", "e.at + INTERVAL 0 SECOND"));
+    assert_eq!(deferred, whole);
 }

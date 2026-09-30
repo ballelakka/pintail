@@ -250,8 +250,12 @@ const MAX_PINNED_KEYS: usize = 64;
 /// Whether the scan under `plan` pins its whole integer key to at most
 /// `MAX_PINNED_KEYS` constants: a conjunct `key = constant` or
 /// `key IN (constants)`, in the scan's predicates or the filter over it,
-/// beneath any projection of plain columns.
+/// beneath any projection of plain columns. A limit of at most that many
+/// rows bounds the keys the same way, whatever it reads beneath.
 fn pinned(plan: &PhysicalPlan) -> bool {
+    if let PhysicalPlan::Limit { count, .. } = plan {
+        return usize::try_from(*count).is_ok_and(|rows| rows <= MAX_PINNED_KEYS);
+    }
     let plan = match plan {
         PhysicalPlan::Project { input, expressions }
             if expressions.iter().all(|projection| {

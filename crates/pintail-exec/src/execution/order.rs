@@ -21,7 +21,7 @@ use pintail_types::DataType;
 
 use super::{PhysicalPlan, Scan};
 
-pub(super) fn integer_type(data_type: Option<DataType>) -> bool {
+pub(crate) fn integer_type(data_type: Option<DataType>) -> bool {
     matches!(
         data_type,
         Some(
