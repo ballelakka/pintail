@@ -683,6 +683,8 @@ dependencies = [
  "rand",
  "rayon",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "serde",
  "serde_json",
  "sha1",
