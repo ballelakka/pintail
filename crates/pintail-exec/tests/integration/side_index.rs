@@ -53,6 +53,23 @@ fn event_schema() -> TableSchema {
     .expect("event schema")
 }
 
+/// The event table after a schema change: the wide text column dropped and a
+/// nullable integer column added, so the segments written before it read
+/// under a schema other than their own.
+fn evolved_event_schema() -> TableSchema {
+    TableSchema::new(
+        2,
+        vec![
+            Column::new(1, "id", DataType::UInt64, false),
+            Column::new(2, "account", DataType::Int64, true),
+            Column::new(3, "kind", DataType::Utf8, false),
+            Column::new(4, "amount", DataType::Int64, false),
+            Column::new(6, "extra", DataType::Int64, true),
+        ],
+    )
+    .expect("evolved event schema")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Event {
     account: Option<i64>,
@@ -132,29 +149,22 @@ impl Fixture {
                     .collect(),
             )
             .expect("ingest events");
-        let entry = |id, name, schema, rows| {
-            TableEntry::new(id, name, schema, TableStatistics::with_row_count(rows))
-                .expect("entry")
-                .with_key_columns([1])
-                .expect("key")
-        };
-        let database = DatabaseEntry::new(
-            DATABASE_ID,
-            "app",
-            [
-                entry(OWNER_ID, "owners", owner_schema(), OWNERS),
-                entry(EVENT_ID, "events", event_schema(), EVENTS),
-            ],
-        )
-        .expect("database");
         Self {
             _dirs: (owner_dir, event_dir),
             owners,
             events,
-            catalog: CatalogSnapshot::new([database]).expect("catalog"),
+            catalog: catalog(event_schema()),
             model,
             version: 2,
         }
+    }
+
+    /// Publishes the evolved event schema to the store and the catalog.
+    fn evolve(&mut self) {
+        self.events
+            .evolve_schema(evolved_event_schema())
+            .expect("evolve");
+        self.catalog = catalog(evolved_event_schema());
     }
 
     /// Moves rows into and out of the probed accounts, deletes some of
@@ -347,6 +357,25 @@ impl Fixture {
     }
 }
 
+fn catalog(events: TableSchema) -> CatalogSnapshot {
+    let entry = |id, name, schema, rows| {
+        TableEntry::new(id, name, schema, TableStatistics::with_row_count(rows))
+            .expect("entry")
+            .with_key_columns([1])
+            .expect("key")
+    };
+    let database = DatabaseEntry::new(
+        DATABASE_ID,
+        "app",
+        [
+            entry(OWNER_ID, "owners", owner_schema(), OWNERS),
+            entry(EVENT_ID, "events", events, EVENTS),
+        ],
+    )
+    .expect("database");
+    CatalogSnapshot::new([database]).expect("catalog")
+}
+
 fn int(value: &Value) -> i64 {
     match value {
         Value::Int64(value) => *value,
@@ -368,6 +397,12 @@ fn a_side_index_lookup_answers_exactly_through_every_store_state() {
     fixture.events.flush().expect("flush");
     fixture.events.compact().expect("compact");
     fixture.check("compacted");
+    // The flush and compaction above wrote postings for the probed column;
+    // read under the evolved schema they give way to a build from the column.
+    fixture.evolve();
+    fixture.check("schema changed");
+    fixture.events.compact().expect("compact");
+    fixture.check("compacted under the changed schema");
 }
 
 #[test]
