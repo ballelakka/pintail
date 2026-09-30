@@ -1,8 +1,8 @@
 # MySQL's regression suite against Pintail
 
-Measured 2026-09-30T07:02:25.900Z: `mysql-test/t` from mysql/mysql-server at `99960bf74fa9`, oracle MySQL 8.4.11, 633 files.
+Measured 2026-09-30T09:59:14.119Z: `mysql-test/t` from mysql/mysql-server at `99960bf74fa9`, oracle MySQL 8.4.11, 633 files.
 
-Replay mode: local. Source commit: 19ad248dd563563e9d3c7861cb669d92fd765e7a; source dirty: false. Binary SHA-256: 3b67a99402ebb1295393b7e40d70c88c554227f59fff4bd3e65b6aaaefe0a855.
+Replay mode: local. Source commit: e215bc5176cf007ea5a3d3d1261e62d990f367c8; source dirty: false. Binary SHA-256: 48b091a869693fae70eb32fd120d8794e763284259bd818ed2756dc2bd980099.
 
 **9,192 of 9,302 compared SELECTs match MySQL byte-for-byte** (98.8%), **out of 23,119 SELECTs replayed** - 13,817 never reached a comparison, so this is a share of what could be compared and not of the suite. 110 differ in rows, 0 in column names only. 5,222 SELECTs Pintail could not run, 6,093 were not compared because their tables were changed by statements a local database cannot follow, 525 failed on MySQL itself, 1,977 depend on the clock, session or server and were not compared. 0 waited past the replication deadline, 0 read unsettled replica tables. Fixtures: 20,224 accepted, 1,173 rejected by Pintail, 18,050 outside the replayed subset.
 
@@ -676,4 +676,4 @@ Column names are compared with rows. Row order is compared when the outer query 
 | 48 | Error: sql parser error: Expected: joined table, found: , at Line: _, Column: _ |
 | 45 | INSERT: Error: Incorrect value _ for column _: expected a datetime |
 
-Per-file diffs for mismatches are written to `validate-out/mtr/runs/munr7wnp-115858/diffs/` (not committed).
+Per-file diffs for mismatches are written to `validate-out/mtr/runs/munxlgng-154616/diffs/` (not committed).
