@@ -19,7 +19,7 @@ const UNKNOWN_RANGE: f64 = 1.0 / 3.0;
 /// statistics. `None` when the table has none.
 #[must_use]
 pub(crate) fn scan_rows(scan: &Scan) -> Option<u64> {
-    let statistics = scan.table.column_statistics.as_deref()?;
+    let statistics = scan.table.column_statistics.as_ref()?.get();
     let rows = scan.table.estimated_rows.or(scan.table.row_count)?;
     let selectivity = scan
         .predicates
@@ -42,7 +42,7 @@ pub(crate) fn scan_distinct(scan: &Scan, column: &BoundColumn) -> Option<u64> {
     if scan.table.key_column_ids.as_slice() == [column.column_id] {
         return scan.table.estimated_rows.or(scan.table.row_count);
     }
-    let statistics = scan.table.column_statistics.as_deref()?;
+    let statistics = scan.table.column_statistics.as_ref()?.get();
     statistics.column(column.column_id)?.distinct
 }
 
@@ -166,7 +166,9 @@ fn plan_distinct(plan: &LogicalPlan, column: &BoundColumn) -> Option<u64> {
 /// that reads it.
 fn plan_facts(plan: &LogicalPlan, column: &BoundColumn) -> Option<(ColumnFacts, u64)> {
     match plan {
-        LogicalPlan::Scan(scan) => facts(scan, scan.table.column_statistics.as_deref()?, column),
+        LogicalPlan::Scan(scan) => {
+            facts(scan, scan.table.column_statistics.as_ref()?.get(), column)
+        }
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }

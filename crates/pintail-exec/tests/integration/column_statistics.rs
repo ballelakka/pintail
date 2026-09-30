@@ -12,8 +12,6 @@
 //! `cargo test --profile recovery -p pintail-exec --test integration column_statistics::
 //! -- --ignored --nocapture`.
 
-use std::sync::Arc;
-
 use pintail_catalog::{
     CatalogSnapshot, DatabaseEntry, DatabaseId, TableEntry, TableId, TableStatistics,
 };
@@ -90,8 +88,9 @@ impl Fixture {
             .collect::<Vec<_>>();
         let count = u64::try_from(stored.len()).expect("rows");
         table.bulk_ingest_snapshot(stored).expect("rows");
-        let statistics = Arc::new(table.snapshot().column_statistics());
-        let catalog = |statistics: Option<Arc<pintail_catalog::ColumnStatistics>>| {
+        let statistics =
+            pintail_catalog::LazyColumnStatistics::ready(table.snapshot().column_statistics());
+        let catalog = |statistics: Option<pintail_catalog::LazyColumnStatistics>| {
             let mut entry = TableEntry::new(
                 TableId::new(1),
                 "nodes",
@@ -323,5 +322,156 @@ fn column_statistics_cost() {
                 timings[3].0.len()
             );
         }
+    }
+}
+
+/// A single-relation filtered count over a text column must plan and run
+/// the same with statistics as without: nothing in it joins.
+#[test]
+fn a_single_relation_never_assembles_statistics() {
+    let fixture = Fixture::new(&rows_of(2_000, 200));
+    let snapshot = fixture.table.snapshot();
+    let lazy = pintail_catalog::LazyColumnStatistics::new(move || snapshot.column_statistics());
+    let entry = TableEntry::new(
+        TableId::new(1),
+        "nodes",
+        schema(),
+        TableStatistics::with_estimated_row_count(2_000),
+    )
+    .expect("entry")
+    .with_key_columns([1])
+    .expect("key")
+    .with_column_statistics(lazy.clone());
+    let catalog = CatalogSnapshot::new([
+        DatabaseEntry::new(DatabaseId::new(1), "app", [entry]).expect("database")
+    ])
+    .expect("catalog");
+    let plan = |sql: &str| {
+        let bound = Binder::new(&catalog, Some("app"))
+            .bind(&parse_statement(sql).expect("parse"))
+            .expect("bind");
+        PhysicalPlanner::plan(
+            Optimizer::optimize(LogicalPlanner::plan(bound)),
+            Collation::default(),
+        )
+        .expect("plan")
+    };
+    plan("SELECT COUNT(*) FROM nodes WHERE grp = 7 AND band > 3");
+    assert!(format!("{lazy:?}").contains("unbuilt"), "{lazy:?}");
+    plan(&two_keys(7, 3));
+    assert!(!format!("{lazy:?}").contains("unbuilt"), "{lazy:?}");
+}
+
+#[test]
+#[ignore = "measurement, not an assertion"]
+#[allow(clippy::too_many_lines)]
+fn single_relation_count_cost() {
+    let schema = TableSchema::new(
+        1,
+        vec![
+            Column::new(1, "id", DataType::UInt64, false),
+            Column::new(2, "owner", DataType::UInt64, false),
+            Column::new(3, "state", DataType::Utf8, false),
+            Column::new(4, "zone", DataType::Utf8, false),
+            Column::new(5, "amount", DataType::Int64, false),
+        ],
+    )
+    .expect("schema");
+    let states = ["open", "sent", "held", "done", "void"];
+    let directory = tempfile::tempdir().expect("directory");
+    let mut table =
+        TableStore::open(directory.path(), schema.clone(), StoreOptions::default()).expect("table");
+    let rows: u64 = 2_000_000;
+    for start in (0..rows).step_by(250_000) {
+        table
+            .bulk_ingest_snapshot(
+                (start..start + 250_000)
+                    .map(|id| {
+                        StoredRow::new(
+                            PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
+                            vec![
+                                Value::UInt64(id),
+                                Value::UInt64(id % 50_000),
+                                Value::Utf8(states[(id * 7 % 5) as usize].to_owned()),
+                                Value::Utf8(format!("z{}", id % 9)),
+                                Value::Int64(i64::try_from(id % 1_000).expect("amount")),
+                            ],
+                            id + 1,
+                            false,
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("rows");
+    }
+    let snapshot = table.snapshot();
+    let started = std::time::Instant::now();
+    let statistics = pintail_catalog::LazyColumnStatistics::ready(snapshot.column_statistics());
+    println!(
+        "column_statistics over {} segments: {:.3} ms",
+        snapshot.segment_count(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    let catalog = |statistics: Option<pintail_catalog::LazyColumnStatistics>| {
+        let mut entry = TableEntry::new(
+            TableId::new(1),
+            "facts",
+            schema.clone(),
+            TableStatistics::with_estimated_row_count(rows),
+        )
+        .expect("entry")
+        .with_key_columns([1])
+        .expect("key");
+        if let Some(statistics) = statistics {
+            entry = entry.with_column_statistics(statistics);
+        }
+        CatalogSnapshot::new([
+            DatabaseEntry::new(DatabaseId::new(1), "app", [entry]).expect("database")
+        ])
+        .expect("catalog")
+    };
+    let catalogs = [catalog(None), catalog(Some(statistics))];
+    let sql = "SELECT COUNT(*) AS n FROM facts WHERE state = 'sent'";
+    let physical = |catalog: &CatalogSnapshot| {
+        let bound = Binder::new(catalog, Some("app"))
+            .bind(&parse_statement(sql).expect("parse"))
+            .expect("bind");
+        PhysicalPlanner::plan(
+            Optimizer::optimize(LogicalPlanner::plan(bound)),
+            Collation::default(),
+        )
+        .expect("plan")
+    };
+    let plans = catalogs
+        .iter()
+        .map(|catalog| pintail_exec::format_physical_plan(&physical(catalog)))
+        .collect::<Vec<_>>();
+    println!("plans equal: {}\n{}", plans[0] == plans[1], plans[1]);
+    if plans[0] != plans[1] {
+        println!("without statistics:\n{}", plans[0]);
+    }
+    let mut timings = [Vec::new(), Vec::new()];
+    let mut planning = [Vec::new(), Vec::new()];
+    for round in 0..30 {
+        let side = round % 2;
+        let started = std::time::Instant::now();
+        let plan = physical(&catalogs[side]);
+        planning[side].push(started.elapsed().as_secs_f64() * 1_000_000.0);
+        let provider =
+            SnapshotScanProvider::new([(DatabaseId::new(1), TableId::new(1), &snapshot)])
+                .expect("provider");
+        let started = std::time::Instant::now();
+        let mut execution =
+            Execution::start(plan, &provider, 1 << 31, Collation::default()).expect("start");
+        while execution.next_batch().expect("batch").is_some() {}
+        timings[side].push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    for (side, name) in ["without", "with"].iter().enumerate() {
+        timings[side].sort_by(f64::total_cmp);
+        planning[side].sort_by(f64::total_cmp);
+        println!(
+            "{name:<8} statistics: run median {:.2} ms min {:.2} ms | plan median {:.1} us",
+            timings[side][7], timings[side][0], planning[side][7]
+        );
     }
 }

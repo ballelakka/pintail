@@ -121,6 +121,63 @@ pub struct ColumnFacts {
     pub range: Option<ColumnRange>,
 }
 
+/// A table's [`ColumnStatistics`], assembled on first use. Most queries
+/// never ask - a single-relation scan plans without them - so a catalog
+/// built after every replica reload does not pay to merge them up front.
+/// Two handles are equal when they share one source.
+#[derive(Clone)]
+pub struct LazyColumnStatistics(Arc<LazySource>);
+
+struct LazySource {
+    built: std::sync::OnceLock<ColumnStatistics>,
+    build: Box<dyn Fn() -> ColumnStatistics + Send + Sync>,
+}
+
+impl LazyColumnStatistics {
+    /// Statistics that `build` assembles the first time they are asked for.
+    #[must_use]
+    pub fn new(build: impl Fn() -> ColumnStatistics + Send + Sync + 'static) -> Self {
+        Self(Arc::new(LazySource {
+            built: std::sync::OnceLock::new(),
+            build: Box::new(build),
+        }))
+    }
+
+    /// Statistics already assembled.
+    #[must_use]
+    pub fn ready(statistics: ColumnStatistics) -> Self {
+        let built = std::sync::OnceLock::new();
+        let _ = built.set(statistics);
+        Self(Arc::new(LazySource {
+            built,
+            build: Box::new(ColumnStatistics::default),
+        }))
+    }
+
+    /// The statistics, assembling them on the first call.
+    #[must_use]
+    pub fn get(&self) -> &ColumnStatistics {
+        self.0.built.get_or_init(|| (self.0.build)())
+    }
+}
+
+impl fmt::Debug for LazyColumnStatistics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.built.get() {
+            Some(statistics) => statistics.fmt(formatter),
+            None => formatter.write_str("LazyColumnStatistics(unbuilt)"),
+        }
+    }
+}
+
+impl PartialEq for LazyColumnStatistics {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LazyColumnStatistics {}
+
 /// A column's value span in an integer domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColumnRange {
@@ -158,7 +215,7 @@ pub struct TableEntry {
     schema: Arc<TableSchema>,
     statistics: TableStatistics,
     key_column_ids: Vec<u32>,
-    column_statistics: Option<Arc<ColumnStatistics>>,
+    column_statistics: Option<LazyColumnStatistics>,
 }
 
 impl TableEntry {
@@ -203,14 +260,14 @@ impl TableEntry {
 
     /// Attaches the per-column statistics the table's stored data keeps.
     #[must_use]
-    pub fn with_column_statistics(mut self, statistics: Arc<ColumnStatistics>) -> Self {
+    pub fn with_column_statistics(mut self, statistics: LazyColumnStatistics) -> Self {
         self.column_statistics = Some(statistics);
         self
     }
 
     /// Per-column statistics, when the table's storage supplied them.
     #[must_use]
-    pub fn column_statistics(&self) -> Option<&Arc<ColumnStatistics>> {
+    pub fn column_statistics(&self) -> Option<&LazyColumnStatistics> {
         self.column_statistics.as_ref()
     }
 

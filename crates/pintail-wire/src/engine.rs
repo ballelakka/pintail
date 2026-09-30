@@ -1942,10 +1942,12 @@ fn build_catalog(replica: &LoadedReplica) -> Result<CatalogSnapshot, QueryError>
                 TableStatistics::with_estimated_row_count(rows),
             )
             .map_err(|error| QueryError::Internal(error.to_string()))?
-            // Built once per load and shared by every query it serves: a
-            // merge of each segment's small sketches plus a bounded sample
-            // of the unflushed rows.
-            .with_column_statistics(std::sync::Arc::new(target.snapshot.column_statistics()));
+            // Assembled on first use - only a join asks - and then shared
+            // by every query this load serves.
+            .with_column_statistics({
+                let snapshot = target.snapshot.clone();
+                pintail_catalog::LazyColumnStatistics::new(move || snapshot.column_statistics())
+            });
             let key_columns = target.source.key_column_ids();
             if key_columns.is_empty() {
                 Ok(entry)

@@ -2797,6 +2797,9 @@ fn reorder_inner_join_run(plan: LogicalPlan) -> LogicalPlan {
     let mut relations = Vec::new();
     let mut conjuncts = Vec::new();
     flatten(&plan, &mut relations, &mut conjuncts);
+    if relations.len() < 3 {
+        return plan;
+    }
     let pinned = !has_pinned_key(&relations[0]) && relations[1..].iter().any(has_pinned_key);
     // Without a pinned relation, a run is rebuilt only when every relation's
     // statistics are known and the rebuilt order is estimated to do well

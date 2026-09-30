@@ -168,7 +168,7 @@ pub struct BoundTable {
     pub key_column_ids: Vec<u32>,
     /// Per-column statistics from the table's stored data, for planning
     /// only.
-    pub column_statistics: Option<std::sync::Arc<pintail_catalog::ColumnStatistics>>,
+    pub column_statistics: Option<pintail_catalog::LazyColumnStatistics>,
     /// Bound input for a derived table or common table expression.
     ///
     /// Catalog-backed tables leave this empty and become storage scans.
