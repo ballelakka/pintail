@@ -461,6 +461,14 @@ pub enum PhysicalPlan {
         /// Named result expressions.
         expressions: Vec<BoundProjection>,
     },
+    /// One row per run of equal `key` values, holding the key: a grouping
+    /// by one column, and nothing else, over input in that column's order.
+    KeyRuns {
+        /// Input operator, in the order of `key`.
+        input: Box<Self>,
+        /// The grouping column.
+        key: BoundExpr,
+    },
     /// Removes duplicate selected rows.
     Distinct {
         /// Input operator.
@@ -540,6 +548,13 @@ impl PhysicalPlan {
                 }));
                 fields
             }
+            Self::KeyRuns { key, .. } => vec![OutputField {
+                name: String::new(),
+                data_type: key.data_type,
+                nullable: key.nullable,
+                geometry: false,
+                timestamp: key.is_source_timestamp(),
+            }],
             Self::HashAggregate {
                 group_by,
                 aggregates,
@@ -978,6 +993,11 @@ fn plan_limit(
                 (input, true)
             } else {
                 key_lookup::ordered_input(input, &keys, trim)
+            };
+            let (input, ordered) = if ordered {
+                (input, true)
+            } else {
+                key_lookup::ordered_groups(input, &keys, trim)
             };
             match (input, ordered) {
                 (ordered, true) => ordered,
@@ -1990,6 +2010,7 @@ fn plan_label(plan: &PhysicalPlan) -> String {
             format!("Project columns={}", expressions.len())
         }
         PhysicalPlan::Distinct { .. } => "Distinct".to_owned(),
+        PhysicalPlan::KeyRuns { .. } => "KeyRuns".to_owned(),
         PhysicalPlan::Sort { keys, top_k, .. } => match top_k {
             Some(k) => format!("Sort keys={} top_k={k}", keys.len()),
             None => format!("Sort keys={}", keys.len()),
@@ -2433,6 +2454,7 @@ fn plan_regex_memory_upper_bound(plan: &PhysicalPlan) -> usize {
         }),
         PhysicalPlan::Derived { input, .. }
         | PhysicalPlan::Distinct { input, .. }
+        | PhysicalPlan::KeyRuns { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::Limit { input, .. } => nested(input),
         PhysicalPlan::CrossJoin { inputs, .. } | PhysicalPlan::UnionAll { inputs } => inputs
@@ -2697,6 +2719,7 @@ fn resolve_plan_subqueries(
         }
         PhysicalPlan::Derived { input, .. }
         | PhysicalPlan::Distinct { input, .. }
+        | PhysicalPlan::KeyRuns { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::Limit { input, .. } => {
             resolve_plan_subqueries(
@@ -3977,6 +4000,13 @@ enum PullOperator {
         current: usize,
     },
     KeyLookupJoin(Box<key_lookup::KeyLookupJoin>),
+    /// One row per run of equal values in the input's column `position`.
+    KeyRuns {
+        input: Box<PullOperator>,
+        position: usize,
+        /// The key of the run last emitted.
+        last: Option<Value>,
+    },
     HashJoin {
         left: Box<Self>,
         right: Box<Self>,
@@ -4148,6 +4178,7 @@ impl PullOperator {
             | Self::HashAggregate { input, .. }
             | Self::Project { input, .. }
             | Self::Distinct { input, .. }
+            | Self::KeyRuns { input, .. }
             | Self::Sort { input, .. }
             | Self::Window { input, .. }
             | Self::Limit { input, .. } => input.release_reservations(memory),
@@ -4869,6 +4900,11 @@ impl PullOperator {
                     .expect("initialized above")
                     .next_batch(column_types, memory)
             }
+            Self::KeyRuns {
+                input,
+                position,
+                last,
+            } => next_key_runs(input, *position, last, memory),
             Self::Distinct {
                 input,
                 column_types,
@@ -5781,6 +5817,24 @@ fn build_operator_inner(
                     collation,
                 },
                 columns,
+            ))
+        }
+        PhysicalPlan::KeyRuns { input, key } => {
+            let (input, columns) = build_operator(*input, provider, memory, collation)?;
+            let position = CompiledExpr::compile(&key, &columns, collation)?
+                .column_index()
+                .ok_or(ExecError::InvalidPhysicalPlan("key runs group by a column"))?;
+            let column = columns
+                .get(position)
+                .cloned()
+                .ok_or(ExecError::InvalidPhysicalPlan("key runs group by a column"))?;
+            Ok((
+                PullOperator::KeyRuns {
+                    input: Box::new(input),
+                    position,
+                    last: None,
+                },
+                vec![column],
             ))
         }
         PhysicalPlan::Distinct {
@@ -8855,4 +8909,39 @@ mod tests {
             "{rendered}"
         );
     }
+}
+
+/// The next batch of `input` holding only the first row of each run of
+/// equal values in its column `position`, and only that column. A run may
+/// continue from one batch into the next, so the key of the last run
+/// emitted carries over.
+fn next_key_runs(
+    input: &mut PullOperator,
+    position: usize,
+    last: &mut Option<Value>,
+    memory: &MemoryTracker,
+) -> Result<Option<RecordBatch>, ExecError> {
+    while let Some(mut batch) = input.next_batch(memory)? {
+        let Some(column) = batch.column(position) else {
+            return Err(ExecError::InvalidPhysicalPlan("key runs group by a column"));
+        };
+        let mut selection = batch.selection().clone();
+        for row in batch.selection().selected_rows() {
+            let value = column.value_owned(row).unwrap_or(Value::Null);
+            if last.as_ref() == Some(&value) {
+                selection.set(row, false)?;
+            } else {
+                *last = Some(value);
+            }
+        }
+        batch.set_selection(selection)?;
+        if batch.visible_row_count() == 0 {
+            continue;
+        }
+        return batch
+            .project_columns(&[position])
+            .map(Some)
+            .ok_or(ExecError::InvalidPhysicalPlan("key runs group by a column"));
+    }
+    Ok(None)
 }

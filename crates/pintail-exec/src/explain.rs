@@ -300,6 +300,10 @@ fn write_plan(
             writeln!(output, "Distinct")?;
             write_plan(input, depth + 1, output, provider)
         }
+        PhysicalPlan::KeyRuns { input, .. } => {
+            writeln!(output, "KeyRuns")?;
+            write_plan(input, depth + 1, output, provider)
+        }
         PhysicalPlan::Window { input, windows, .. } => {
             writeln!(output, "Window functions={}", windows.len())?;
             write_plan(input, depth + 1, output, provider)

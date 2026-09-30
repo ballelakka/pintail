@@ -101,6 +101,21 @@ fn relabelled(plan: &PhysicalPlan) -> Option<(&PhysicalPlan, &[BoundProjection],
     .then_some((input.as_ref(), expressions.as_slice(), columns.as_slice()))
 }
 
+/// A projection keeping some of its input's plain columns - how a scan
+/// read for its predicates drops the columns only they needed - taken
+/// apart: the input and the columns kept.
+fn narrowed(plan: &PhysicalPlan) -> Option<(&PhysicalPlan, &[BoundProjection])> {
+    let PhysicalPlan::Project { input, expressions } = plan else {
+        return None;
+    };
+    expressions
+        .iter()
+        .all(|projection| {
+            matches!(&projection.expr.kind, BoundExprKind::Column(column) if !column.outer)
+        })
+        .then_some((input.as_ref(), expressions.as_slice()))
+}
+
 /// The table scan a lookup side reads, and the side's column `key` as that
 /// scan's own column: the scan itself, a filter over it, or a derived table
 /// relabelling plain columns of either.
@@ -110,6 +125,15 @@ fn lookup_scan<'plan>(
 ) -> Option<(&'plan Scan, BoundExpr)> {
     if let Some(scan) = base_scan(plan) {
         return Some((scan, key.clone()));
+    }
+    if let Some((input, expressions)) = narrowed(plan) {
+        let BoundExprKind::Column(column) = &key.kind else {
+            return None;
+        };
+        return expressions
+            .iter()
+            .any(|projection| matches!(&projection.expr.kind, BoundExprKind::Column(candidate) if same_column(candidate, column)))
+            .then_some((base_scan(input)?, key.clone()));
     }
     let (input, expressions, columns) = relabelled(plan)?;
     let BoundExprKind::Column(column) = &key.kind else {
@@ -241,6 +265,157 @@ pub(super) fn ordered_input(
         },
         other => (other, false),
     }
+}
+
+/// Whether `plan` yields its rows in the order of `column`, a leading key
+/// column of the scan at the bottom of its left spine, once each hash join
+/// on that spine reads its other input by key: the scan, filters and
+/// projections keeping `column` over it, and joins driven by it whose other
+/// input is found by its whole integer primary key.
+fn spine_ordered(plan: &PhysicalPlan, column: &BoundColumn) -> bool {
+    if let Some(scan) = base_scan(plan) {
+        return ordered_by(scan, &[column]);
+    }
+    match plan {
+        PhysicalPlan::Filter { input, .. } => spine_ordered(input, column),
+        PhysicalPlan::Project { input, .. } => narrowed(plan).is_some_and(|(_, expressions)| {
+            expressions.iter().any(|projection| {
+                matches!(&projection.expr.kind, BoundExprKind::Column(candidate) if same_column(candidate, column))
+            })
+        }) && spine_ordered(input, column),
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            left_key,
+            extra_keys,
+            null_safe,
+            right_key,
+            ..
+        } => {
+            extra_keys.is_empty()
+                && !null_safe.contains(&true)
+                && matches!(kind, BoundJoinKind::Inner | BoundJoinKind::Left)
+                && integer_type(left_key.data_type)
+                && lookup_by_key(right, right_key)
+                && spine_ordered(left, column)
+        }
+        _ => false,
+    }
+}
+
+/// `plan` with every hash join on its left spine a key lookup join driven
+/// by its left input, for a plan `spine_ordered` accepted.
+fn drive_spine(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new(drive_spine(*input)),
+            predicate,
+        },
+        PhysicalPlan::Project { input, expressions } => PhysicalPlan::Project {
+            input: Box::new(drive_spine(*input)),
+            expressions,
+        },
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            left_key,
+            right_key,
+            residual,
+            ..
+        } => PhysicalPlan::KeyLookupJoin {
+            left: Box::new(drive_spine(*left)),
+            right,
+            kind: lookup_kind(kind),
+            driving_left: true,
+            driving_key: left_key,
+            lookup_key: right_key,
+            residual,
+        },
+        other => other,
+    }
+}
+
+/// The sort input as a plan already in the order of `keys`, and `true`,
+/// when it is a projection over a grouping by one column and nothing else,
+/// no aggregate, whose input comes in that column's order through joins
+/// that can read their other inputs by key. Each group is then a run of
+/// equal keys, so the groups are the runs, in order, and the limit above
+/// stops the scan and the joins once it has its rows. `MySQL` groups an
+/// integer by its value, which is what two equal keys in a run share. Any
+/// other input comes back unchanged, with `false`.
+pub(super) fn ordered_groups(
+    input: PhysicalPlan,
+    keys: &[BoundOrderKey],
+    trim: usize,
+) -> (PhysicalPlan, bool) {
+    let accepts = |plan: &PhysicalPlan| {
+        let PhysicalPlan::Project { input, expressions } = plan else {
+            return false;
+        };
+        let PhysicalPlan::HashAggregate {
+            input: grouped,
+            group_by,
+            aggregates,
+        } = input.as_ref()
+        else {
+            return false;
+        };
+        let ([group], [key]) = (group_by.as_slice(), keys) else {
+            return false;
+        };
+        let BoundExprKind::Column(column) = &group.kind else {
+            return false;
+        };
+        aggregates.is_empty()
+            && key.ascending
+            && trim <= expressions.len()
+            && !column.outer
+            && integer_type(group.data_type)
+            && expressions
+                .get(key.index)
+                .is_some_and(|projection| match &projection.expr.kind {
+                    BoundExprKind::GroupKey(0) => true,
+                    BoundExprKind::Column(candidate) => same_column(candidate, column),
+                    _ => false,
+                })
+            && spine_ordered(grouped, column)
+    };
+    if !accepts(&input) {
+        return (input, false);
+    }
+    let PhysicalPlan::Project {
+        input: grouped,
+        mut expressions,
+    } = input
+    else {
+        return (input, false);
+    };
+    let (spine, mut group_by) = match *grouped {
+        PhysicalPlan::HashAggregate {
+            input, group_by, ..
+        } => (input, group_by),
+        other => {
+            let input = PhysicalPlan::Project {
+                input: Box::new(other),
+                expressions,
+            };
+            return (input, false);
+        }
+    };
+    let key = group_by.remove(0);
+    expressions.truncate(expressions.len() - trim);
+    (
+        PhysicalPlan::Project {
+            input: Box::new(PhysicalPlan::KeyRuns {
+                input: Box::new(drive_spine(*spine)),
+                key,
+            }),
+            expressions,
+        },
+        true,
+    )
 }
 
 /// Keys a driving input may be pinned to for its join to read the other
@@ -479,7 +654,7 @@ impl KeyLookupJoin {
             // About to read the whole table for scattered keys: a driving
             // input that ends within a few more rows names every key the
             // join will ever look up, and the read keeps only those.
-            let known = if self.lookup.reads_all(&keys) {
+            let known = if self.lookup.reads_all(&keys) && self.lookup.worth_knowing() {
                 self.fill_known(memory)?;
                 self.driving_done.then(|| {
                     let mut known = keys.clone();
@@ -598,6 +773,15 @@ impl Lookup {
                 && key_ranges(keys, ranged.unsigned).len() <= MAX_RANGES))
     }
 
+    /// Whether a whole read of the table is worth pulling the driving input
+    /// ahead to learn every key first. A table of no more rows than that
+    /// pull reads whole for less than it saves, and the pull drives every
+    /// join beneath past what a limit above would have stopped at.
+    fn worth_knowing(&self) -> bool {
+        matches!(self, Self::Ranged(ranged)
+            if usize::try_from(ranged.budget).unwrap_or(usize::MAX) > KNOWN_KEYS_ROWS)
+    }
+
     /// `known`, when given, is every key the join will look up: a whole
     /// read of the table then decodes only the rows those keys name.
     fn find(
@@ -674,6 +858,32 @@ impl LookupPlan {
                 ),
                 _ => return Err(NOT_A_SCAN),
             },
+            // A projection of plain columns lays its rows out as those
+            // columns, which is the relabelling a derived table names.
+            plan @ PhysicalPlan::Project { .. } if narrowed(&plan).is_some() => {
+                let PhysicalPlan::Project { input, expressions } = plan else {
+                    return Err(NOT_A_SCAN);
+                };
+                let columns = expressions
+                    .iter()
+                    .map(|projection| match &projection.expr.kind {
+                        BoundExprKind::Column(column) => {
+                            let mut column = column.clone();
+                            column.outer = false;
+                            column.nullable = projection.expr.nullable;
+                            Ok(column)
+                        }
+                        _ => Err(NOT_A_SCAN),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    Some(Relabel {
+                        expressions,
+                        columns,
+                    }),
+                    *input,
+                )
+            }
             other => (None, other),
         };
         let (scan, filter) = match plan {
