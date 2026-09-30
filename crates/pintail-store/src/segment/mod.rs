@@ -2770,13 +2770,6 @@ impl Validity {
         }
     }
 
-    /// Reserving is only meaningful once a null has forced a per-row vector.
-    fn reserve(&mut self, additional: usize) {
-        if let Self::Bits(bits) = self {
-            bits.reserve(additional);
-        }
-    }
-
     fn iter(&self) -> Box<dyn Iterator<Item = bool> + '_> {
         match self {
             Self::AllValid(count) => Box::new(std::iter::repeat_n(true, *count)),
@@ -2973,17 +2966,29 @@ impl ColumnBuilder {
             Self::DictUtf8 {
                 codes, validity, ..
             } => {
-                codes.reserve(raw.len() / 4);
-                validity.reserve(raw.len() / 4);
-                for chunk in raw.chunks_exact(4) {
-                    let block_code =
-                        u32::from_le_bytes(chunk.try_into().expect("4-byte code")) as usize;
-                    let chunk_code = *translation
-                        .get(block_code)
-                        .ok_or("dictionary index is out of bounds")?;
-                    codes.push(chunk_code);
-                    validity.push(true);
+                // One sized extend and one validity bump per block. A push
+                // per row, each with its own capacity check, an early
+                // return and a validity push, left the loop's speed to how
+                // the surrounding code happened to inline: an unrelated
+                // change elsewhere in the crate made it ~40% slower.
+                let rows = raw.len() / 4;
+                let start = codes.len();
+                let mut in_bounds = true;
+                codes.extend(raw.chunks_exact(4).map(|chunk| {
+                    let block_code = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    translation
+                        .get(block_code as usize)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            in_bounds = false;
+                            0
+                        })
+                }));
+                if !in_bounds {
+                    codes.truncate(start);
+                    return Err("dictionary index is out of bounds".to_owned());
                 }
+                validity.extend_valid(rows);
                 Ok(())
             }
             _ => Err("dictionary code in a non-dictionary column".to_owned()),
