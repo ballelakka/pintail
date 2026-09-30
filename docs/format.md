@@ -114,7 +114,7 @@ Publication writes and synchronizes `.manifest.ptm.tmp`, atomically renames
 it to `manifest.ptm`, then synchronizes the table directory. A snapshot holds
 an `Arc` to one immutable decoded generation.
 
-## Segment (`PTSEG`, version 4)
+## Segment (`PTSEG`, version 5)
 
 Readers accept all published segment versions. Version 1 stores the original
 text carriers and always-compressed blocks. Version 2 adds fixed-width native
@@ -122,7 +122,8 @@ units for eligible decimal and temporal columns. Version 3 adds raw block
 payloads when LZ4 cannot save at least 5%; the other framing and all prior
 compression tags remain readable. Version 4 adds a footer digest over the
 header and every column descriptor, the only bytes no block or footer
-checksum covered.
+checksum covered. Version 5 adds the framed compression layout for wide plain
+UTF-8 blocks.
 
 ### Header
 
@@ -186,6 +187,29 @@ payload whose byte length must exactly equal `uncompressed_payload_length`.
 Compression ID `1` is LZ4. Normal flushes try LZ4 per block and retain it only
 when the encoded payload is at least 5% smaller; otherwise they store ID `0`.
 Compression ID `2` is zstd and remains the full-merge cold-tier codec.
+
+Compression ID `4` (version 5 and later) is framed. A plain UTF-8 block whose
+encoded payload reaches 256 KiB is cut at value boundaries into frames of
+about 64 KiB, each compressed on its own with the tier's codec (LZ4, raw when
+LZ4 cannot save 5%, or zstd):
+
+```
+u32 frame_count
+frame_count x (u32 value_count, u32 uncompressed_length,
+               u8 frame_compression, u32 stored_length, u64 xxh3(stored))
+u64 xxh3(block_head ++ frame_count ++ frame entries)
+frame bytes, concatenated in order
+```
+
+`block_head` is the payload before `compressed_payload`: row count, null
+bitmap, encoding, compression and uncompressed length. Frame compression IDs
+are `0`, `1` and `2` as above. Frame lengths must sum to
+`uncompressed_payload_length` and value counts to the block's present values;
+decompressing every frame in order yields exactly the plain payload. A read
+of a few rows loads the block head, the directory and only the frames that
+hold them, checking each against its own digest instead of the block
+checksum. Under the adaptive policy a block whose frames do not save 5%
+overall is stored raw.
 
 Physical scalars are one byte for boolean, eight bytes for integer/float
 bits, and length-prefixed bytes for UTF-8/binary. Composite keys start with a

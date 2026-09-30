@@ -1,9 +1,10 @@
 mod encoding;
 
 use encoding::{
-    compare_cells, compress_block_for_storage, decode_integer_base, decode_payload,
-    decoded_heap_upper_bound, decompress_block, encode_payload, hll_registers, select_encoding,
-    unpack, unpack_delta_each, unpack_signed_into, unpack_unsigned_into,
+    FRAME_ENTRY_BYTES, FRAMED_MINIMUM_BYTES, compare_cells, compress_block_for_storage,
+    compress_framed_for_storage, decode_integer_base, decode_payload, decoded_heap_upper_bound,
+    decompress_block, decompress_frame, encode_payload, framed_head_digest, hll_registers,
+    parse_frame_directory, select_encoding, unpack, unpack_delta_each, unpack_signed_into, unpack_unsigned_into,
 };
 
 use std::{
@@ -25,12 +26,13 @@ use crate::{
 
 const MAGIC: &[u8; 5] = b"PTSEG";
 const FOOTER_MAGIC: &[u8; 5] = b"PTFTR";
-const FORMAT_VERSION: u8 = 4;
+const FORMAT_VERSION: u8 = 5;
 
 /// Segment versions this reader understands: v1 stores text carriers for
 /// every Utf8-storage column; v2 additionally stores fixed-width native
 /// units (wire type Int64) for eligible Decimal/Date32/DateTime64 columns;
-/// v3 permits raw block payloads when LZ4 cannot save at least 5%.
+/// v3 permits raw block payloads when LZ4 cannot save at least 5%;
+/// v5 stores wide plain text blocks as independently compressed frames.
 /// Header bytes after the magic: format version, schema version, schema
 /// fingerprint, row count, column count and target block rows.
 const HEADER_LENGTH: usize = MAGIC.len() + 1 + 4 + 8 + 8 + 4 + 4;
@@ -40,6 +42,8 @@ const COLUMN_DESCRIPTOR_LENGTH: usize = 4 + 1 + 4;
 /// The first format whose footer carries a digest of the header and column
 /// descriptors.
 const DESCRIPTOR_DIGEST_VERSION: u8 = 4;
+/// The first format whose blocks may carry the framed compression layout.
+const FRAMED_BLOCK_VERSION: u8 = 5;
 
 /// The digest a version 4 footer records over the fields no block checksum
 /// covers. Those fields decide how many rows a read allocates and which
@@ -70,7 +74,7 @@ fn written_format_version() -> u8 {
 }
 
 const fn format_version_supported(version: u8) -> bool {
-    matches!(version, 1..=4)
+    matches!(version, 1..=5)
 }
 
 fn read_format_version(path: &Path, decoder: &mut FileDecoder) -> Result<u8, StoreError> {
@@ -558,6 +562,10 @@ pub(crate) enum Compression {
     Zstd = 2,
     /// Writer policy only. Stored blocks carry either `None` or `Lz4`.
     AdaptiveLz4 = 3,
+    /// Stored layout only: a plain text payload split at value boundaries
+    /// into frames compressed one by one, so a read of a few rows
+    /// decompresses only the frames that hold them.
+    Framed = 4,
 }
 
 impl Compression {
@@ -569,6 +577,7 @@ impl Compression {
             )),
             1 => Ok(Self::Lz4),
             2 => Ok(Self::Zstd),
+            4 if format_version >= FRAMED_BLOCK_VERSION => Ok(Self::Framed),
             _ => Err(format!("unknown block compression {tag}")),
         }
     }
@@ -705,7 +714,7 @@ pub(crate) fn probe_native_column(
     Some(parsed)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Encoding {
     Plain = 0,
     Dictionary = 1,
@@ -3306,6 +3315,7 @@ pub(crate) fn read_projected_column_ranges(
                         builder,
                         ranges: RangeCursor::new(block_ranges()),
                     },
+                    block_limit - block_start,
                 )?;
                 blocks_decoded += 1;
                 let builder = builders[position]
@@ -3485,7 +3495,25 @@ fn write_block(
     let encoding = select_encoding(logical_type, &non_null);
     block.u8(encoding as u8);
     let uncompressed = encode_payload(logical_type, encoding, &non_null)?;
-    let (stored_compression, compressed) = compress_block_for_storage(compression, &uncompressed)?;
+    // Wide text (documents, long strings) is where one block's payload runs
+    // to megabytes; a read of a handful of its rows would otherwise
+    // decompress all of it.
+    let framed = logical_type == LogicalType::Utf8
+        && encoding == Encoding::Plain
+        && uncompressed.len() >= FRAMED_MINIMUM_BYTES
+        && written_format_version() >= FRAMED_BLOCK_VERSION;
+    let (stored_compression, compressed) = if framed {
+        let mut block_head = block.as_slice().to_vec();
+        block_head.push(Compression::Framed as u8);
+        block_head.extend_from_slice(
+            &u32::try_from(uncompressed.len())
+                .map_err(|_| StoreError::FormatLimit("uncompressed block exceeds u32::MAX".into()))?
+                .to_le_bytes(),
+        );
+        compress_framed_for_storage(compression, &block_head, &uncompressed)?
+    } else {
+        compress_block_for_storage(compression, &uncompressed)?
+    };
     block.u8(stored_compression as u8);
     block.length(uncompressed.len(), "uncompressed block")?;
     block.bytes(&compressed, "compressed block")?;
@@ -3973,7 +4001,8 @@ fn read_file_block_utf8_into(
     path: &Path,
     decoder: &mut FileDecoder,
     memory: &ScanMemoryBudget<'_>,
-    sink: Utf8Sink<'_>,
+    mut sink: Utf8Sink<'_>,
+    block_rows: usize,
 ) -> Result<BlockRead, StoreError> {
     let format_version = decoder
         .format_version()
@@ -3982,6 +4011,20 @@ fn read_file_block_utf8_into(
     let payload_length = decoder
         .u32()
         .map_err(|reason| corrupt_here(path, decoder, reason))? as usize;
+    // A sparse selection of a framed block reads only the frames it needs.
+    if format_version >= FRAMED_BLOCK_VERSION
+        && !sink.ranges.covers_all(block_rows)
+        && let Some(block) = read_file_framed_utf8_rows(
+            path,
+            decoder,
+            block_offset,
+            payload_length,
+            memory,
+            &mut sink,
+        )?
+    {
+        return Ok(block);
+    }
     let encoded_length = payload_length.saturating_add(12);
     let _encoded_memory = memory.reserve_temporary(encoded_length)?;
     let mut encoded = Vec::with_capacity(encoded_length);
@@ -4290,6 +4333,176 @@ where
         cells: Some(cells),
         reserved_bytes: memory.map_or(0, |_| reserved_bytes),
     })
+}
+
+/// Reads the selected rows of a framed plain text block straight from the
+/// file: the block head, the frame directory and the frames holding a
+/// selected value, each checked against its own digest, and nothing else.
+/// Rows are walked once in order; a frame stays loaded while consecutive
+/// selected values fall in it, and the value cursor inside it only moves
+/// forward. Returns `None`, with the decoder just past the block's length,
+/// for any other block.
+#[allow(clippy::too_many_lines)]
+fn read_file_framed_utf8_rows(
+    path: &Path,
+    decoder: &mut FileDecoder,
+    block_offset: usize,
+    payload_length: usize,
+    memory: &ScanMemoryBudget<'_>,
+    sink: &mut Utf8Sink<'_>,
+) -> Result<Option<BlockRead>, StoreError> {
+    let mut head = Vec::new();
+    let row_count = decoder
+        .u32()
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    head.extend_from_slice(&row_count.to_le_bytes());
+    let row_count = row_count as usize;
+    let bitmap_length = decoder
+        .u32()
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    if bitmap_length as usize != row_count.div_ceil(8) {
+        return Err(corrupt_here(path, decoder, "invalid null bitmap length"));
+    }
+    head.extend_from_slice(&bitmap_length.to_le_bytes());
+    let bitmap_start = head.len();
+    head.resize(bitmap_start + bitmap_length as usize, 0);
+    decoder
+        .read_exact(&mut head[bitmap_start..])
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    let mut tags = [0_u8; 6];
+    decoder
+        .read_exact(&mut tags)
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    head.extend_from_slice(&tags);
+    if tags[0] != Encoding::Plain as u8 || tags[1] != Compression::Framed as u8 {
+        decoder
+            .seek_to(block_offset + 4)
+            .map_err(|reason| corrupt_here(path, decoder, reason))?;
+        return Ok(None);
+    }
+    let uncompressed_length = u32::from_le_bytes([tags[2], tags[3], tags[4], tags[5]]) as usize;
+    let stored_total = decoder
+        .u32()
+        .map_err(|reason| corrupt_here(path, decoder, reason))? as usize;
+    let frame_count = decoder
+        .u32()
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    let directory_length = (frame_count as usize)
+        .checked_mul(FRAME_ENTRY_BYTES)
+        .and_then(|length| length.checked_add(4))
+        .filter(|length| length.saturating_add(8) <= stored_total)
+        .ok_or_else(|| corrupt_here(path, decoder, "frame directory exceeds its block"))?;
+    let mut directory = Vec::with_capacity(directory_length);
+    directory.extend_from_slice(&frame_count.to_le_bytes());
+    directory.resize(directory_length, 0);
+    decoder
+        .read_exact(&mut directory[4..])
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    let digest = decoder
+        .u64()
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    if framed_head_digest(&head, &directory) != digest {
+        return Err(corrupt(path, block_offset, "framed block head checksum mismatch"));
+    }
+    let entries = parse_frame_directory(&directory, uncompressed_length)
+        .map_err(|reason| corrupt(path, block_offset, reason))?;
+    let data_start = decoder.decode_position();
+    let stored = entries
+        .last()
+        .map_or(0, |entry| entry.stored_offset + entry.stored_length);
+    if stored + directory_length + 8 != stored_total {
+        return Err(corrupt(path, block_offset, "frames do not fill their block"));
+    }
+    let null_bitmap = &head[bitmap_start..bitmap_start + bitmap_length as usize];
+    let is_null = |row: usize| null_bitmap[row / 8] & (1 << (row % 8)) != 0;
+    let non_null_count = (0..row_count).filter(|row| !is_null(*row)).count();
+    if entries.last().map_or(0, encoding::FrameEntry::end_value) != non_null_count {
+        return Err(corrupt(
+            path,
+            block_offset,
+            "frames hold a value count other than the block's",
+        ));
+    }
+    let widest = entries
+        .iter()
+        .map(|entry| entry.uncompressed_length + entry.stored_length)
+        .max()
+        .unwrap_or(0);
+    let _frame_memory = memory.reserve_temporary(widest)?;
+    sink.builder.degrade_dictionary();
+    let row_end = sink
+        .ranges
+        .ranges
+        .last()
+        .map_or(0, |range| range.1)
+        .min(row_count);
+    // The loaded frame's index and bytes, the byte offset of its next
+    // unread value and that value's ordinal.
+    let mut loaded: Option<(usize, Vec<u8>)> = None;
+    let mut cursor = 0_usize;
+    let mut cursor_value = 0_usize;
+    let mut ordinal = 0_usize;
+    for row in 0..row_end {
+        let row_is_null = is_null(row);
+        if sink.ranges.contains(row) {
+            if row_is_null {
+                sink.builder
+                    .push(Cell::Null)
+                    .map_err(|reason| corrupt(path, block_offset, reason))?;
+            } else {
+                let frame_index = entries.partition_point(|entry| entry.end_value() <= ordinal);
+                let entry = &entries[frame_index];
+                if loaded.as_ref().is_none_or(|(index, _)| *index != frame_index) {
+                    decoder
+                        .seek_to(data_start + entry.stored_offset)
+                        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+                    let stored = decoder
+                        .raw(entry.stored_length)
+                        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+                    if xxh3_64(&stored) != entry.checksum {
+                        return Err(corrupt(
+                            path,
+                            data_start + entry.stored_offset,
+                            "frame checksum mismatch",
+                        ));
+                    }
+                    let bytes = decompress_frame(entry, &stored)
+                        .map_err(|reason| corrupt(path, data_start + entry.stored_offset, reason))?;
+                    loaded = Some((frame_index, bytes));
+                    cursor = 0;
+                    cursor_value = entry.first_value;
+                }
+                let (_, bytes) = loaded.as_ref().expect("a frame was just loaded");
+                let mut values = Decoder::new(bytes.get(cursor..).unwrap_or_default());
+                let value = (|| {
+                    for _ in cursor_value..ordinal {
+                        values.bytes()?;
+                    }
+                    let value = values.bytes()?;
+                    std::str::from_utf8(value)
+                        .map_err(|_| "invalid UTF-8 block value".to_owned())?;
+                    Ok::<_, String>(value)
+                })()
+                .map_err(|reason| corrupt(path, data_start + entry.stored_offset, reason))?;
+                cursor += values.position();
+                cursor_value = ordinal + 1;
+                sink.builder
+                    .push_utf8(value)
+                    .map_err(|reason| corrupt(path, block_offset, reason))?;
+            }
+        }
+        if !row_is_null {
+            ordinal += 1;
+        }
+    }
+    decoder
+        .seek_to(block_offset + 4 + payload_length + 8)
+        .map_err(|reason| corrupt_here(path, decoder, reason))?;
+    Ok(Some(BlockRead {
+        row_count,
+        cells: None,
+        reserved_bytes: 0,
+    }))
 }
 
 /// Decodes one string block payload straight into a column builder's arena.
@@ -5694,5 +5907,194 @@ mod delta_direct_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod framed_block_tests {
+    use std::{fmt::Write as _, time::Instant};
+
+    use pintail_types::{Column, DataType, KeyPart, PrimaryKey, StoredRow, TableSchema, Value};
+
+    use super::{Compression, ScanMemoryBudget, SegmentMeta, read_projected_column_ranges, write};
+
+    fn schema() -> TableSchema {
+        TableSchema::new(
+            1,
+            vec![
+                Column::new(1, "id", DataType::UInt64, false),
+                Column::new(2, "owner", DataType::UInt64, false),
+                Column::new(3, "doc", DataType::Utf8, true),
+            ],
+        )
+        .expect("schema")
+    }
+
+    /// A document of roughly `width` bytes that compresses the way stored
+    /// JSON does: repeated keys, varying numbers and short strings.
+    fn document(id: u64, width: usize) -> String {
+        let mut text = String::from("[");
+        let mut item = 0_u64;
+        while text.len() < width {
+            let mixed = id.wrapping_mul(0x9E37_79B9).wrapping_add(item * 7919);
+            write!(
+                text,
+                "{{\"slot\":{item},\"score\":{},\"label\":\"k{}\",\"ok\":{}}},",
+                mixed % 1000,
+                mixed % 97,
+                mixed.is_multiple_of(2)
+            )
+            .expect("write to a string");
+            item += 1;
+        }
+        text.push(']');
+        text
+    }
+
+    fn rows(count: u64, width: usize) -> Vec<StoredRow> {
+        (0..count)
+            .map(|id| {
+                let doc = if id % 13 == 5 {
+                    Value::Null
+                } else {
+                    Value::Utf8(document(id, width))
+                };
+                StoredRow::new(
+                    PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
+                    vec![Value::UInt64(id), Value::UInt64(id % 997), doc],
+                    1,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn fetch(
+        directory: &std::path::Path,
+        meta: &SegmentMeta,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Vec<Value> {
+        let budget_cell = std::sync::atomic::AtomicUsize::new(0);
+        let budget = ScanMemoryBudget::new(&budget_cell, usize::MAX);
+        let mut fetch =
+            read_projected_column_ranges(directory, meta, &schema(), &[2], ranges, &budget)
+                .expect("ranged read");
+        fetch.columns.remove(0).into_values()
+    }
+
+    /// Every row pattern a sparse read can ask a framed block for: single
+    /// rows, rows either side of a frame edge, nulls, runs spanning frames,
+    /// and whole blocks. Each answer must equal the rows as written, under
+    /// both stored codecs a frame can carry.
+    #[test]
+    fn sparse_and_full_reads_of_framed_blocks_return_the_written_rows() {
+        let rows = rows(3000, 900);
+        let expected = rows
+            .iter()
+            .map(|row| row.values()[2].clone())
+            .collect::<Vec<_>>();
+        for compression in [Compression::AdaptiveLz4, Compression::Zstd, Compression::Lz4] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let meta = write(directory.path(), 1, &schema(), &rows, 1024, compression, true)
+                .expect("write segment");
+            let bytes = std::fs::read(directory.path().join(&meta.file_name)).expect("bytes");
+            assert_eq!(bytes[5], super::FORMAT_VERSION);
+            let range_sets: Vec<Vec<std::ops::Range<usize>>> = vec![
+                vec![0..1],
+                vec![5..6],
+                vec![34..38, 1023..1026, 2999..3000],
+                (0..3000).step_by(97).map(|row| row..row + 1).collect(),
+                vec![100..2100],
+                vec![0..3000],
+            ];
+            for ranges in range_sets {
+                let want = ranges
+                    .iter()
+                    .flat_map(|range| expected[range.clone()].iter().cloned())
+                    .collect::<Vec<_>>();
+                assert_eq!(fetch(directory.path(), &meta, &ranges), want, "{ranges:?}");
+            }
+        }
+    }
+
+    /// A sparse read of a framed block loads frames without the block
+    /// checksum, so each frame carries its own: damage inside a frame a read
+    /// selects must fail that read rather than return altered text.
+    #[test]
+    fn a_sparse_read_checks_each_frame_it_loads() {
+        let rows = rows(3000, 900);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let meta = write(
+            directory.path(),
+            1,
+            &schema(),
+            &rows,
+            1024,
+            Compression::AdaptiveLz4,
+            true,
+        )
+        .expect("write segment");
+        let path = directory.path().join(&meta.file_name);
+        let mut bytes = std::fs::read(&path).expect("read segment");
+        let middle = bytes.len() / 2;
+        for byte in &mut bytes[middle..middle + 16] {
+            *byte ^= 0x5A;
+        }
+        std::fs::write(&path, &bytes).expect("rewrite segment");
+        let every_other = (0..3000_usize).step_by(2).map(|row| row..row + 1).collect::<Vec<_>>();
+        let budget_cell = std::sync::atomic::AtomicUsize::new(0);
+        let budget = ScanMemoryBudget::new(&budget_cell, usize::MAX);
+        let read =
+            read_projected_column_ranges(directory.path(), &meta, &schema(), &[2], &every_other, &budget);
+        let Err(error) = read else {
+            panic!("a damaged frame must fail the read");
+        };
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+    }
+
+    /// Before/after measurement for a wide text column: a sparse fetch of
+    /// about one row in 700 spread over every block, and a full-column read,
+    /// against the same rows written as unframed (v4) and framed (v5)
+    /// segments. `cargo test -p pintail-store --release framed_block_tests
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_sparse_and_full_reads_of_a_wide_text_column() {
+        let rows = rows(98_304, 1100);
+        let sparse = (0..98_304_usize)
+            .step_by(1031)
+            .map(|row| row..row + 1)
+            .collect::<Vec<_>>();
+        for compression in [Compression::AdaptiveLz4, Compression::Zstd] {
+            for version in [4_u8, 5] {
+                super::WRITTEN_FORMAT_VERSION.with(|written| written.set(version));
+                let directory = tempfile::tempdir().expect("tempdir");
+                let meta = write(directory.path(), 1, &schema(), &rows, 16_384, compression, true)
+                    .expect("write segment");
+                super::WRITTEN_FORMAT_VERSION.with(|written| written.set(super::FORMAT_VERSION));
+                let size = std::fs::metadata(directory.path().join(&meta.file_name))
+                    .expect("metadata")
+                    .len();
+                let time = |ranges: &[std::ops::Range<usize>]| {
+                    let mut best = f64::MAX;
+                    for _ in 0..7 {
+                        let started = Instant::now();
+                        let values = fetch(directory.path(), &meta, ranges);
+                        best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                        assert_eq!(
+                            values.len(),
+                            ranges.iter().map(std::ops::Range::len).sum::<usize>()
+                        );
+                    }
+                    best
+                };
+                let sparse_ms = time(&sparse);
+                let full_ms = time(std::slice::from_ref(&(0..98_304)));
+                println!(
+                    "{compression:?} v{version}: {size} bytes, sparse {} rows {sparse_ms:.2} ms, full column {full_ms:.2} ms",
+                    sparse.len()
+                );
+            }
+        }
     }
 }

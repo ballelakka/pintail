@@ -38,7 +38,215 @@ pub(super) fn compress_block_for_storage(
                 Ok((Compression::None, bytes.to_vec()))
             }
         }
+        Compression::Framed => Err(StoreError::FormatLimit(
+            "framed is a stored block layout, not a writer policy".into(),
+        )),
     }
+}
+
+/// Uncompressed bytes a frame of a framed block aims for. A frame closes at
+/// the first value boundary at or past this size, so a value is never split
+/// and one wider than the target sits in a frame of its own.
+pub(super) const FRAME_TARGET_BYTES: usize = 64 * 1024;
+
+/// The smallest plain text payload stored as frames. Below four frames the
+/// saving on a sparse read is too small to pay for the frame directory.
+pub(super) const FRAMED_MINIMUM_BYTES: usize = 4 * FRAME_TARGET_BYTES;
+
+/// Bytes one frame occupies in a framed block's directory.
+pub(super) const FRAME_ENTRY_BYTES: usize = 4 + 4 + 1 + 4 + 8;
+
+/// One independently compressed run of whole values inside a framed block,
+/// as its directory entry describes it.
+pub(super) struct FrameEntry {
+    /// Non-null ordinal, within the block, of the frame's first value.
+    pub(super) first_value: usize,
+    pub(super) value_count: usize,
+    pub(super) uncompressed_length: usize,
+    pub(super) codec: Compression,
+    /// Offset of the stored bytes from the end of the directory.
+    pub(super) stored_offset: usize,
+    pub(super) stored_length: usize,
+    pub(super) checksum: u64,
+}
+
+impl FrameEntry {
+    pub(super) fn end_value(&self) -> usize {
+        self.first_value + self.value_count
+    }
+}
+
+/// A frame and its stored bytes.
+pub(super) struct Frame<'a> {
+    pub(super) entry: FrameEntry,
+    data: &'a [u8],
+}
+
+/// Compresses a plain length-prefixed value payload as a directory of
+/// frames, each holding whole values and compressed on its own, so a read of
+/// a few rows decompresses the frames holding them instead of the block.
+/// Decompressing every frame in order yields `bytes` exactly, so a full
+/// decode sees the same payload an unframed block stores.
+///
+/// Layout: `u32 frame_count`; per frame `u32 value_count`,
+/// `u32 uncompressed_length`, `u8 codec`, `u32 stored_length` and
+/// `u64 xxh3(stored bytes)`; then `u64 xxh3(block_head ++ directory)`; then
+/// every frame's stored bytes in order. `block_head` is the block payload
+/// before its compressed bytes (row count, null bitmap, encoding, the framed
+/// tag and the uncompressed length), so a reader that loads only the head,
+/// the directory and the frames it needs can check each of them without
+/// reading the rest of the block. Under the adaptive policy a frame LZ4
+/// cannot shrink by 5% is stored raw, and a block whose frames together do
+/// not save 5% is stored raw and unframed.
+pub(super) fn compress_framed_for_storage(
+    policy: Compression,
+    block_head: &[u8],
+    bytes: &[u8],
+) -> Result<(Compression, Vec<u8>), StoreError> {
+    if matches!(policy, Compression::None | Compression::Framed) {
+        return compress_block_for_storage(policy, bytes);
+    }
+    let mut frames = Vec::new();
+    let mut decoder = Decoder::new(bytes);
+    let mut start = 0_usize;
+    let mut values = 0_usize;
+    while decoder.position() < bytes.len() {
+        decoder
+            .bytes()
+            .map_err(|reason| StoreError::FormatLimit(format!("plain payload: {reason}")))?;
+        values += 1;
+        if decoder.position() - start >= FRAME_TARGET_BYTES {
+            frames.push((values, start..decoder.position()));
+            start = decoder.position();
+            values = 0;
+        }
+    }
+    if values > 0 {
+        frames.push((values, start..bytes.len()));
+    }
+    let mut directory = Encoder::new();
+    directory.length(frames.len(), "frame count")?;
+    let mut data = Vec::with_capacity(bytes.len() / 2);
+    for (value_count, range) in frames {
+        let raw = &bytes[range];
+        let (codec, stored) = match policy {
+            Compression::Zstd => compress_block_for_storage(Compression::Zstd, raw)?,
+            Compression::Lz4 => (Compression::Lz4, lz4_compress(raw)),
+            _ => compress_block_for_storage(Compression::AdaptiveLz4, raw)?,
+        };
+        directory.length(value_count, "frame value count")?;
+        directory.length(raw.len(), "frame length")?;
+        directory.u8(codec as u8);
+        directory.length(stored.len(), "frame stored length")?;
+        directory.u64(xxh3_64(&stored));
+        data.extend_from_slice(&stored);
+    }
+    let digest = framed_head_digest(block_head, directory.as_slice());
+    directory.u64(digest);
+    let mut stored_block = directory.finish();
+    stored_block.extend_from_slice(&data);
+    if policy == Compression::AdaptiveLz4 && !materially_smaller(bytes.len(), stored_block.len())
+    {
+        return Ok((Compression::None, bytes.to_vec()));
+    }
+    Ok((Compression::Framed, stored_block))
+}
+
+pub(super) fn framed_head_digest(block_head: &[u8], directory: &[u8]) -> u64 {
+    let mut bytes = Vec::with_capacity(block_head.len() + directory.len());
+    bytes.extend_from_slice(block_head);
+    bytes.extend_from_slice(directory);
+    xxh3_64(&bytes)
+}
+
+/// Parses the frame entries of a directory (`u32 frame_count` and the
+/// entries, without the trailing digest), checking that the frames account
+/// for exactly `uncompressed_length` bytes.
+pub(super) fn parse_frame_directory(
+    directory: &[u8],
+    uncompressed_length: usize,
+) -> Result<Vec<FrameEntry>, String> {
+    let mut decoder = Decoder::new(directory);
+    let frame_count = decoder.count(FRAME_ENTRY_BYTES)?;
+    let mut entries = Vec::with_capacity(frame_count);
+    let mut first_value = 0_usize;
+    let mut stored_offset = 0_usize;
+    let mut total = 0_usize;
+    for _ in 0..frame_count {
+        let value_count = decoder.u32()? as usize;
+        let length = decoder.u32()? as usize;
+        let codec = match decoder.u8()? {
+            0 => Compression::None,
+            1 => Compression::Lz4,
+            2 => Compression::Zstd,
+            tag => return Err(format!("unknown frame compression {tag}")),
+        };
+        let stored_length = decoder.u32()? as usize;
+        let checksum = decoder.u64()?;
+        if value_count == 0 {
+            return Err("empty frame".to_owned());
+        }
+        entries.push(FrameEntry {
+            first_value,
+            value_count,
+            uncompressed_length: length,
+            codec,
+            stored_offset,
+            stored_length,
+            checksum,
+        });
+        first_value = first_value
+            .checked_add(value_count)
+            .ok_or("frame value count overflow")?;
+        stored_offset = stored_offset
+            .checked_add(stored_length)
+            .ok_or("frame stored length overflow")?;
+        total = total.checked_add(length).ok_or("frame length overflow")?;
+    }
+    decoder.finish()?;
+    if total != uncompressed_length {
+        return Err(format!(
+            "frames hold {total} bytes, block declares {uncompressed_length}"
+        ));
+    }
+    Ok(entries)
+}
+
+/// Splits an in-memory framed payload into its frames. The block checksum
+/// already covers these bytes, so the per-frame checksums are not re-read.
+pub(super) fn parse_frames(
+    bytes: &[u8],
+    uncompressed_length: usize,
+) -> Result<Vec<Frame<'_>>, String> {
+    let mut decoder = Decoder::new(bytes);
+    let frame_count = decoder.count(FRAME_ENTRY_BYTES)?;
+    let directory_length = 4 + frame_count * FRAME_ENTRY_BYTES;
+    let directory = bytes
+        .get(..directory_length)
+        .ok_or("frame directory is truncated")?;
+    let entries = parse_frame_directory(directory, uncompressed_length)?;
+    let data = bytes
+        .get(directory_length + 8..)
+        .ok_or("frame directory digest is truncated")?;
+    let stored = entries.last().map_or(0, |entry| entry.stored_offset + entry.stored_length);
+    if stored != data.len() {
+        return Err(format!(
+            "frames store {stored} bytes, block holds {}",
+            data.len()
+        ));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let data = &data[entry.stored_offset..entry.stored_offset + entry.stored_length];
+            Frame { entry, data }
+        })
+        .collect())
+}
+
+/// Decompresses one frame's stored bytes.
+pub(super) fn decompress_frame(entry: &FrameEntry, stored: &[u8]) -> Result<Vec<u8>, String> {
+    decompress_block(entry.codec, stored, entry.uncompressed_length)
 }
 
 pub(super) fn decompress_block(
@@ -62,6 +270,48 @@ pub(super) fn decompress_block(
             .map_err(|error| format!("invalid zstd block: {error}")),
         Compression::AdaptiveLz4 => {
             Err("adaptive LZ4 is a writer policy, not a stored compression".to_owned())
+        }
+        Compression::Framed => {
+            // Frames decompress in place into one buffer, and zstd frames
+            // share one context: a context per 64 KiB frame, or a copy per
+            // frame, cost a full-column scan about a tenth of its time.
+            let frames = parse_frames(bytes, uncompressed_length)?;
+            let mut output = vec![0_u8; uncompressed_length];
+            let mut zstd_context = None;
+            let mut offset = 0_usize;
+            for Frame { entry, data } in &frames {
+                let end = offset + entry.uncompressed_length;
+                let destination = &mut output[offset..end];
+                let written = match entry.codec {
+                    Compression::None => {
+                        if data.len() != destination.len() {
+                            return Err("raw frame length differs from its directory".to_owned());
+                        }
+                        destination.copy_from_slice(data);
+                        destination.len()
+                    }
+                    Compression::Lz4 => lz4_flex::block::decompress_into(data, destination)
+                        .map_err(|error| format!("invalid LZ4 frame: {error}"))?,
+                    _ => {
+                        if zstd_context.is_none() {
+                            zstd_context = Some(
+                                zstd::bulk::Decompressor::new()
+                                    .map_err(|error| format!("zstd context: {error}"))?,
+                            );
+                        }
+                        zstd_context
+                            .as_mut()
+                            .expect("context was just created")
+                            .decompress_to_buffer(data, destination)
+                            .map_err(|error| format!("invalid zstd frame: {error}"))?
+                    }
+                };
+                if written != entry.uncompressed_length {
+                    return Err("frame decompressed to a length other than its directory's".to_owned());
+                }
+                offset = end;
+            }
+            Ok(output)
         }
     }
 }
