@@ -12,6 +12,7 @@ pub mod array;
 mod batch;
 pub mod collation;
 mod counters;
+mod estimate;
 mod execution;
 mod explain;
 mod expression;

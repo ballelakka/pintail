@@ -2507,8 +2507,31 @@ fn infer_joins(input: LogicalPlan, predicate: BoundExpr, filtered: bool) -> Logi
         // probe side is read first and filters the build side by its keys,
         // which the build side's scan applies before decoding the rest of
         // each row. A small build side only bounds the probe scan's range.
+        //
+        // Statistics extend that to a side they show is small - at most the
+        // rows a probe side is read ahead for, and a quarter of the other
+        // side or less - when neither side is pinned.
         let pinned_side = (filtered && has_pinned_key(&tree) != has_pinned_key(&candidate))
-            .then(|| has_pinned_key(&candidate));
+            .then(|| has_pinned_key(&candidate))
+            .or_else(|| {
+                if !filtered || has_pinned_key(&tree) || has_pinned_key(&candidate) {
+                    return None;
+                }
+                let tree_rows = crate::estimate::expected_rows(&tree)?;
+                let candidate_rows = crate::estimate::expected_rows(&candidate)?;
+                let small = |rows: u64, other: u64| {
+                    rows <= crate::execution::PROBE_PREFETCH_ROWS
+                        && rows.saturating_mul(crate::execution::PROBE_PREFETCH_BUILD_RATIO)
+                            <= other
+                };
+                if small(candidate_rows, tree_rows) {
+                    Some(true)
+                } else if small(tree_rows, candidate_rows) {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
         let (left, right) = if let Some(candidate_pinned) = pinned_side {
             if candidate_pinned {
                 (candidate, tree)
@@ -2551,6 +2574,9 @@ fn infer_joins(input: LogicalPlan, predicate: BoundExpr, filtered: bool) -> Logi
 /// choose an order only; they never remove a predicate, row, or runtime check.
 struct JoinCost {
     rows: u64,
+    /// Rows before the plan's own predicates, so a join to a key can keep
+    /// the share of the key side that survives them.
+    base: u64,
     keys: Vec<BTreeSet<ColumnKey>>,
 }
 
@@ -2568,10 +2594,12 @@ impl JoinCost {
                 let rows = scan.estimated_rows().unwrap_or(u64::MAX);
                 Self {
                     rows: if filtered {
-                        filtered_scan_rows(scan, rows)
+                        crate::estimate::scan_rows(scan)
+                            .unwrap_or_else(|| filtered_scan_rows(scan, rows))
                     } else {
                         rows
                     },
+                    base: rows,
                     keys: if key.is_empty() {
                         Vec::new()
                     } else {
@@ -2582,6 +2610,9 @@ impl JoinCost {
             LogicalPlan::Filter { input, .. } | LogicalPlan::Sort { input, .. } => {
                 Self::for_plan(input, filtered)
             }
+            // A reordered run's relation is often a scan under the
+            // projection that trims its columns; it has the scan's rows.
+            LogicalPlan::Project { input, .. } if filtered => Self::for_plan(input, filtered),
             LogicalPlan::Join {
                 left,
                 right,
@@ -2592,10 +2623,14 @@ impl JoinCost {
                 &Self::for_plan(right, filtered),
                 &conjuncts_of(condition),
             ),
-            _ => Self {
-                rows: plan.estimated_rows().unwrap_or(u64::MAX),
-                keys: Vec::new(),
-            },
+            _ => {
+                let rows = plan.estimated_rows().unwrap_or(u64::MAX);
+                Self {
+                    rows,
+                    base: rows,
+                    keys: Vec::new(),
+                }
+            }
         }
     }
 
@@ -2607,10 +2642,19 @@ impl JoinCost {
             .collect();
         let left_key = left.keys.iter().any(|key| key.is_subset(&columns));
         let right_key = right.keys.iter().any(|key| key.is_subset(&columns));
+        // A row joined to a key side finds its match only if that key's row
+        // survived the key side's own predicates, so it keeps their share.
+        let surviving = |rows: u64, key_side: &Self| {
+            u64::try_from(
+                u128::from(rows) * u128::from(key_side.rows.min(key_side.base))
+                    / u128::from(key_side.base.max(1)),
+            )
+            .unwrap_or(u64::MAX)
+        };
         let rows = match (left_key, right_key) {
             (true, true) => left.rows.min(right.rows),
-            (true, false) => right.rows,
-            (false, true) => left.rows,
+            (true, false) => surviving(right.rows, left),
+            (false, true) => surviving(left.rows, right),
             (false, false) => left.rows.saturating_mul(right.rows),
         };
         // Joining to a key preserves the other side's key as a cost hint.
@@ -2623,7 +2667,17 @@ impl JoinCost {
         if left_key {
             keys.extend(right.keys.iter().cloned());
         }
-        Self { rows, keys }
+        // The keys carried on are the other side's, and so is the count
+        // their surviving share is measured against: a filtered relation
+        // joined through a key still marks its partner's key as filtered.
+        let base = match (left_key, right_key) {
+            (true, true) => left.base.min(right.base),
+            (true, false) => right.base,
+            (false, true) => left.base,
+            (false, false) => rows,
+        }
+        .max(rows);
+        Self { rows, base, keys }
     }
 }
 
@@ -2743,11 +2797,15 @@ fn reorder_inner_join_run(plan: LogicalPlan) -> LogicalPlan {
     let mut relations = Vec::new();
     let mut conjuncts = Vec::new();
     flatten(&plan, &mut relations, &mut conjuncts);
-    if relations.len() < 3
-        || has_pinned_key(&relations[0])
-        || !relations[1..].iter().any(has_pinned_key)
-        || conjuncts.iter().any(is_volatile)
-    {
+    let pinned = !has_pinned_key(&relations[0]) && relations[1..].iter().any(has_pinned_key);
+    // Without a pinned relation, a run is rebuilt only when every relation's
+    // statistics are known and the rebuilt order is estimated to do well
+    // under half the written order's work.
+    let informed = !pinned
+        && relations
+            .iter()
+            .all(|relation| crate::estimate::expected_rows(relation).is_some());
+    if relations.len() < 3 || !(pinned || informed) || conjuncts.iter().any(is_volatile) {
         return plan;
     }
     let Some(predicate) = conjuncts.into_iter().reduce(and_expr) else {
@@ -2764,7 +2822,41 @@ fn reorder_inner_join_run(plan: LogicalPlan) -> LogicalPlan {
         }
         other => !matches!(other, LogicalPlan::CrossJoin { .. }),
     };
-    if complete { rebuilt } else { plan }
+    if !complete {
+        return plan;
+    }
+    if informed {
+        let (Some(written), Some(reordered)) = (join_work(&plan), join_work(&rebuilt)) else {
+            return plan;
+        };
+        if reordered.saturating_mul(2) >= written {
+            return plan;
+        }
+    }
+    rebuilt
+}
+
+/// Estimated work of an inner join tree: the rows every join in it
+/// produces, with scans counting their own predicates. Each relation is
+/// read once whatever the order, so what an order changes is the size of
+/// the results in between.
+fn join_work(plan: &LogicalPlan) -> Option<u128> {
+    match plan {
+        LogicalPlan::Join {
+            left,
+            right,
+            kind: BoundJoinKind::Inner,
+            condition: Some(condition),
+        } => {
+            let left_cost = JoinCost::for_plan(left, true);
+            let right_cost = JoinCost::for_plan(right, true);
+            let joined = JoinCost::joined(&left_cost, &right_cost, &conjuncts_of(condition));
+            Some(join_work(left)? + join_work(right)? + u128::from(joined.rows))
+        }
+        LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => join_work(input),
+        LogicalPlan::Join { .. } | LogicalPlan::CrossJoin { .. } => None,
+        _ => Some(0),
+    }
 }
 
 /// Choose the connected pair with the smallest estimated intermediate work.

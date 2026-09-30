@@ -1093,7 +1093,7 @@ pub(super) struct ProbePrefetch {
 /// is small enough that reading it twice over would cost nothing worth
 /// having; one that does not is served from the read-ahead first and
 /// streamed after, and the build side is taken whole.
-pub(super) const PROBE_PREFETCH_ROWS: u64 = 65_536;
+pub(crate) const PROBE_PREFETCH_ROWS: u64 = 65_536;
 
 /// Distinct probe keys a build-side filter may hold to be taken beneath a
 /// join or a DISTINCT on the build side, to the input the key column comes
@@ -1109,7 +1109,7 @@ const PROBE_FILTER_KEYS: usize = 65_536;
 /// size can drop few build rows for that, and a probe the build's equal
 /// drops none. The instruction gate's 4,096-row self-join measured the
 /// read-ahead at a seventh of the whole query while filtering nothing.
-pub(super) const PROBE_PREFETCH_BUILD_RATIO: u64 = 4;
+pub(crate) const PROBE_PREFETCH_BUILD_RATIO: u64 = 4;
 
 /// Whether the probe side is read ahead of the build.
 ///

@@ -6,6 +6,7 @@ mod dependent_index;
 mod error;
 pub(crate) mod gather;
 mod join;
+pub(crate) use join::{PROBE_PREFETCH_BUILD_RATIO, PROBE_PREFETCH_ROWS};
 mod key_lookup;
 pub(crate) mod membership;
 mod memo;
@@ -849,8 +850,15 @@ impl PhysicalPlanner {
                 let pairs = pairs.map(|key| (key.left, key.right)).collect();
                 let (left, left_filter) = scan_filtered(left, left_filter);
                 let (right, right_filter) = scan_filtered(right, right_filter);
-                let probe_estimate = left.estimated_rows();
-                let build_estimate = right.estimated_rows();
+                // Column statistics, where every relation beneath a side has
+                // them, give its expected rows after its predicates: a side
+                // filtered to a few rows of a large table is then read ahead
+                // and its keys filter the build side, instead of the build
+                // side being hashed whole for them.
+                let probe_estimate =
+                    crate::estimate::expected_rows(&left).or_else(|| left.estimated_rows());
+                let build_estimate =
+                    crate::estimate::expected_rows(&right).or_else(|| right.estimated_rows());
                 let left_input = filtered(Self::plan(*left, collation)?, left_filter);
                 let right_input = filtered(Self::plan(*right, collation)?, right_filter);
                 // A left input pinned to a few of its keys reads the right
