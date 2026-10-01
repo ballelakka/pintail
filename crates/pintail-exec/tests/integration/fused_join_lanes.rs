@@ -332,12 +332,47 @@ fn a_filtered_probe_folds_only_its_selected_rows() {
 #[test]
 fn a_repeated_build_key_folds_every_matching_row() {
     let fixture = Fixture::new();
-    agree(
+    let rows = agree(
         &fixture,
         "SELECT d.zone, COUNT(*), SUM(f.amount) FROM facts f",
         "JOIN pairs d ON f.dim_id = d.k",
         "GROUP BY d.zone ORDER BY d.zone",
     );
+    // Both answers share the build, so the counts are also taken here:
+    // every key in 0..DIMS names two rows of one zone.
+    let mut expected = std::collections::BTreeMap::<&str, u64>::new();
+    for id in 1..=FACTS {
+        if let Some(key) = fact_key(id).filter(|key| (0..DIMS).contains(key)) {
+            *expected.entry(zone(key)).or_default() += 2;
+        }
+    }
+    let counts: Vec<String> = rows
+        .iter()
+        .map(|row| row.split('|').take(2).collect::<Vec<_>>().join("|"))
+        .collect();
+    let expected: Vec<String> = expected
+        .iter()
+        .map(|(zone, rows)| format!("{zone}|UInt64({rows})"))
+        .collect();
+    assert_eq!(counts, expected);
+    // The general join, without an aggregate to fuse into.
+    let (rows, _) = fixture.run(
+        "SELECT f.id, d.id FROM facts f JOIN pairs d ON f.dim_id = d.k \
+         WHERE f.id <= 2000 ORDER BY f.id, d.id",
+    );
+    let mut joined = Vec::new();
+    for id in 1..=2000 {
+        if let Some(key) = fact_key(id).filter(|key| (0..DIMS).contains(key)) {
+            let first = if key == 0 { DIMS } else { key };
+            joined.push(format!("{id}|{first}"));
+            joined.push(format!("{id}|{}", first + DIMS));
+        }
+    }
+    let rows: Vec<String> = rows
+        .iter()
+        .map(|row| row.replace("Int64(", "").replace(')', ""))
+        .collect();
+    assert_eq!(rows, joined);
 }
 
 /// Aggregates without a lane - a build-side argument, MIN -
