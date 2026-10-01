@@ -843,7 +843,25 @@ impl TableSnapshot {
                     .memtable
                     .range((lo_bound.clone(), hi_bound.clone()))
                     .all(|(_, row)| row.version() >= segments[index].max_version);
-            if overlay {
+            // A point lookup whose key the memtable holds newer than
+            // anything in the cluster is answered by that row alone: no
+            // segment version can win. Merging instead decodes the block the
+            // key falls in row by row, whole, which grows with the table.
+            let memtable_point = !direct
+                && start == end
+                && self.memtable.get(start).is_some_and(|row| {
+                    segments[index..next]
+                        .iter()
+                        .all(|meta| row.version() > meta.max_version)
+                });
+            if memtable_point {
+                needs_visibility_resolution = true;
+                parts.push_back(ScanPart::MemtableOnly {
+                    lo: lo_bound,
+                    hi: hi_bound,
+                    rows: None,
+                });
+            } else if overlay {
                 parts.push_back(ScanPart::Overlay {
                     segment: segments[index].clone(),
                     rows: None,
