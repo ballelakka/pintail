@@ -5069,6 +5069,9 @@ fn build_fused_inner_join_aggregate(
     // one of its batch columns was not in a representation a lane reads.
     let lane_morsels = std::sync::atomic::AtomicUsize::new(0);
     let all_morsels = std::sync::atomic::AtomicUsize::new(0);
+    // Why each morsel the column fold could have taken went to the row fold.
+    let declined_morsels =
+        std::sync::Mutex::new(std::collections::BTreeMap::<&'static str, usize>::new());
     let unique_reserved = unique_keys.as_ref().map_or(0, |(keys, _)| keys.bytes());
     memory.reserve(unique_reserved)?;
     let mut groups = HashMap::<Vec<Value>, AggregateGroup>::new();
@@ -5162,10 +5165,17 @@ fn build_fused_inner_join_aggregate(
                     &plan,
                     memory,
                 )
-                .map(|(groups, folded)| {
+                .map(|(groups, declined)| {
                     all_morsels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if folded {
-                        lane_morsels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match declined {
+                        None => {
+                            lane_morsels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Some(reason) => {
+                            if let Ok(mut reasons) = declined_morsels.lock() {
+                                *reasons.entry(reason).or_default() += 1;
+                            }
+                        }
                     }
                     groups
                 })
@@ -5224,11 +5234,16 @@ fn build_fused_inner_join_aggregate(
     if note.is_active() {
         let fold = row_fold_reason.map_or_else(
             || {
-                format!(
+                use std::fmt::Write as _;
+                let mut fold = format!(
                     "column fold on {} of {} morsels",
                     lane_morsels.into_inner(),
                     all_morsels.into_inner()
-                )
+                );
+                for (reason, morsels) in declined_morsels.into_inner().unwrap_or_default() {
+                    let _ = write!(fold, "; row fold on {morsels}: {reason}");
+                }
+                fold
             },
             |reason| format!("row fold: {reason}"),
         );
@@ -5289,6 +5304,9 @@ fn fold_joined_row(
     Ok(())
 }
 
+/// A morsel's groups, and why the column fold declined it when it did.
+type FusedMorselGroups = (HashMap<Vec<Value>, AggregateGroup>, Option<&'static str>);
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_local_fused_join_groups(
     morsel: &Morsel<'_>,
@@ -5303,7 +5321,7 @@ fn build_local_fused_join_groups(
     unique_keys: Option<&(UniqueKeyGroups, Vec<Lane>)>,
     plan: &JoinGroupPlan,
     parent_memory: &MemoryTracker,
-) -> Result<(HashMap<Vec<Value>, AggregateGroup>, bool), ExecError> {
+) -> Result<FusedMorselGroups, ExecError> {
     // Groups are fixed by the build side: start with the resolved set and
     // index into it, so the probe loop never hashes or compares group
     // values (the Q8 profile's dominant cost).
@@ -5342,7 +5360,7 @@ fn build_local_fused_join_groups(
                 crate::batch::TypedValues::Int64(_) | crate::batch::TypedValues::UInt64(_)
             )
         });
-    let lane_folded = match unique_keys {
+    let declined = match unique_keys {
         Some((keys, lanes)) => fold_morsel(
             morsel,
             left_key,
@@ -5353,9 +5371,9 @@ fn build_local_fused_join_groups(
             &mut touched,
             &memory,
         )?,
-        None => false,
+        None => Some("no column fold planned"),
     };
-    let rows = (!lane_folded).then(|| morsel.selected_rows());
+    let rows = declined.is_some().then(|| morsel.selected_rows());
     for (offset, row) in rows.into_iter().flatten().enumerate() {
         if offset % 1024 == 0 {
             memory.check_interruption()?;
@@ -5470,7 +5488,7 @@ fn build_local_fused_join_groups(
             }
         }
     }
-    Ok((folded, lane_folded))
+    Ok((folded, declined))
 }
 
 /// Dictionary-code aggregation for low-cardinality string group keys

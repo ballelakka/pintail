@@ -310,6 +310,41 @@ fn assert_column_fold(segment_purchases: u64) {
     );
 }
 
+/// A sum of an integer column folds a column at a time too, on segment and
+/// memtable rows alike, and answers what the unfused join over an
+/// expression does.
+#[test]
+fn an_integer_sum_takes_the_column_fold() {
+    for purchases in [STREAMED_PURCHASES, SMALL_PURCHASES] {
+        let fixture = Fixture::new(purchases);
+        let sql = |extra: &str| {
+            format!(
+                "SELECT b.region, COUNT(*), SUM(p.quantity), SUM(p.total_amount){extra} \
+                 FROM purchases p JOIN buyers b ON p.buyer_id = b.id \
+                 GROUP BY b.region ORDER BY b.region"
+            )
+        };
+        let (rows, profile) = fixture.run(&sql(""));
+        // A DISTINCT aggregate keeps the join out of the fused aggregate,
+        // so the reference sums through the general operator.
+        let (reference, reference_profile) = fixture.run(&sql(", COUNT(DISTINCT p.item_id)"));
+        assert!(
+            join_line(&reference_profile).contains("not fused"),
+            "{reference_profile}"
+        );
+        let reference = reference
+            .into_iter()
+            .map(|row| row.rsplit_once('|').expect("a distinct count").0.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, reference, "{profile}");
+        let line = join_line(&profile);
+        assert!(
+            line.contains("column fold on") && !line.contains("row fold"),
+            "{profile}"
+        );
+    }
+}
+
 /// An aggregate the column fold has no lane for keeps the fused join and
 /// says why it took the row fold.
 #[test]

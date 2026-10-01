@@ -1,7 +1,7 @@
 //! A columnar fold for the fused inner join-aggregate's commonest shape: a
 //! build key that is dense and unique (an auto-increment primary key), and
-//! aggregates that are counts and exact decimal sums or averages of probe
-//! columns.
+//! aggregates that are counts, integer sums and exact decimal sums or
+//! averages of probe columns.
 //!
 //! The row fold resolved each probe row's group through two indirections -
 //! the dense slot, then that bucket's list of group indexes - and updated
@@ -126,6 +126,9 @@ pub(super) enum Lane {
     CountValid { column: usize },
     /// `SUM(column)` of a decimal column, on its scaled units.
     DecimalSum { column: usize, float_output: bool },
+    /// `SUM(column)` typed as the column's own integer type: signed when
+    /// `signed`, and the same checked addition the row fold does.
+    IntegerSum { column: usize, signed: bool },
     /// Exact `AVG(column)` of a decimal column at `result_scale`.
     DecimalAverage { column: usize, result_scale: u8 },
 }
@@ -146,9 +149,19 @@ pub(super) fn plan_lanes(aggregates: &[CompiledAggregate], left_width: usize) ->
             match (aggregate.function, column) {
                 (AggregateFunction::Count, None) => Some(Lane::CountRows),
                 (AggregateFunction::Count, Some(column)) => Some(Lane::CountValid { column }),
-                (AggregateFunction::Sum, Some(column)) => Some(Lane::DecimalSum {
-                    column,
-                    float_output: aggregate_uses_float(aggregate),
+                (AggregateFunction::Sum, Some(column)) => Some(match aggregate.data_type {
+                    Some(pintail_types::DataType::Int64) => Lane::IntegerSum {
+                        column,
+                        signed: true,
+                    },
+                    Some(pintail_types::DataType::UInt64) => Lane::IntegerSum {
+                        column,
+                        signed: false,
+                    },
+                    _ => Lane::DecimalSum {
+                        column,
+                        float_output: aggregate_uses_float(aggregate),
+                    },
                 }),
                 (AggregateFunction::Average, Some(column)) => {
                     decimal_average_scale(aggregate).map(|result_scale| Lane::DecimalAverage {
@@ -175,10 +188,12 @@ enum LaneInput<'a> {
 
 /// A decimal column's scaled units: 64-bit as the store decodes them, or
 /// 128-bit as a batch rebuilt from row values (memtable rows, a small
-/// materialized range) parses them.
+/// materialized range) parses them; or an unsigned integer column's values
+/// as the units of a scale-zero sum.
 #[derive(Clone, Copy)]
 enum Units<'a> {
     Narrow(&'a [i64]),
+    Unsigned(&'a [u64]),
     Wide(&'a [i128]),
 }
 
@@ -245,6 +260,7 @@ impl Rows<'_> {
 fn add_units(totals: &mut [i128], groups: &[u32], units: Units<'_>, rows: &Rows<'_>) {
     match units {
         Units::Narrow(units) => add_unit_values(totals, groups, units, rows),
+        Units::Unsigned(units) => add_unit_values(totals, groups, units, rows),
         Units::Wide(units) => add_unit_values(totals, groups, units, rows),
     }
 }
@@ -270,10 +286,10 @@ where
 
 /// Folds `morsel` into `groups` through the unique-key table, marking each
 /// group a probe row reached in `touched`. Under `outer`, `groups` holds the
-/// miss group last and the rows that match nothing fold into it. `false`,
-/// with nothing folded,
-/// when a column of this batch is not in a representation a lane reads -
-/// the row fold then takes the morsel.
+/// miss group last and the rows that match nothing fold into it. With
+/// nothing folded, the reason a column of this batch is not in a
+/// representation a lane reads - the row fold then takes the morsel, and
+/// the profile names the reason.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn fold_morsel(
     morsel: &Morsel<'_>,
@@ -284,19 +300,19 @@ pub(super) fn fold_morsel(
     groups: &mut [AggregateGroup],
     touched: &mut [bool],
     memory: &MemoryTracker,
-) -> Result<bool, ExecError> {
+) -> Result<Option<&'static str>, ExecError> {
     let batch = morsel.batch;
     let Some((key_values, key_validity)) = left_key
         .column_index()
         .and_then(|column| batch.column(column))
         .and_then(crate::ColumnVector::typed)
     else {
-        return Ok(false);
+        return Ok(Some("a probe key that is not one packed column"));
     };
     let key_values = match key_values {
         TypedValues::Int64(values) => Keys::Signed(values),
         TypedValues::UInt64(values) => Keys::Unsigned(values),
-        _ => return Ok(false),
+        _ => return Ok(Some("a probe key that is not packed integers")),
     };
     let mut inputs = Vec::with_capacity(lanes.len());
     for lane in lanes {
@@ -305,13 +321,13 @@ pub(super) fn fold_morsel(
             Lane::CountValid { column } => {
                 let Some((_, validity)) = batch.column(column).and_then(crate::ColumnVector::typed)
                 else {
-                    return Ok(false);
+                    return Ok(Some("a counted column that is not packed"));
                 };
                 LaneInput::Valid(validity)
             }
             Lane::DecimalSum { column, .. } | Lane::DecimalAverage { column, .. } => {
                 let Some(vector) = batch.column(column) else {
-                    return Ok(false);
+                    return Ok(Some("a summed column outside the batch"));
                 };
                 // Wide units of a column declared with at most eighteen
                 // digits each fit 64 bits, so their totals stay exactly as
@@ -345,7 +361,27 @@ pub(super) fn fold_morsel(
                         validity,
                         scale: *scale,
                     },
-                    _ => return Ok(false),
+                    Some((TypedValues::Decimal128 { .. }, _)) => {
+                        return Ok(Some("wide decimal units of a column past 18 digits"));
+                    }
+                    Some(_) => return Ok(Some("a summed column that is not packed units")),
+                    None => return Ok(Some("a summed column of mixed row values")),
+                }
+            }
+            Lane::IntegerSum { column, signed } => {
+                match batch.column(column).and_then(crate::ColumnVector::typed) {
+                    Some((TypedValues::Int64(values), validity)) if signed => LaneInput::Units {
+                        units: Units::Narrow(values),
+                        validity,
+                        scale: 0,
+                    },
+                    Some((TypedValues::UInt64(values), validity)) if !signed => LaneInput::Units {
+                        units: Units::Unsigned(values),
+                        validity,
+                        scale: 0,
+                    },
+                    Some(_) => return Ok(Some("a summed column of another integer type")),
+                    None => return Ok(Some("a summed column of mixed row values")),
                 }
             }
         };
@@ -355,7 +391,7 @@ pub(super) fn fold_morsel(
                 .checked_sub(*scale)
                 .is_none_or(|digits| digits > AVERAGE_MAX_DIGITS)
         {
-            return Ok(false);
+            return Ok(Some("an average widened past 19 digits"));
         }
         inputs.push(input);
     }
@@ -467,6 +503,20 @@ pub(super) fn fold_morsel(
                         state.update_decimal_sum_units(total, *scale, float_output)?;
                     }
                 }
+                (Lane::IntegerSum { signed, .. }, LaneInput::Units { .. }) if valid > 0 => {
+                    // The morsel's total, exact in 128 bits; past the
+                    // sum's type it overflows as the row fold's would.
+                    if signed {
+                        state.add_dense_signed(
+                            i64::try_from(total).map_err(|_| ExecError::NumericOverflow)?,
+                        )?;
+                    } else {
+                        state.add_dense_unsigned(
+                            u64::try_from(total).map_err(|_| ExecError::NumericOverflow)?,
+                        )?;
+                    }
+                }
+                (Lane::IntegerSum { .. }, LaneInput::Units { .. }) => {}
                 (Lane::DecimalAverage { result_scale, .. }, LaneInput::Units { scale, .. }) => {
                     if valid > 0 {
                         state.add_decimal_average_partial(
@@ -485,5 +535,5 @@ pub(super) fn fold_morsel(
             }
         }
     }
-    Ok(true)
+    Ok(None)
 }
