@@ -815,6 +815,29 @@ pub struct PrewhereRanges {
     /// regions keeps rows that fail, and must say so here; a chunk decoded
     /// from exact ranges alone is [`ProjectedColumnChunk::prefiltered`].
     pub exact: bool,
+    /// The kept rows as one bit per row of the chunk (bit `r % 64` of word
+    /// `r / 64`), given instead of `ranges`, which are then empty. A filter
+    /// keeping rows scattered through the chunk names them in a few
+    /// thousand words rather than tens of thousands of ranges, and a direct
+    /// segment read places them from the words; every other read turns
+    /// them into ranges first ([`Self::into_ranges`]).
+    pub mask: Option<Vec<u64>>,
+}
+
+impl PrewhereRanges {
+    /// The same selection with the mask, if any, turned into ranges over
+    /// the chunk's `rows`.
+    #[must_use]
+    pub fn into_ranges(self, rows: usize) -> Self {
+        match self.mask {
+            Some(words) => Self {
+                ranges: crate::segment::word_runs(&words, rows),
+                exact: self.exact,
+                mask: None,
+            },
+            None => self,
+        }
+    }
 }
 
 impl From<Vec<std::ops::Range<usize>>> for PrewhereRanges {
@@ -823,6 +846,7 @@ impl From<Vec<std::ops::Range<usize>>> for PrewhereRanges {
         Self {
             ranges,
             exact: false,
+            mask: None,
         }
     }
 }
@@ -2229,7 +2253,8 @@ impl ProjectedScanStream {
         let insert_positions = std::sync::Mutex::new(Vec::new());
         let select = |columns: &[DecodedColumn], row_count: usize| {
             let kept = match caller {
-                Some((caller_ids, select)) => select(&columns[..caller_ids.len()], row_count)?,
+                Some((caller_ids, select)) => select(&columns[..caller_ids.len()], row_count)?
+                    .map(|kept| kept.into_ranges(row_count)),
                 None => None,
             };
             let key_columns = key_indices
@@ -2257,6 +2282,7 @@ impl ProjectedScanStream {
             Ok(Some(PrewhereRanges {
                 ranges: subtract_positions(ranges, &excluded),
                 exact,
+                mask: None,
             }))
         };
         let segment_chunk = self.decode_slice_plain(slice, decode_limit, Some((&ids, &select)))?;
@@ -2448,7 +2474,9 @@ impl ProjectedScanStream {
             end,
             &scan_budget,
         )?;
-        let ranges = select(&fetch.columns, row_count).map_err(StoreError::FormatLimit)?;
+        let ranges = select(&fetch.columns, row_count)
+            .map_err(StoreError::FormatLimit)?
+            .map(|kept| kept.into_ranges(row_count));
         if predicate_ids == self.column_ids {
             return retain_predicate_fetch(
                 fetch,
@@ -2458,7 +2486,7 @@ impl ProjectedScanStream {
                 &scan_budget,
             );
         }
-        let Some(PrewhereRanges { ranges, exact }) = ranges else {
+        let Some(PrewhereRanges { ranges, exact, .. }) = ranges else {
             return self.project_after_predicates(
                 segment,
                 predicate_ids,
@@ -2611,7 +2639,9 @@ impl ProjectedScanStream {
             .iter()
             .map(std::iter::ExactSizeIterator::len)
             .sum::<usize>();
-        let ranges = select(&fetch.columns, row_count).map_err(StoreError::FormatLimit)?;
+        let ranges = select(&fetch.columns, row_count)
+            .map_err(StoreError::FormatLimit)?
+            .map(|kept| kept.into_ranges(row_count));
         let mut chunk = if predicate_ids == self.column_ids {
             retain_predicate_fetch(
                 fetch,
@@ -2620,7 +2650,7 @@ impl ProjectedScanStream {
                 segments_read,
                 scan_budget,
             )?
-        } else if let Some(PrewhereRanges { ranges, exact }) = ranges {
+        } else if let Some(PrewhereRanges { ranges, exact, .. }) = ranges {
             check_selected_ranges(&ranges, row_count)?;
             let absolute = candidate_positions(&ranges, candidates);
             self.project_after_predicates(
@@ -2677,6 +2707,7 @@ impl ProjectedScanStream {
         let row_count = match rows {
             KeptRows::Span(start, end) => end.saturating_sub(start),
             KeptRows::Ranges(ranges) => ranges.iter().map(std::iter::ExactSizeIterator::len).sum(),
+            KeptRows::Mask(words) => words.iter().map(|word| word.count_ones() as usize).sum(),
         };
         let reuse = self
             .column_ids
@@ -2690,6 +2721,16 @@ impl ProjectedScanStream {
                 .map(std::iter::ExactSizeIterator::len)
                 .sum::<usize>();
             if selected != row_count {
+                return Err(StoreError::FormatLimit(
+                    "kept predicate rows disagree with the rows to read".into(),
+                ));
+            }
+        } else if let KeptRows::Mask(words) = rows {
+            let fetched = predicate_rows.unwrap_or(0);
+            if words.len() != fetched.div_ceil(64)
+                || (!fetched.is_multiple_of(64)
+                    && words.last().is_some_and(|last| last >> (fetched % 64) != 0))
+            {
                 return Err(StoreError::FormatLimit(
                     "kept predicate rows disagree with the rows to read".into(),
                 ));
@@ -2710,6 +2751,8 @@ impl ProjectedScanStream {
                 reuse.contains(&Some(index)).then(|| {
                     if let Some(kept) = kept {
                         compact_decoded_column(&mut column, kept, row_count);
+                    } else if let KeptRows::Mask(words) = rows {
+                        compact_decoded_column_by_mask(&mut column, words, row_count);
                     }
                     column
                 })
@@ -2757,6 +2800,14 @@ impl ProjectedScanStream {
                     &self.snapshot.schema,
                     &rest,
                     ranges,
+                    scan_budget,
+                )?,
+                KeptRows::Mask(words) => segment::read_projected_column_mask(
+                    &self.snapshot.directory,
+                    segment,
+                    &self.snapshot.schema,
+                    &rest,
+                    words,
                     scan_budget,
                 )?,
             })
@@ -2973,10 +3024,12 @@ impl ProjectedScanStream {
             &candidates,
             &scan_budget,
         )?;
-        let selected = select(&fetch.columns, candidate_rows).map_err(StoreError::FormatLimit)?;
+        let selected = select(&fetch.columns, candidate_rows)
+            .map_err(StoreError::FormatLimit)?
+            .map(|kept| kept.into_ranges(candidate_rows));
         let segments_read = usize::from(start_row == 0);
         let chunk = match selected {
-            Some(PrewhereRanges { ranges, exact }) => {
+            Some(PrewhereRanges { ranges, exact, .. }) => {
                 let absolute = super::side_index::absolute_ranges(&candidates, &ranges);
                 self.project_after_predicates(
                     segment,
@@ -3072,10 +3125,27 @@ impl ProjectedScanStream {
             )?;
             let ranges = select(&fetch.columns, row_count).map_err(StoreError::FormatLimit)?;
             if predicate_ids == self.column_ids {
+                let ranges = ranges.map(|kept| kept.into_ranges(row_count));
                 return retain_predicate_fetch(fetch, ranges.as_ref(), row_count, 1, &scan_budget);
             }
             return match ranges {
-                Some(PrewhereRanges { ranges, exact }) => self.project_after_predicates(
+                // The whole segment was judged, so the mask's rows are the
+                // segment's own and place the other columns as they are.
+                Some(PrewhereRanges {
+                    mask: Some(words),
+                    exact,
+                    ..
+                }) => self.project_after_predicates(
+                    &segment,
+                    predicate_ids,
+                    fetch,
+                    None,
+                    KeptRows::Mask(&words),
+                    exact,
+                    1,
+                    &scan_budget,
+                ),
+                Some(PrewhereRanges { ranges, exact, .. }) => self.project_after_predicates(
                     &segment,
                     predicate_ids,
                     fetch,
@@ -3892,6 +3962,74 @@ enum KeptRows<'ranges> {
     Span(usize, usize),
     /// These ordered, disjoint row ranges.
     Ranges(&'ranges [std::ops::Range<usize>]),
+    /// The rows a mask over the whole segment selects, which are also the
+    /// predicate fetch's kept rows (the fetch read the whole segment).
+    Mask(&'ranges [u64]),
+}
+
+/// [`compact_decoded_column`] for the rows a mask selects (bit `r % 64` of
+/// `words[r / 64]` for row `r`); `selected` is their count. Packed columns
+/// move their values a word at a time, so a run of one row costs a bit
+/// scan rather than a range of its own; text and row values take the
+/// ranges path.
+fn compact_decoded_column_by_mask(column: &mut DecodedColumn, words: &[u64], selected: usize) {
+    fn compact<T: Copy>(values: &mut Vec<T>, words: &[u64]) {
+        let rows = values.len();
+        let mut written = 0;
+        for (index, &word) in words.iter().enumerate() {
+            let base = index * 64;
+            if word == u64::MAX && base + 64 <= rows {
+                values.copy_within(base..base + 64, written);
+                written += 64;
+                continue;
+            }
+            let mut bits = word;
+            while bits != 0 {
+                let row = base + bits.trailing_zeros() as usize;
+                if row >= rows {
+                    break;
+                }
+                values[written] = values[row];
+                written += 1;
+                bits &= bits - 1;
+            }
+        }
+        values.truncate(written);
+        values.shrink_to_fit();
+    }
+    let validity = match column {
+        DecodedColumn::Int64 { values, validity }
+        | DecodedColumn::NativeUnits {
+            values, validity, ..
+        } => {
+            compact(values, words);
+            validity
+        }
+        DecodedColumn::UInt64 { values, validity }
+        | DecodedColumn::Float64 {
+            bits: values,
+            validity,
+        } => {
+            compact(values, words);
+            validity
+        }
+        DecodedColumn::DictionaryUtf8 {
+            codes, validity, ..
+        } => {
+            compact(codes, words);
+            validity
+        }
+        DecodedColumn::Utf8 { .. } | DecodedColumn::Values(_) => {
+            let rows = column.len();
+            let ranges = crate::segment::word_runs(words, rows);
+            compact_decoded_column(column, &ranges, selected);
+            return;
+        }
+    };
+    match validity {
+        ColumnValidity::AllValid(count) => *count = selected,
+        ColumnValidity::Bytes(bits) => compact(bits, words),
+    }
 }
 
 /// Keeps only the rows `ranges` names in one decoded column, in place:
@@ -4279,5 +4417,75 @@ mod candidate_position_tests {
             candidate_positions(std::slice::from_ref(&(4..4)), &candidates),
             Vec::new()
         );
+    }
+}
+
+#[cfg(test)]
+mod mask_compaction_tests {
+    use super::{
+        ColumnValidity, DecodedColumn, compact_decoded_column, compact_decoded_column_by_mask,
+    };
+    use pintail_types::Value;
+
+    fn columns(rows: usize) -> Vec<DecodedColumn> {
+        let values: Vec<i64> = (0..rows)
+            .map(|row| i64::try_from(row).expect("small") * 3 - 7)
+            .collect();
+        let valid: Vec<bool> = (0..rows).map(|row| row % 5 != 2).collect();
+        let mut heap = Vec::new();
+        let mut offsets = vec![0];
+        for row in 0..rows {
+            heap.extend_from_slice(format!("v{row}").as_bytes());
+            offsets.push(heap.len());
+        }
+        vec![
+            DecodedColumn::Int64 {
+                values: values.clone(),
+                validity: ColumnValidity::AllValid(rows),
+            },
+            DecodedColumn::Int64 {
+                values,
+                validity: ColumnValidity::Bytes(valid),
+            },
+            DecodedColumn::Utf8 {
+                heap,
+                offsets,
+                validity: ColumnValidity::AllValid(rows),
+            },
+            DecodedColumn::Values((0..rows).map(|row| Value::UInt64(row as u64)).collect()),
+        ]
+    }
+
+    #[test]
+    fn a_mask_keeps_the_same_rows_as_its_ranges() {
+        for rows in [1_usize, 63, 64, 65, 200, 1_000] {
+            let patterns: [&dyn Fn(usize) -> bool; 4] = [
+                &|row| row % 3 == 0,
+                &|_| true,
+                &|row| row % 64 < 40,
+                &|row| row + 1 == rows,
+            ];
+            for keep in patterns {
+                let mut words = vec![0_u64; rows.div_ceil(64)];
+                let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+                for row in (0..rows).filter(|row| keep(*row)) {
+                    words[row / 64] |= 1 << (row % 64);
+                    match ranges.last_mut() {
+                        Some(last) if last.end == row => last.end = row + 1,
+                        _ => ranges.push(row..row + 1),
+                    }
+                }
+                let selected = ranges.iter().map(std::iter::ExactSizeIterator::len).sum();
+                for (mut by_mask, mut by_ranges) in columns(rows).into_iter().zip(columns(rows)) {
+                    compact_decoded_column_by_mask(&mut by_mask, &words, selected);
+                    compact_decoded_column(&mut by_ranges, &ranges, selected);
+                    assert_eq!(
+                        by_mask.into_values(),
+                        by_ranges.into_values(),
+                        "rows {rows}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -2767,6 +2767,29 @@ fn prewhere_ranges(
     let Some(mask) = combined else {
         return Ok(None);
     };
+    let selected = mask.count();
+    if selected == 0 {
+        return Ok(Some(pintail_store::PrewhereRanges {
+            ranges: Vec::new(),
+            exact: true,
+            mask: None,
+        }));
+    }
+    if selected.saturating_mul(100) >= row_count.saturating_mul(DENSE_PERCENT) {
+        return Ok(None);
+    }
+    let exact = spec.complete && !spec.predicates.is_empty() && predicates_applied;
+    // Rows kept in runs of a row or two - a range filter on a column that
+    // is not the key - would be tens of thousands of ranges per chunk; the
+    // mask itself is a few thousand words, and a direct segment read
+    // places the other columns from it.
+    if mask.len() == row_count && mask.run_count() * MASK_RUN_WORDS > row_count.div_ceil(64) {
+        return Ok(Some(pintail_store::PrewhereRanges {
+            ranges: Vec::new(),
+            exact,
+            mask: Some(mask.into_words()),
+        }));
+    }
     // The mask's runs a word at a time: a per-row bit test over every row
     // of a chunk cost as much as the comparison that built the mask.
     let mut ranges = mask.selected_runs();
@@ -2777,21 +2800,16 @@ fn prewhere_ranges(
             ranges.pop();
         }
     }
-    if ranges.is_empty() {
-        return Ok(Some(pintail_store::PrewhereRanges {
-            ranges,
-            exact: true,
-        }));
-    }
-    let selected: usize = ranges.iter().map(std::iter::ExactSizeIterator::len).sum();
-    if selected.saturating_mul(100) >= row_count.saturating_mul(DENSE_PERCENT) {
-        return Ok(None);
-    }
     Ok(Some(pintail_store::PrewhereRanges {
         ranges,
-        exact: spec.complete && !spec.predicates.is_empty() && predicates_applied,
+        exact,
+        mask: None,
     }))
 }
+
+/// A selection averaging more than one run per this many mask words goes
+/// to the store as the mask rather than as ranges.
+const MASK_RUN_WORDS: usize = 8;
 
 /// Converts one decoded chunk into ready record batches: slices of
 /// `DEFAULT_BATCH_ROWS`, each column adopted into its typed executor form.

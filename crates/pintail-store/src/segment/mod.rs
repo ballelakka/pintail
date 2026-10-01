@@ -3460,7 +3460,6 @@ pub(crate) fn read_projected_columns(
 /// Decodes several disjoint ascending row ranges of every projected column
 /// into packed columnar storage, skipping blocks wholly outside every range
 /// (the storage primitive behind filter-first late materialization).
-#[allow(clippy::too_many_lines)]
 pub(crate) fn read_projected_column_ranges(
     directory: &Path,
     meta: &SegmentMeta,
@@ -3469,21 +3468,92 @@ pub(crate) fn read_projected_column_ranges(
     ranges: &[std::ops::Range<usize>],
     memory: &ScanMemoryBudget<'_>,
 ) -> Result<ProjectedColumnFetch, StoreError> {
+    read_projected_pick(
+        directory,
+        meta,
+        schema,
+        projection,
+        RowPick::Ranges(ranges),
+        memory,
+    )
+}
+
+/// [`read_projected_column_ranges`] for the rows a mask over the whole
+/// segment selects: bit `r % 64` of `words[r / 64]` stands for row `r`.
+///
+/// A filter that keeps scattered rows names them in far fewer words than
+/// ranges, and an integer block takes its share of the mask as it is.
+pub(crate) fn read_projected_column_mask(
+    directory: &Path,
+    meta: &SegmentMeta,
+    schema: &TableSchema,
+    projection: &[usize],
+    words: &[u64],
+    memory: &ScanMemoryBudget<'_>,
+) -> Result<ProjectedColumnFetch, StoreError> {
+    read_projected_pick(
+        directory,
+        meta,
+        schema,
+        projection,
+        RowPick::Mask(words),
+        memory,
+    )
+}
+
+/// The rows a projected read decodes.
+#[derive(Clone, Copy)]
+enum RowPick<'a> {
+    /// Ascending, disjoint row ranges.
+    Ranges(&'a [std::ops::Range<usize>]),
+    /// One bit per segment row.
+    Mask(&'a [u64]),
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_projected_pick(
+    directory: &Path,
+    meta: &SegmentMeta,
+    schema: &TableSchema,
+    projection: &[usize],
+    pick: RowPick<'_>,
+    memory: &ScanMemoryBudget<'_>,
+) -> Result<ProjectedColumnFetch, StoreError> {
     let path = directory.join(&meta.file_name);
     verify(directory, meta, schema)?;
     let mut decoder = FileDecoder::open(&path)?;
     let header = read_segment_columns_header(&path, &mut decoder, meta, schema)?;
     let layout = projected_layout(&path, meta, schema, &mut decoder, &header)?;
-    let mut previous_end = 0_usize;
-    for range in ranges {
-        if range.start > range.end || range.end > header.row_count || range.start < previous_end {
-            return Err(StoreError::FormatLimit(
-                "projected row ranges must be ascending, disjoint, and in bounds".into(),
-            ));
+    let (ranges, selected_rows): (&[std::ops::Range<usize>], usize) = match pick {
+        RowPick::Ranges(ranges) => {
+            let mut previous_end = 0_usize;
+            for range in ranges {
+                if range.start > range.end
+                    || range.end > header.row_count
+                    || range.start < previous_end
+                {
+                    return Err(StoreError::FormatLimit(
+                        "projected row ranges must be ascending, disjoint, and in bounds".into(),
+                    ));
+                }
+                previous_end = range.end;
+            }
+            (ranges, ranges.iter().map(std::ops::Range::len).sum())
         }
-        previous_end = range.end;
-    }
-    let selected_rows = ranges.iter().map(std::ops::Range::len).sum::<usize>();
+        RowPick::Mask(words) => {
+            if words.len() != header.row_count.div_ceil(64)
+                || window_words(words, 0, header.row_count) != words
+            {
+                return Err(StoreError::FormatLimit(
+                    "projected row mask must cover exactly the segment's rows".into(),
+                ));
+            }
+            (
+                &[],
+                words.iter().map(|word| word.count_ones() as usize).sum(),
+            )
+        }
+    };
     let mut builders: Vec<Option<ColumnBuilder>> = (0..projection.len()).map(|_| None).collect();
     let mut found = vec![false; projection.len()];
     let mut column_decode = projection
@@ -3544,9 +3614,17 @@ pub(crate) fn read_projected_column_ranges(
             while range_cursor < ranges.len() && ranges[range_cursor].end <= block_start {
                 range_cursor += 1;
             }
-            let selected = ranges
-                .get(range_cursor)
-                .is_some_and(|range| range.start < block_limit && range.end > block_start);
+            // A mask pick: this block's share of the mask.
+            let block_words = match pick {
+                RowPick::Mask(words) => Some(window_words(words, block_start, block_limit)),
+                RowPick::Ranges(_) => None,
+            };
+            let selected = match &block_words {
+                Some(words) => words.iter().any(|word| *word != 0),
+                None => ranges
+                    .get(range_cursor)
+                    .is_some_and(|range| range.start < block_limit && range.end > block_start),
+            };
             if !selected {
                 blocks_pruned += 1;
                 continue;
@@ -3567,6 +3645,12 @@ pub(crate) fn read_projected_column_ranges(
                 .take_while(|range| range.start < block_limit)
                 .count();
             let block_ranges = || {
+                if let Some(words) = &block_words {
+                    return word_runs(words, block_limit - block_start)
+                        .into_iter()
+                        .map(|range| (range.start, range.end))
+                        .collect::<Vec<_>>();
+                }
                 ranges[range_cursor..range_cursor + touching]
                     .iter()
                     .filter(|range| block_start < range.end && block_limit > range.start)
@@ -3607,7 +3691,12 @@ pub(crate) fn read_projected_column_ranges(
                     memory,
                     IntSink {
                         builder,
-                        ranges: RangeCursor::new(block_ranges()),
+                        ranges: match &block_words {
+                            Some(words) => {
+                                RangeCursor::from_words(words.clone(), block_limit - block_start)
+                            }
+                            None => RangeCursor::new(block_ranges()),
+                        },
                     },
                 )?;
                 if block.cells.is_none() {
@@ -4095,6 +4184,23 @@ fn decode_int_payload_into(
     null_bitmap: &[u8],
     sink: IntSink<'_>,
 ) -> Result<bool, String> {
+    let IntSink {
+        builder,
+        mut ranges,
+    } = sink;
+    if let Some(words) = ranges.words.take() {
+        if matches!(encoding, Encoding::BitPacked) && non_null_count == row_count {
+            let mut decoder = Decoder::new(bytes);
+            let base = decode_integer_base(&mut decoder, logical_type)?;
+            if decode_selected_into(&mut decoder, builder, &words, base, row_count)? {
+                decoder.finish()?;
+                return Ok(true);
+            }
+        }
+        ranges.words = Some(words);
+        ranges.settle(row_count);
+    }
+    let sink = IntSink { builder, ranges };
     if matches!(encoding, Encoding::DeltaBitPacked) {
         return decode_delta_payload_into(
             bytes,
@@ -4134,11 +4240,15 @@ fn decode_int_payload_into(
         decoder.finish()?;
         return Ok(true);
     }
-    if non_null_count == row_count
-        && decode_selected_into(&mut decoder, builder, &ranges, base, row_count)?
-    {
-        decoder.finish()?;
-        return Ok(true);
+    if non_null_count == row_count {
+        let mut words = SELECTION_SCRATCH.with(std::cell::RefCell::take);
+        range_words(&ranges.ranges, row_count, &mut words);
+        let placed = decode_selected_into(&mut decoder, builder, &words, base, row_count);
+        SELECTION_SCRATCH.with(|slot| *slot.borrow_mut() = words);
+        if placed? {
+            decoder.finish()?;
+            return Ok(true);
+        }
     }
     // Decoded into this thread's reused buffer: a fresh 128 KiB vector per
     // block faulted its pages in again on every block of a filtered scan.
@@ -4160,7 +4270,7 @@ fn decode_int_payload_into(
 }
 
 /// A partly selected block with no NULLs, straight into a typed builder:
-/// the selection becomes one bit per row, each 64-row group any bit selects
+/// `words` hold one bit per block row, each 64-row group any bit selects
 /// is unpacked into a stack buffer, and its selected values append from
 /// there. Returns `false`, with nothing consumed or placed, when the builder
 /// is not integer-typed or when the payload's widest value could leave the
@@ -4175,7 +4285,7 @@ fn decode_int_payload_into(
 fn decode_selected_into(
     decoder: &mut Decoder<'_>,
     builder: &mut ColumnBuilder,
-    ranges: &RangeCursor,
+    words: &[u64],
     base: i128,
     row_count: usize,
 ) -> Result<bool, String> {
@@ -4192,27 +4302,8 @@ fn decode_selected_into(
     if !fits {
         return Ok(false);
     }
-    let mut words = SELECTION_SCRATCH.with(std::cell::RefCell::take);
-    words.clear();
-    words.resize(row_count.div_ceil(64), 0);
-    for &(lo, hi) in &ranges.ranges {
-        let hi = hi.min(row_count);
-        if lo >= hi {
-            continue;
-        }
-        let (mut row, end) = (lo, hi);
-        while row < end {
-            let word = row / 64;
-            let offset = row % 64;
-            let take = (64 - offset).min(end - row);
-            let bits = if take == 64 {
-                u64::MAX
-            } else {
-                ((1_u64 << take) - 1) << offset
-            };
-            words[word] |= bits;
-            row += take;
-        }
+    if words.len() < row_count.div_ceil(64) {
+        return Err("selection words are shorter than the block".to_owned());
     }
     // Counted from the bits, so ranges that touch or overlap count once.
     let selected = words.iter().map(|word| word.count_ones() as usize).sum();
@@ -4221,7 +4312,7 @@ fn decode_selected_into(
             #[allow(clippy::cast_possible_truncation)]
             let base = base as i64;
             values.reserve(selected);
-            let placed = for_each_selected_group(decoder, row_count, &words, |group, word| {
+            let placed = for_each_selected_group(decoder, row_count, words, |group, word| {
                 let mut bits = word;
                 while bits != 0 {
                     #[allow(clippy::cast_possible_wrap)]
@@ -4236,7 +4327,7 @@ fn decode_selected_into(
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let base = base as u64;
             values.reserve(selected);
-            let placed = for_each_selected_group(decoder, row_count, &words, |group, word| {
+            let placed = for_each_selected_group(decoder, row_count, words, |group, word| {
                 let mut bits = word;
                 while bits != 0 {
                     values.push(base.wrapping_add(group[bits.trailing_zeros() as usize]));
@@ -4247,8 +4338,27 @@ fn decode_selected_into(
             placed
         }
     };
-    SELECTION_SCRATCH.with(|slot| *slot.borrow_mut() = words);
     outcome.map(|()| true)
+}
+
+/// `ranges` (block-relative, clamped to `row_count`) as one bit per row.
+fn range_words(ranges: &[(usize, usize)], row_count: usize, words: &mut Vec<u64>) {
+    words.clear();
+    words.resize(row_count.div_ceil(64), 0);
+    for &(lo, hi) in ranges {
+        let hi = hi.min(row_count);
+        let mut row = lo;
+        while row < hi {
+            let offset = row % 64;
+            let take = (64 - offset).min(hi - row);
+            words[row / 64] |= if take == 64 {
+                u64::MAX
+            } else {
+                ((1_u64 << take) - 1) << offset
+            };
+            row += take;
+        }
+    }
 }
 
 thread_local! {
@@ -4448,11 +4558,42 @@ fn decode_delta_payload_into(
 struct RangeCursor {
     ranges: Vec<(usize, usize)>,
     index: usize,
+    /// The selection as one bit per block row instead, when it came as a
+    /// row mask; `ranges` is then empty until [`Self::settle`] fills it.
+    words: Option<Vec<u64>>,
 }
 
 impl RangeCursor {
     fn new(ranges: Vec<(usize, usize)>) -> Self {
-        Self { ranges, index: 0 }
+        Self {
+            ranges,
+            index: 0,
+            words: None,
+        }
+    }
+
+    /// A block's selection as one bit per row of its `rows`. A block it
+    /// selects whole becomes the one full range, for the bulk paths.
+    fn from_words(words: Vec<u64>, rows: usize) -> Self {
+        if words_select_all(&words, rows) {
+            return Self::new(vec![(0, rows)]);
+        }
+        Self {
+            ranges: Vec::new(),
+            index: 0,
+            words: Some(words),
+        }
+    }
+
+    /// Turns a word selection into ranges for the paths that walk ranges.
+    fn settle(&mut self, rows: usize) {
+        if let Some(words) = self.words.take() {
+            self.ranges = word_runs(&words, rows)
+                .into_iter()
+                .map(|range| (range.start, range.end))
+                .collect();
+            self.index = 0;
+        }
     }
 
     fn contains(&mut self, row: usize) -> bool {
@@ -4469,6 +4610,79 @@ impl RangeCursor {
             && self.ranges.last().is_some_and(|range| range.1 >= row_count)
             && self.ranges.windows(2).all(|pair| pair[0].1 >= pair[1].0)
     }
+}
+
+/// Whether `words` select every one of `rows` rows.
+fn words_select_all(words: &[u64], rows: usize) -> bool {
+    let whole = rows / 64;
+    words.len() == rows.div_ceil(64)
+        && words[..whole].iter().all(|word| *word == u64::MAX)
+        && (rows.is_multiple_of(64) || words[whole] == (1_u64 << (rows % 64)) - 1)
+}
+
+/// The rows `words` select among the first `rows`, as ascending, disjoint,
+/// maximal runs, found a word at a time.
+pub(crate) fn word_runs(words: &[u64], rows: usize) -> Vec<std::ops::Range<usize>> {
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut push = |start: usize, end: usize| match runs.last_mut() {
+        Some(last) if last.end == start => last.end = end,
+        _ => runs.push(start..end),
+    };
+    for (index, &word) in words.iter().enumerate() {
+        let base = index * 64;
+        if base >= rows {
+            break;
+        }
+        if word == u64::MAX {
+            push(base, base + 64);
+            continue;
+        }
+        let mut bits = word;
+        while bits != 0 {
+            let start = bits.trailing_zeros() as usize;
+            let length = (bits >> start).trailing_ones() as usize;
+            push(base + start, base + start + length);
+            bits = if start + length >= 64 {
+                0
+            } else {
+                bits & (u64::MAX << (start + length))
+            };
+        }
+    }
+    while let Some(last) = runs.last_mut() {
+        if last.start >= rows {
+            runs.pop();
+            continue;
+        }
+        last.end = last.end.min(rows);
+        break;
+    }
+    runs
+}
+
+/// Bits `start..end` of the row mask `words`, as words of their own with
+/// bit 0 standing for row `start`; bits past `end` are clear.
+fn window_words(words: &[u64], start: usize, end: usize) -> Vec<u64> {
+    let rows = end.saturating_sub(start);
+    let first = start / 64;
+    let shift = start % 64;
+    let mut window: Vec<u64> = (0..rows.div_ceil(64))
+        .map(|index| {
+            let low = words.get(first + index).copied().unwrap_or(0) >> shift;
+            let high = if shift == 0 {
+                0
+            } else {
+                words.get(first + index + 1).copied().unwrap_or(0) << (64 - shift)
+            };
+            low | high
+        })
+        .collect();
+    if !rows.is_multiple_of(64)
+        && let Some(last) = window.last_mut()
+    {
+        *last &= (1_u64 << (rows % 64)) - 1;
+    }
+    window
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5956,6 +6170,7 @@ mod range_read_tests {
     use super::{Compression, ScanMemoryBudget, read_projected_column_ranges, write};
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn multi_range_reads_match_concatenated_single_ranges() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let schema = TableSchema::new(
@@ -6045,6 +6260,63 @@ mod range_read_tests {
                 .iter()
                 .map(std::iter::ExactSizeIterator::len)
                 .sum::<usize>()
+        );
+
+        // The same rows named by a mask read the same values, whatever
+        // their shape: scattered single rows, short runs, whole blocks.
+        let patterns: [&dyn Fn(usize) -> bool; 5] = [
+            &|row| row % 3 == 0,
+            &|row| row % 7 < 2,
+            &|_| true,
+            &|row| row == 99,
+            &|row| (16..64).contains(&row) || row % 13 == 5,
+        ];
+        for keep in patterns {
+            let mut words = vec![0_u64; 100_usize.div_ceil(64)];
+            for row in (0..100).filter(|row| keep(*row)) {
+                words[row / 64] |= 1 << (row % 64);
+            }
+            let runs = super::word_runs(&words, 100);
+            let by_ranges = read_projected_column_ranges(
+                directory.path(),
+                &meta,
+                &schema,
+                &projection,
+                &runs,
+                &budget,
+            )
+            .expect("range read");
+            let by_mask = super::read_projected_column_mask(
+                directory.path(),
+                &meta,
+                &schema,
+                &projection,
+                &words,
+                &budget,
+            )
+            .expect("mask read");
+            let values = |fetch: super::ProjectedColumnFetch| {
+                fetch
+                    .columns
+                    .into_iter()
+                    .map(super::super::store::DecodedColumn::into_values)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values(by_mask), values(by_ranges));
+        }
+        let mut stray = vec![0_u64; 2];
+        stray[1] = 1 << 40;
+        assert!(
+            super::read_projected_column_mask(
+                directory.path(),
+                &meta,
+                &schema,
+                &projection,
+                &stray,
+                &budget,
+            )
+            .is_err(),
+            "a mask bit past the last row is refused"
         );
 
         let backwards = [10..20_usize, 5..8];

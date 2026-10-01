@@ -1222,6 +1222,26 @@ impl SelectionMask {
         count + (self.words[last_word] & tail_mask).count_ones() as usize
     }
 
+    /// How many maximal runs of selected rows the mask holds: the rows
+    /// selected whose predecessor is not, counted a word at a time.
+    #[must_use]
+    pub(crate) fn run_count(&self) -> usize {
+        let mut carry = 0_u64;
+        let mut runs = 0_usize;
+        for &word in &self.words {
+            runs += (word & !((word << 1) | carry)).count_ones() as usize;
+            carry = word >> 63;
+        }
+        runs
+    }
+
+    /// The mask's words: bit `r % 64` of word `r / 64` for row `r`, clear
+    /// past the last row.
+    #[must_use]
+    pub(crate) fn into_words(self) -> Vec<u64> {
+        self.words
+    }
+
     /// The selected rows as ascending, disjoint, maximal runs.
     ///
     /// A word at a time: an empty word costs one test, a full one extends
@@ -1949,6 +1969,7 @@ mod selection_tests {
                 let selected: Vec<usize> = (0..len).filter(|row| keep(*row)).collect();
                 let mask = mask_of(len, &selected);
                 assert_eq!(mask.selected_runs(), run_walk(&mask), "len {len}");
+                assert_eq!(mask.run_count(), run_walk(&mask).len(), "len {len}");
             }
         }
     }
