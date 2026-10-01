@@ -57,6 +57,7 @@ mod left_join_top_k;
 mod legacy_utf8_collations;
 mod lenient_date_parity;
 mod live_replication_queries;
+mod memtable_dimension_scan;
 mod memtable_overlay;
 mod mixed_collation_comparison;
 mod mixed_collation_grouping;
