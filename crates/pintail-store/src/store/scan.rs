@@ -326,6 +326,7 @@ impl DecodedColumn {
     /// (ascending, indexing the output). Integer columns stay packed when
     /// every inserted value is of their type or null; any other column, or
     /// a mismatched value, is rebuilt as plain values.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn interleave(self, inserts: &[(usize, &pintail_types::Value)]) -> Self {
         if inserts.is_empty() {
             return self;
@@ -363,8 +364,194 @@ impl DecodedColumn {
                     )),
                 }
             }
-            other => Self::Values(interleave_values(other.into_values(), inserts)),
+            Self::Float64 { bits, validity } => {
+                match typed_inserts(inserts, |value| match value {
+                    pintail_types::Value::Float64(value) => Some(Some(value.get().to_bits())),
+                    pintail_types::Value::Null => Some(None),
+                    _ => None,
+                }) {
+                    Some(typed) => {
+                        let (bits, validity) = interleave_typed(bits, &validity, &typed);
+                        Self::Float64 { bits, validity }
+                    }
+                    None => Self::Values(interleave_values(
+                        Self::Float64 { bits, validity }.into_values(),
+                        inserts,
+                    )),
+                }
+            }
+            // Units stay packed for a value whose text they regenerate
+            // exactly, which is what reading them back as text yields.
+            Self::NativeUnits {
+                units,
+                values,
+                validity,
+            } => {
+                match typed_inserts(inserts, |value| match value {
+                    pintail_types::Value::Utf8(text) => units.parse_exact(text).map(Some),
+                    pintail_types::Value::Null => Some(None),
+                    _ => None,
+                }) {
+                    Some(typed) => {
+                        let (values, validity) = interleave_typed(values, &validity, &typed);
+                        Self::NativeUnits {
+                            units,
+                            values,
+                            validity,
+                        }
+                    }
+                    None => Self::Values(interleave_values(
+                        Self::NativeUnits {
+                            units,
+                            values,
+                            validity,
+                        }
+                        .into_values(),
+                        inserts,
+                    )),
+                }
+            }
+            Self::DictionaryUtf8 {
+                dict_heap,
+                dict_offsets,
+                codes,
+                validity,
+            } => match text_inserts(inserts) {
+                Some(texts) => {
+                    let (dict_heap, dict_offsets, typed) =
+                        dictionary_codes(dict_heap, dict_offsets, &texts);
+                    let (codes, validity) = interleave_typed(codes, &validity, &typed);
+                    Self::DictionaryUtf8 {
+                        dict_heap,
+                        dict_offsets,
+                        codes,
+                        validity,
+                    }
+                }
+                None => Self::Values(interleave_values(
+                    Self::DictionaryUtf8 {
+                        dict_heap,
+                        dict_offsets,
+                        codes,
+                        validity,
+                    }
+                    .into_values(),
+                    inserts,
+                )),
+            },
+            Self::Utf8 {
+                heap,
+                offsets,
+                validity,
+            } => match text_inserts(inserts) {
+                Some(texts) => interleave_text(&heap, &offsets, &validity, &texts),
+                None => Self::Values(interleave_values(
+                    Self::Utf8 {
+                        heap,
+                        offsets,
+                        validity,
+                    }
+                    .into_values(),
+                    inserts,
+                )),
+            },
+            Self::Values(values) => Self::Values(interleave_values(values, inserts)),
         }
+    }
+}
+
+/// Values at their final positions, `None` for null.
+type Placed<T> = Vec<(usize, Option<T>)>;
+
+/// Text inserts as bytes (`None` for null), or `None` when one is not text.
+fn text_inserts<'a>(inserts: &[(usize, &'a pintail_types::Value)]) -> Option<Placed<&'a [u8]>> {
+    inserts
+        .iter()
+        .map(|(at, value)| match value {
+            pintail_types::Value::Utf8(text) => Some((*at, Some(text.as_bytes()))),
+            pintail_types::Value::Null => Some((*at, None)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each text insert as a code of the dictionary, the entries it did not
+/// hold yet appended to it.
+fn dictionary_codes(
+    mut dict_heap: Vec<u8>,
+    mut dict_offsets: Vec<usize>,
+    texts: &[(usize, Option<&[u8]>)],
+) -> (Vec<u8>, Vec<usize>, Placed<u32>) {
+    let entries = dict_offsets.len().saturating_sub(1);
+    let mut known = std::collections::HashMap::<Vec<u8>, u32>::with_capacity(entries);
+    for entry in 0..entries {
+        let code = u32::try_from(entry).expect("a block dictionary fits u32 codes");
+        known
+            .entry(dict_heap[dict_offsets[entry]..dict_offsets[entry + 1]].to_vec())
+            .or_insert(code);
+    }
+    let typed = texts
+        .iter()
+        .map(|(at, text)| {
+            let code = text.map(|bytes| {
+                *known.entry(bytes.to_vec()).or_insert_with(|| {
+                    let code = u32::try_from(dict_offsets.len() - 1)
+                        .expect("a block dictionary fits u32 codes");
+                    dict_heap.extend_from_slice(bytes);
+                    dict_offsets.push(dict_heap.len());
+                    code
+                })
+            });
+            (*at, code)
+        })
+        .collect();
+    (dict_heap, dict_offsets, typed)
+}
+
+/// A text arena with `texts` placed at their final positions (ascending,
+/// indexing the output); a null spans zero bytes.
+fn interleave_text(
+    heap: &[u8],
+    offsets: &[usize],
+    validity: &ColumnValidity,
+    texts: &[(usize, Option<&[u8]>)],
+) -> DecodedColumn {
+    let rows = offsets.len().saturating_sub(1);
+    let total = rows + texts.len();
+    let added = texts
+        .iter()
+        .map(|(_, text)| text.map_or(0, <[u8]>::len))
+        .sum::<usize>();
+    let mut out = Vec::with_capacity(heap.len() + added);
+    let mut bounds = Vec::with_capacity(total + 1);
+    let mut valid = Vec::with_capacity(total);
+    bounds.push(0);
+    let mut row = 0;
+    let mut next = 0;
+    while valid.len() < total {
+        let at = valid.len();
+        if next < texts.len() && (texts[next].0 == at || row >= rows) {
+            if let Some(bytes) = texts[next].1 {
+                out.extend_from_slice(bytes);
+            }
+            valid.push(texts[next].1.is_some());
+            next += 1;
+        } else {
+            out.extend_from_slice(&heap[offsets[row]..offsets[row + 1]]);
+            valid.push(validity.is_valid(row));
+            row += 1;
+        }
+        bounds.push(out.len());
+    }
+    let validity = if valid.iter().all(|flag| *flag) {
+        ColumnValidity::AllValid(total)
+    } else {
+        ColumnValidity::Bytes(valid)
+    };
+    DecodedColumn::Utf8 {
+        heap: out,
+        offsets: bounds,
+        validity,
     }
 }
 
@@ -4228,7 +4415,9 @@ fn retain_predicate_fetch(
 
 #[cfg(test)]
 mod overlay_primitive_tests {
-    use super::{ColumnValidity, DecodedColumn, overlay_positions, subtract_positions};
+    use super::{
+        ColumnValidity, DecodedColumn, interleave_values, overlay_positions, subtract_positions,
+    };
     use pintail_types::{KeyPart, PrimaryKey, StoredRow, Value};
 
     fn packed(values: &[u64]) -> DecodedColumn {
@@ -4393,6 +4582,51 @@ mod overlay_primitive_tests {
                 .into_values(),
             [1_u64, 2, 3, 4, 5].map(Value::UInt64).to_vec()
         );
+    }
+
+    /// Text, dictionary text, native units and floats keep their packed
+    /// shape when memtable rows interleave into them, and read back exactly
+    /// as the plain-value interleave of the same rows does.
+    #[test]
+    fn packed_columns_stay_packed_under_interleave() {
+        let text = |value: &str| Value::Utf8(value.to_owned());
+        let check = |column: DecodedColumn, inserts: &[(usize, &Value)], packed: bool| {
+            let expected = interleave_values(column.clone().into_values(), inserts);
+            let merged = column.interleave(inserts);
+            assert_eq!(!matches!(merged, DecodedColumn::Values(_)), packed);
+            assert_eq!(merged.into_values(), expected);
+        };
+        let (north, east, fresh, null) = (text("north"), text("east"), text("fresh"), Value::Null);
+        let dictionary = || DecodedColumn::DictionaryUtf8 {
+            dict_heap: b"northsouth".to_vec(),
+            dict_offsets: vec![0, 5, 10],
+            codes: vec![0, 1, 0, 1],
+            validity: ColumnValidity::Bytes(vec![true, true, false, true]),
+        };
+        let inserts = [(0, &east), (2, &north), (3, &null), (6, &fresh), (7, &east)];
+        check(dictionary(), &inserts, true);
+        let arena = || DecodedColumn::Utf8 {
+            heap: b"abcde".to_vec(),
+            offsets: vec![0, 2, 2, 5],
+            validity: ColumnValidity::Bytes(vec![true, false, true]),
+        };
+        check(arena(), &[(1, &east), (4, &null), (5, &fresh)], true);
+        check(arena(), &[(1, &Value::Int64(3))], false);
+        let units = || DecodedColumn::NativeUnits {
+            units: crate::segment::NativeUnits::Decimal { scale: 2 },
+            values: vec![150, -7],
+            validity: ColumnValidity::AllValid(2),
+        };
+        let (decimal, loose) = (text("12.30"), text("12.3"));
+        check(units(), &[(0, &decimal), (3, &null)], true);
+        // Text the units would not regenerate stays text.
+        check(units(), &[(1, &loose)], false);
+        let floats = DecodedColumn::Float64 {
+            bits: vec![1.5_f64.to_bits()],
+            validity: ColumnValidity::AllValid(1),
+        };
+        let half = Value::Float64(pintail_types::Float64::new(0.5));
+        check(floats, &[(0, &half), (2, &null)], true);
     }
 }
 
