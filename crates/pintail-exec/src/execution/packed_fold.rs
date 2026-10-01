@@ -38,6 +38,14 @@ impl FoldRows<'_> {
             Self::Picked(rows) => rows.len(),
         }
     }
+
+    /// The listed rows, in order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(move |index| match self {
+            Self::Span(rows) => rows.start + index,
+            Self::Picked(rows) => rows[index] as usize,
+        })
+    }
 }
 
 /// The rows of `rows` the batch selects: a span when every one is selected,
@@ -86,29 +94,54 @@ fn combine<const OP: u8>(total: &mut i128, value: i64) {
     }
 }
 
-/// Folds one lane's units into `totals`, counting NULL rows per slot.
+/// One column's accumulators: the totals of its SUM, MIN and MAX roles
+/// (empty for a role no lane takes) and its NULL rows per slot.
+struct ColumnTotals<'a> {
+    sum: &'a mut [i128],
+    minimum: &'a mut [i128],
+    maximum: &'a mut [i128],
+}
+
+impl ColumnTotals<'_> {
+    /// Folds one value into `slot` for every role the column has.
+    #[inline]
+    fn add<const S: bool, const MN: bool, const MX: bool>(&mut self, slot: usize, value: i64) {
+        if S {
+            combine::<SUM>(&mut self.sum[slot], value);
+        }
+        if MN {
+            combine::<MINIMUM>(&mut self.minimum[slot], value);
+        }
+        if MX {
+            combine::<MAXIMUM>(&mut self.maximum[slot], value);
+        }
+    }
+}
+
+/// Folds one column's units into every role it has in a single pass,
+/// counting NULL rows per slot.
 #[inline]
-fn fold_units<const OP: u8>(
-    totals: &mut [i128],
+fn fold_column<const S: bool, const MN: bool, const MX: bool>(
+    mut totals: ColumnTotals<'_>,
     nulls: &mut Vec<u64>,
+    slot_count: usize,
     slots: &[u32],
     rows: &FoldRows<'_>,
     values: &[i64],
     validity: &ValidityMask,
 ) {
-    let slot_count = totals.len();
     match rows {
         FoldRows::Span(span) => {
             let values = &values[span.clone()];
             if validity.no_nulls() {
                 for (&slot, &value) in slots.iter().zip(values) {
-                    combine::<OP>(&mut totals[slot as usize], value);
+                    totals.add::<S, MN, MX>(slot as usize, value);
                 }
             } else {
                 let nulls = lane_nulls(nulls, slot_count);
                 for ((&slot, &value), row) in slots.iter().zip(values).zip(span.clone()) {
                     if validity.is_valid(row) {
-                        combine::<OP>(&mut totals[slot as usize], value);
+                        totals.add::<S, MN, MX>(slot as usize, value);
                     } else {
                         nulls[slot as usize] += 1;
                     }
@@ -118,14 +151,14 @@ fn fold_units<const OP: u8>(
         FoldRows::Picked(picked) => {
             if validity.no_nulls() {
                 for (&slot, &row) in slots.iter().zip(*picked) {
-                    combine::<OP>(&mut totals[slot as usize], values[row as usize]);
+                    totals.add::<S, MN, MX>(slot as usize, values[row as usize]);
                 }
             } else {
                 let nulls = lane_nulls(nulls, slot_count);
                 for (&slot, &row) in slots.iter().zip(*picked) {
                     let row = row as usize;
                     if validity.is_valid(row) {
-                        combine::<OP>(&mut totals[slot as usize], values[row]);
+                        totals.add::<S, MN, MX>(slot as usize, values[row]);
                     } else {
                         nulls[slot as usize] += 1;
                     }
@@ -133,6 +166,17 @@ fn fold_units<const OP: u8>(
             }
         }
     }
+}
+
+/// The packed lanes that read one column: the lane holding each role's
+/// totals (SUM and AVG share the sum role), and the lane holding the
+/// column's NULL counts.
+#[derive(Clone, Copy, Debug, Default)]
+struct ColumnRoles {
+    sum: Option<usize>,
+    minimum: Option<usize>,
+    maximum: Option<usize>,
+    nulls: usize,
 }
 
 fn lane_nulls(nulls: &mut Vec<u64>, slot_count: usize) -> &mut [u64] {
@@ -174,18 +218,82 @@ pub(super) struct PackedFold {
     totals: Vec<Vec<i128>>,
     /// Per lane: NULL rows per slot, empty until the lane meets a NULL.
     nulls: Vec<Vec<u64>>,
+    /// Per lane: the lane whose `totals` hold its result - itself, or the
+    /// first lane of the same role over the same column (SUM beside AVG).
+    total_of: Vec<usize>,
+    /// Per lane: the lane whose `nulls` count its column's NULL rows.
+    nulls_of: Vec<usize>,
+    /// The lanes that keep totals, grouped by the column they read.
+    columns: Vec<ColumnRoles>,
 }
 
 impl PackedFold {
+    #[cfg(test)]
     pub(super) fn new(slot_count: usize, lanes: &[Option<PackedLane>]) -> Self {
+        Self::over_columns(slot_count, lanes, &(0..lanes.len()).collect::<Vec<_>>())
+    }
+
+    /// A fold whose lanes read `columns` (one per lane): the lanes over one
+    /// column fold in a single pass, and a second sum of a column - SUM
+    /// beside AVG - shares the first one's totals instead of repeating it.
+    pub(super) fn sharing(
+        slot_count: usize,
+        packed: &[Option<PackedLane>],
+        lanes: &[TwoPassLane],
+    ) -> Self {
+        let columns = lanes
+            .iter()
+            .enumerate()
+            .map(|(index, lane)| match lane {
+                TwoPassLane::DecimalUnits { column, .. }
+                | TwoPassLane::ExtremeDecimal { column, .. } => *column,
+                // Never shared: a key past any real column index.
+                _ => usize::MAX - index,
+            })
+            .collect::<Vec<_>>();
+        Self::over_columns(slot_count, packed, &columns)
+    }
+
+    fn over_columns(slot_count: usize, lanes: &[Option<PackedLane>], sources: &[usize]) -> Self {
+        let mut total_of = (0..lanes.len()).collect::<Vec<_>>();
+        let mut nulls_of = total_of.clone();
+        let mut columns: Vec<(usize, ColumnRoles)> = Vec::new();
+        for (index, lane) in lanes.iter().enumerate() {
+            if !keeps_total(*lane) {
+                continue;
+            }
+            let source = sources[index];
+            let position = columns
+                .iter()
+                .position(|(column, _)| *column == source)
+                .unwrap_or_else(|| {
+                    columns.push((
+                        source,
+                        ColumnRoles {
+                            nulls: index,
+                            ..ColumnRoles::default()
+                        },
+                    ));
+                    columns.len() - 1
+                });
+            let roles = &mut columns[position].1;
+            nulls_of[index] = roles.nulls;
+            let role = match lane {
+                Some(PackedLane::Minimum { .. }) => &mut roles.minimum,
+                Some(PackedLane::Maximum { .. }) => &mut roles.maximum,
+                _ => &mut roles.sum,
+            };
+            total_of[index] = *role.get_or_insert(index);
+        }
         Self {
             slot_count,
             lanes: lanes.to_vec(),
             counts: written_zeros(slot_count),
             totals: lanes
                 .iter()
-                .map(|lane| {
-                    if keeps_total(*lane) {
+                .enumerate()
+                .map(|(index, lane)| {
+                    if keeps_total(*lane) && total_of[index] == index {
                         filled(slot_count, identity(*lane))
                     } else {
                         Vec::new()
@@ -193,6 +301,9 @@ impl PackedFold {
                 })
                 .collect(),
             nulls: lanes.iter().map(|_| Vec::new()).collect(),
+            total_of,
+            nulls_of,
+            columns: columns.into_iter().map(|(_, roles)| roles).collect(),
         }
     }
 
@@ -255,24 +366,52 @@ impl PackedFold {
         for &slot in slots {
             self.counts[slot as usize] += 1;
         }
-        for (index, input) in inputs.iter().enumerate() {
-            let LaneInput::Units(values, validity) = input else {
+        for roles in &self.columns {
+            let LaneInput::Units(values, validity) = &inputs[roles.nulls] else {
                 continue;
             };
-            let totals = &mut self.totals[index];
-            let nulls = &mut self.nulls[index];
-            match self.lanes[index] {
-                Some(PackedLane::Sum { .. } | PackedLane::Average { .. }) => {
-                    fold_units::<SUM>(totals, nulls, slots, rows, values, validity);
-                }
-                Some(PackedLane::Minimum { .. }) => {
-                    fold_units::<MINIMUM>(totals, nulls, slots, rows, values, validity);
-                }
-                Some(PackedLane::Maximum { .. }) => {
-                    fold_units::<MAXIMUM>(totals, nulls, slots, rows, values, validity);
-                }
-                Some(PackedLane::Count) | None => {}
+            let mut take = |lane: Option<usize>| {
+                lane.map_or_else(Vec::new, |lane| std::mem::take(&mut self.totals[lane]))
+            };
+            let (mut sum, mut minimum, mut maximum) =
+                (take(roles.sum), take(roles.minimum), take(roles.maximum));
+            let mut nulls = std::mem::take(&mut self.nulls[roles.nulls]);
+            let totals = ColumnTotals {
+                sum: &mut sum,
+                minimum: &mut minimum,
+                maximum: &mut maximum,
+            };
+            let slot_count = self.slot_count;
+            macro_rules! fold {
+                ($s:literal, $mn:literal, $mx:literal) => {
+                    fold_column::<$s, $mn, $mx>(
+                        totals, &mut nulls, slot_count, slots, rows, values, validity,
+                    )
+                };
             }
+            match (
+                roles.sum.is_some(),
+                roles.minimum.is_some(),
+                roles.maximum.is_some(),
+            ) {
+                (true, true, true) => fold!(true, true, true),
+                (true, true, false) => fold!(true, true, false),
+                (true, false, true) => fold!(true, false, true),
+                (true, false, false) => fold!(true, false, false),
+                (false, true, true) => fold!(false, true, true),
+                (false, true, false) => fold!(false, true, false),
+                (false, false, true) => fold!(false, false, true),
+                (false, false, false) => {}
+            }
+            for (lane, totals) in [roles.sum, roles.minimum, roles.maximum]
+                .into_iter()
+                .zip([sum, minimum, maximum])
+            {
+                if let Some(lane) = lane {
+                    self.totals[lane] = totals;
+                }
+            }
+            self.nulls[roles.nulls] = nulls;
         }
     }
 
@@ -282,9 +421,11 @@ impl PackedFold {
         self.counts[slot] += 1;
         for (index, reader) in readers.iter().enumerate() {
             let lane = self.lanes[index];
-            if !keeps_total(lane) {
+            if !keeps_total(lane) || self.total_of[index] != index {
                 continue;
             }
+            // A lane sharing another's totals is skipped above; one that
+            // owns its totals but not its column's NULL counts skips NULLs.
             if let Some(bits) = reader.bits(row) {
                 let value = i64::from_ne_bytes(bits.to_ne_bytes());
                 let total = &mut self.totals[index][slot];
@@ -293,7 +434,7 @@ impl PackedFold {
                     Some(PackedLane::Maximum { .. }) => combine::<MAXIMUM>(total, value),
                     _ => combine::<SUM>(total, value),
                 }
-            } else {
+            } else if self.nulls_of[index] == index {
                 let slot_count = self.slot_count;
                 lane_nulls(&mut self.nulls[index], slot_count)[slot] += 1;
             }
@@ -374,14 +515,17 @@ pub(super) fn merged_cell(
     let mut total = identity(Some(lane));
     let mut nulls = 0_u64;
     for fold in folds {
-        if let Some(&value) = fold.totals[index].get(slot) {
+        if let Some(&value) = fold.totals[fold.total_of[index]].get(slot) {
             match lane {
                 PackedLane::Minimum { .. } => total = total.min(value),
                 PackedLane::Maximum { .. } => total = total.max(value),
                 _ => total = total.wrapping_add(value),
             }
         }
-        nulls += fold.nulls[index].get(slot).copied().unwrap_or(0);
+        nulls += fold.nulls[fold.nulls_of[index]]
+            .get(slot)
+            .copied()
+            .unwrap_or(0);
     }
     Some((
         lane,
@@ -509,6 +653,67 @@ mod tests {
             &partials,
             &reference(&picked, &picked_slots, &values, &valid, slot_count),
         );
+    }
+
+    #[test]
+    fn lanes_over_one_column_fold_once_and_agree_with_separate_lanes() {
+        use super::super::two_pass::TwoPassLane;
+        let rows = 9_000;
+        let slot_count = 11;
+        let (values, valid) = column(rows);
+        // COUNT(*), SUM, AVG, MIN, MAX of one column.
+        let packed = [
+            Some(PackedLane::Count),
+            LANES[1],
+            Some(PackedLane::Average {
+                digits: 4,
+                result_scale: 6,
+            }),
+            LANES[2],
+            LANES[3],
+        ];
+        let sum = TwoPassLane::DecimalUnits {
+            column: 3,
+            scale: 2,
+            float_output: false,
+        };
+        let extreme = TwoPassLane::ExtremeDecimal {
+            column: 3,
+            scale: 2,
+        };
+        let lanes = [TwoPassLane::CountStar, sum, sum, extreme, extreme];
+        let inputs = [
+            LaneInput::Count,
+            LaneInput::Units(&values, &valid),
+            LaneInput::Units(&values, &valid),
+            LaneInput::Units(&values, &valid),
+            LaneInput::Units(&values, &valid),
+        ];
+        let listed = (0..rows)
+            .filter(|row| row % 5 != 1)
+            .map(|row| u32::try_from(row).expect("small"))
+            .collect::<Vec<_>>();
+        let listed_slots = slots_of(listed.iter().map(|row| *row as usize), slot_count);
+        let span_slots = slots_of(0..rows, slot_count);
+        let mut shared = PackedFold::sharing(slot_count, &packed, &lanes);
+        let mut separate = PackedFold::new(slot_count, &packed);
+        for fold in [&mut shared, &mut separate] {
+            fold.fold(&inputs, &listed_slots, &FoldRows::Picked(&listed));
+            fold.fold(&inputs, &span_slots, &FoldRows::Span(0..rows));
+        }
+        let mut merged = PackedFold::sharing(slot_count, &packed, &lanes);
+        merged.merge_from(&shared, |slot| slot);
+        for slot in 0..slot_count {
+            for index in 0..packed.len() {
+                let (_, expected) =
+                    merged_cell(std::slice::from_ref(&separate), index, slot).expect("packed");
+                for folds in [std::slice::from_ref(&shared), std::slice::from_ref(&merged)] {
+                    let (_, cell) = merged_cell(folds, index, slot).expect("packed");
+                    assert_eq!(cell.rows, expected.rows, "slot {slot} lane {index} rows");
+                    assert_eq!(cell.total, expected.total, "slot {slot} lane {index} total");
+                }
+            }
+        }
     }
 
     /// Kernel measurement, ignored by default:

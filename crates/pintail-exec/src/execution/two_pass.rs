@@ -2604,7 +2604,7 @@ fn fold_int_range_window(
             } else {
                 usize::try_from(old.base - base).expect("old range inside the new one")
             };
-            let mut fold = PackedFold::new(slot_count, &packed);
+            let mut fold = PackedFold::sharing(slot_count, &packed, lanes);
             for partial in &old.folds {
                 fold.merge_from(partial, |slot| if slot == 0 { 0 } else { slot + shift });
             }
@@ -2628,7 +2628,7 @@ fn fold_int_range_window(
         unreachable!("the range was just made active");
     };
     let pool = std::sync::Mutex::new(std::mem::take(&mut active.folds));
-    let fresh = || PackedFold::new(slot_count, &packed);
+    let fresh = || PackedFold::sharing(slot_count, &packed, lanes);
     morsels.par_iter().try_for_each(|morsel| {
         let taken = pool
             .lock()
@@ -3305,10 +3305,13 @@ fn dense_packed_chunk(
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
     let unpacked = packed.iter().any(Option::is_none);
-    let mut fold = PackedFold::new(acc.len(), packed);
+    let mut fold = PackedFold::sharing(acc.len(), packed, lanes);
     let mut selected = Vec::new();
     for (batch, translations) in chunk {
-        let Some(slots) = dense_row_slots(batch, keys, columns, translations)? else {
+        // The selected rows are listed once; the slots, the packed fold and
+        // the unpacked lanes all walk that list.
+        let rows = fold_rows(batch, 0..batch.row_count(), &mut selected);
+        let Some(slots) = dense_row_slots(batch, keys, columns, translations, &rows)? else {
             two_pass_dense_batch(
                 batch,
                 keys,
@@ -3323,17 +3326,16 @@ fn dense_packed_chunk(
         };
         // Packed lanes fold a column at a time; a batch whose decimal
         // column carries no 64-bit units folds the same totals row by row.
-        let rows = fold_rows(batch, 0..batch.row_count(), &mut selected);
         if let Some(inputs) = fold.resolve(batch, lanes) {
             fold.fold(&inputs, &slots, &rows);
         } else {
             let readers = lane_readers(batch, lanes);
-            for (row, slot) in batch.selection().selected_rows().zip(&slots) {
+            for (row, slot) in rows.iter().zip(&slots) {
                 fold.add_row(*slot as usize, &readers, row);
             }
         }
         if unpacked {
-            apply_unpacked_lanes(batch, &slots, lanes, packed, aggregates, acc, memory)?;
+            apply_unpacked_lanes(batch, &rows, &slots, lanes, packed, aggregates, acc, memory)?;
         }
     }
     for (slot, entry) in acc.iter_mut().enumerate() {
@@ -3355,6 +3357,7 @@ fn dense_row_slots(
     keys: TwoPassKeySource,
     columns: &[usize],
     translations: &[Vec<u64>],
+    selected: &FoldRows<'_>,
 ) -> Result<Option<Vec<u32>>, ExecError> {
     let mut slots = Vec::with_capacity(batch.visible_row_count());
     if let TwoPassKeySource::Int { column, .. } = keys {
@@ -3427,9 +3430,15 @@ fn dense_row_slots(
         .iter()
         .all(|(codes, validity, _)| validity.no_nulls() && codes.len() >= rows);
     match (readers.as_slice(), tables.as_slice()) {
-        ([(codes, ..)], [table]) if every_row && no_nulls => {
-            slots.extend(codes[..rows].iter().map(|code| share(table, *code)));
-        }
+        // One NOT NULL key: a lookup per listed row, whole span or filtered.
+        ([(codes, ..)], [table]) if no_nulls => match selected {
+            FoldRows::Span(span) => {
+                slots.extend(codes[span.clone()].iter().map(|code| share(table, *code)));
+            }
+            FoldRows::Picked(picked) => {
+                slots.extend(picked.iter().map(|row| share(table, codes[*row as usize])));
+            }
+        },
         ([(first, ..), (second, ..)], [first_table, second_table]) if every_row && no_nulls => {
             slots.extend(
                 first[..rows]
@@ -3587,7 +3596,7 @@ fn dense_date_parts_window(
             || {
                 (
                     vec![None; slot_count],
-                    any_packed.then(|| PackedFold::new(slot_count, &packed)),
+                    any_packed.then(|| PackedFold::sharing(slot_count, &packed, lanes)),
                 )
             },
             |(mut acc, mut fold), (batch, _)| {
@@ -3769,12 +3778,12 @@ fn dense_date_parts_packed_batch(
         fold.fold(&inputs, &slots, &rows);
     } else {
         let readers = lane_readers(batch, lanes);
-        for (row, slot) in batch.selection().selected_rows().zip(&slots) {
+        for (row, slot) in rows.iter().zip(&slots) {
             fold.add_row(*slot as usize, &readers, row);
         }
     }
     if packed.iter().any(Option::is_none) {
-        apply_unpacked_lanes(batch, &slots, lanes, packed, aggregates, acc, memory)
+        apply_unpacked_lanes(batch, &rows, &slots, lanes, packed, aggregates, acc, memory)
             .map_err(DenseFold::Exec)?;
     }
     Ok(())
@@ -3785,8 +3794,10 @@ fn dense_date_parts_packed_batch(
 /// a COUNT(DISTINCT) over a packed integer column inserts straight from it.
 /// Every lane still sees its rows in row order, so each state ends exactly
 /// where the row-at-a-time loop left it.
+#[allow(clippy::too_many_arguments)]
 fn apply_unpacked_lanes(
     batch: &RecordBatch,
+    rows: &FoldRows<'_>,
     slots: &[u32],
     lanes: &[TwoPassLane],
     packed: &[Option<PackedLane>],
@@ -3819,7 +3830,7 @@ fn apply_unpacked_lanes(
         };
         macro_rules! distinct_from {
             ($values:expr, $validity:expr, $bits:expr) => {
-                for (row, slot) in batch.selection().selected_rows().zip(slots) {
+                for (row, slot) in rows.iter().zip(slots) {
                     if $validity.is_valid(row) {
                         let key = distinct_key($bits($values[row])).expect("distinct lane");
                         acc[*slot as usize].as_mut().expect("states made above")[index]
@@ -3838,7 +3849,7 @@ fn apply_unpacked_lanes(
                 distinct_from!(values, validity, |value: u64| value);
             }
             _ => {
-                for (row, slot) in batch.selection().selected_rows().zip(slots) {
+                for (row, slot) in rows.iter().zip(slots) {
                     if let Some(bits) = reader.bits(row) {
                         let states = acc[*slot as usize].as_mut().expect("states made above");
                         apply_two_pass_lane(&mut states[index], lane, aggregate, bits, memory)?;
