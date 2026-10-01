@@ -7,6 +7,7 @@ Research conducted 2026-07-31 in support of the "beat ClickHouse" benchmark effo
 - [duckdb-internals.md](duckdb-internals.md) — source + papers from DuckDB
 - [scylladb-seastar.md](scylladb-seastar.md) — systems techniques from ScyllaDB/Seastar
 - [papers-survey.md](papers-survey.md) — verified survey of ~40 papers (1998–2026)
+- [clickhouse-gap-2026-10.md](clickhouse-gap-2026-10.md) — measured per-query gap to ClickHouse on the 20M-row engine track, ranked opportunities
 
 ## Synthesis
 
