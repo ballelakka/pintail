@@ -1,3 +1,4 @@
+mod selection;
 mod spatial;
 mod sql_regex;
 mod str_to_date;
@@ -51,38 +52,7 @@ fn typed_comparison_mask(
         validity: &ValidityMask,
         keep: impl Fn(T) -> bool + Sync,
     ) -> SelectionMask {
-        use rayon::prelude::*;
-        // One worker per span of whole 64-row words: each word is owned by
-        // exactly one worker, so the workers never share a write target.
-        // This loop was the WHERE clause of every typed comparison, and it
-        // ran on one thread - 35ms of a 118ms query on the 20M benchmark
-        // while fifteen threads idled.
-        const WORDS_PER_SPAN: usize = 1024;
-        let word_count = values.len().div_ceil(64);
-        let words: Vec<u64> = (0..word_count.div_ceil(WORDS_PER_SPAN))
-            .into_par_iter()
-            .flat_map_iter(|span| {
-                let first_word = span * WORDS_PER_SPAN;
-                let last_word = (first_word + WORDS_PER_SPAN).min(word_count);
-                (first_word..last_word).map(|word| {
-                    let start = word * 64;
-                    let end = (start + 64).min(values.len());
-                    let mut bits = 0_u64;
-                    if validity.no_nulls() {
-                        for (offset, value) in values[start..end].iter().enumerate() {
-                            bits |= u64::from(keep(*value)) << offset;
-                        }
-                    } else {
-                        for (offset, value) in values[start..end].iter().enumerate() {
-                            bits |= u64::from(validity.is_valid(start + offset) && keep(*value))
-                                << offset;
-                        }
-                    }
-                    bits
-                })
-            })
-            .collect();
-        SelectionMask::from_words(values.len(), words)
+        selection::select_words(values, validity, keep)
     }
     fn ordered<T: Copy + PartialOrd + Sync>(
         values: &[T],
@@ -224,15 +194,7 @@ fn typed_comparison_mask(
             if let Some((codes, values)) = column.dictionary() {
                 let matching: Vec<bool> =
                     values.iter().map(|value| keeps(value.as_bytes())).collect();
-                let mut mask = SelectionMask::none(codes.len());
-                for (row, code) in codes.iter().enumerate() {
-                    if validity.is_valid(row)
-                        && matching[usize::try_from(*code).expect("dict code fits usize")]
-                    {
-                        mask.set(row, true).expect("row within mask bounds");
-                    }
-                }
-                return Some(mask);
+                return Some(selection::select_codes(codes, validity, &matching));
             }
             #[allow(clippy::items_after_statements)]
             const MAX_DISTINCT: usize = 16;
@@ -288,6 +250,9 @@ fn between_mask(
     else {
         return Ok(None);
     };
+    if let Some(mask) = selection::between_range_mask(batch, *column, lower, upper) {
+        return Ok(Some(mask));
+    }
     let Some(vector) = batch.column(*column) else {
         return Ok(None);
     };
@@ -881,6 +846,10 @@ impl CompiledExpr {
                 right,
                 ..
             } => {
+                // A two-sided range on one column reads the column once.
+                if let Some(mask) = selection::conjunction_range_mask(batch, left, right) {
+                    return Ok(Some(mask));
+                }
                 let (Some(mut mask), Some(other)) = (
                     left.evaluate_filter_mask(batch)?,
                     right.evaluate_filter_mask(batch)?,

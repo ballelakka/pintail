@@ -173,12 +173,13 @@ mod tests {
             heap.extend_from_slice(text.as_bytes());
             offsets.push(heap.len());
         }
-        let validity = pintail_store::ColumnValidity::Bytes(valid.clone());
-        let column = crate::array::StrColumn::from_dictionary(&heap, &offsets, &codes, &validity);
+        let validity = crate::array::ValidityMask::from_bools(&valid);
+        let column =
+            crate::array::StrColumn::from_dictionary(&heap, &offsets, codes, validity.clone());
         ColumnVector::from_typed(
             DataType::Utf8,
             crate::batch::TypedValues::Utf8(column),
-            crate::array::ValidityMask::from_bools(&valid),
+            validity,
         )
     }
 

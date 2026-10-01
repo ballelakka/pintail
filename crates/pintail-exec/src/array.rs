@@ -83,6 +83,16 @@ impl ValidityMask {
         }
     }
 
+    /// Validity of rows `64 * index ..` as one word, bit `i` for row
+    /// `64 * index + i`; every bit set when nothing is null.
+    #[must_use]
+    pub(crate) fn word(&self, index: usize) -> u64 {
+        match &self.words {
+            None => u64::MAX,
+            Some(words) => words[index],
+        }
+    }
+
     /// Count of valid rows.
     #[must_use]
     pub fn count_valid(&self) -> usize {
@@ -321,7 +331,9 @@ struct StrBody {
 pub struct StrDictionary {
     codes: Vec<u32>,
     values: Vec<String>,
-    validity: Vec<bool>,
+    /// The column's own validity: all-valid as a row count, so a NOT NULL
+    /// coded column carries no per-row bytes.
+    validity: ValidityMask,
 }
 
 impl StrColumn {
@@ -518,23 +530,24 @@ impl StrColumn {
         })
     }
 
+    /// A coded column over the decoded codes, adopted without copying them.
     #[must_use]
     pub fn from_dictionary(
         dict_heap: &[u8],
         dict_offsets: &[usize],
-        codes: &[u32],
-        validity: &pintail_store::ColumnValidity,
+        codes: Vec<u32>,
+        validity: ValidityMask,
     ) -> Self {
         Self {
             views: Vec::new(),
             heap: Vec::new(),
             dict: Some(StrDictionary {
-                codes: codes.to_vec(),
+                codes,
                 values: dict_offsets
                     .windows(2)
                     .map(|pair| String::from_utf8_lossy(&dict_heap[pair[0]..pair[1]]).into_owned())
                     .collect(),
-                validity: validity.iter().collect(),
+                validity,
             }),
             lazy: Some(Box::new(std::sync::OnceLock::new())),
             enum_labels: None,
@@ -559,9 +572,9 @@ impl StrColumn {
             body.views = dict
                 .codes
                 .iter()
-                .zip(&dict.validity)
-                .map(|(code, valid)| {
-                    if *valid {
+                .enumerate()
+                .map(|(row, code)| {
+                    if dict.validity.is_valid(row) {
                         templates[*code as usize]
                     } else {
                         empty
@@ -578,7 +591,7 @@ impl StrColumn {
     pub fn byte_size(&self) -> usize {
         if let Some(dict) = &self.dict {
             let coded = dict.codes.len() * size_of::<u32>()
-                + dict.validity.len()
+                + dict.validity.len().div_ceil(64) * size_of::<u64>()
                 + dict.values.iter().map(String::len).sum::<usize>();
             let built = self
                 .lazy

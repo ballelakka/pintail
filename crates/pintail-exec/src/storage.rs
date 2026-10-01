@@ -2802,7 +2802,7 @@ pub(crate) fn column_vector_from_decoded(
                 // Straight to view templates: one 16-byte view per row,
                 // dictionary bytes as the only heap.
                 let column =
-                    StrColumn::from_dictionary(&dict_heap, &dict_offsets, &codes, &validity)
+                    StrColumn::from_dictionary(&dict_heap, &dict_offsets, codes, mask.clone())
                         .with_enum_labels(enum_labels.map(Arc::clone))
                         .with_set_members(set_members.map(Arc::clone));
                 return Ok(ColumnVector::from_typed(
