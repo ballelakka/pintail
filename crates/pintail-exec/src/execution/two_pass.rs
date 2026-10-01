@@ -420,6 +420,7 @@ struct TwoPassState<'a> {
     maps: &'a mut [GroupKeyMap],
     dense: &'a mut Option<DenseGroupSlots>,
     range: &'a mut IntRange,
+    pool: &'a mut DensePool,
     group_reserved: &'a mut usize,
     spill_runs: &'a mut Vec<spill::ClosedRun>,
 }
@@ -440,6 +441,7 @@ fn two_pass_spill(
     collation: Collation,
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
+    settle_dense(state.dense, state.pool, aggregates, memory)?;
     if let Some(slots) = state.dense.take() {
         fold_dense_into_maps(
             slots,
@@ -624,6 +626,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
     }
 
     let mut range = IntRange::default();
+    let mut dense_pool = DensePool::default();
     let mut window: Vec<(RecordBatch, Vec<Vec<u64>>)> = Vec::new();
     let mut window_reserved = 0_usize;
     let mut window_rows = 0_usize;
@@ -684,6 +687,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                         maps: &mut maps,
                         dense: &mut dense,
                         range: &mut range,
+                        pool: &mut dense_pool,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -705,6 +709,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     &mut maps,
                     &mut dense,
                     &mut range,
+                    &mut dense_pool,
                     intern.as_ref().map_or(0, |intern| intern.values.len()),
                     memory,
                     &mut group_reserved,
@@ -720,6 +725,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                             maps: &mut maps,
                             dense: &mut dense,
                             range: &mut range,
+                            pool: &mut dense_pool,
                             group_reserved: &mut group_reserved,
                             spill_runs: &mut spill_runs,
                         },
@@ -747,6 +753,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                         maps: &mut maps,
                         dense: &mut dense,
                         range: &mut range,
+                        pool: &mut dense_pool,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -768,6 +775,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     &mut maps,
                     &mut dense,
                     &mut range,
+                    &mut dense_pool,
                     intern.as_ref().map_or(0, |intern| intern.values.len()),
                     memory,
                     &mut group_reserved,
@@ -781,6 +789,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                             maps: &mut maps,
                             dense: &mut dense,
                             range: &mut range,
+                            pool: &mut dense_pool,
                             group_reserved: &mut group_reserved,
                             spill_runs: &mut spill_runs,
                         },
@@ -815,6 +824,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     maps: &mut maps,
                     dense: &mut dense,
                     range: &mut range,
+                    pool: &mut dense_pool,
                     group_reserved: &mut group_reserved,
                     spill_runs: &mut spill_runs,
                 },
@@ -844,6 +854,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                         maps: &mut maps,
                         dense: &mut dense,
                         range: &mut range,
+                        pool: &mut dense_pool,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -916,6 +927,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     maps: &mut maps,
                     dense: &mut dense,
                     range: &mut range,
+                    pool: &mut dense_pool,
                     group_reserved: &mut group_reserved,
                     spill_runs: &mut spill_runs,
                 },
@@ -945,6 +957,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                         maps: &mut maps,
                         dense: &mut dense,
                         range: &mut range,
+                        pool: &mut dense_pool,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -973,6 +986,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
             maps: &mut maps,
             dense: &mut dense,
             range: &mut range,
+            pool: &mut dense_pool,
             group_reserved: &mut group_reserved,
             spill_runs: &mut spill_runs,
         },
@@ -994,6 +1008,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         &mut maps,
         &mut dense,
         &mut range,
+        &mut dense_pool,
         intern.as_ref().map_or(0, |intern| intern.values.len()),
         memory,
         &mut group_reserved,
@@ -1004,6 +1019,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
             maps: &mut maps,
             dense: &mut dense,
             range: &mut range,
+            pool: &mut dense_pool,
             group_reserved: &mut group_reserved,
             spill_runs: &mut spill_runs,
         },
@@ -1025,6 +1041,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         &mut group_reserved,
     )?;
     memory.release(bucket_reserved);
+    settle_dense(&mut dense, &mut dense_pool, aggregates, memory)?;
     if let Some(slots) = dense.take() {
         fold_dense_into_maps(
             slots,
@@ -1709,6 +1726,7 @@ fn drain_two_pass_window(
     maps: &mut [GroupKeyMap],
     dense: &mut Option<DenseGroupSlots>,
     range: &mut IntRange,
+    pool: &mut DensePool,
     intern_len: usize,
     memory: &MemoryTracker,
     group_reserved: &mut usize,
@@ -1730,7 +1748,7 @@ fn drain_two_pass_window(
                 }
                 // A year outside the table's window: fall through, unify what
                 // the slots hold and finish on the scatter path.
-            } else if dense_text_window(window, keys, lanes, aggregates, slots, memory)? {
+            } else if dense_text_window(window, keys, lanes, aggregates, slots, pool, memory)? {
                 window.clear();
                 memory.release(*window_reserved);
                 *window_reserved = 0;
@@ -1740,6 +1758,7 @@ fn drain_two_pass_window(
         // The intern table outgrew the dense domain: unify what the dense
         // slots hold into the partition maps and continue on the classic
         // scatter path for the rest of the stream.
+        settle_dense(dense, pool, aggregates, memory)?;
         let slots = dense.take().expect("checked above");
         fold_dense_into_maps(
             slots,
@@ -2835,6 +2854,60 @@ enum DenseFold {
 
 type DenseGroupSlots = Vec<Option<Vec<AggregateState>>>;
 
+/// Worker partials of the dense text slots, kept from one window to the
+/// next and merged into the slots only when something reads them.
+///
+/// A partial made fresh for every batch started every group's states over:
+/// each COUNT(DISTINCT) set grew from empty through its integer set and its
+/// bitmap's widenings once per batch, and every partial merged into the
+/// slots once per window.
+#[derive(Default)]
+struct DensePool {
+    partials: Vec<DenseGroupSlots>,
+    /// Bytes charged for the partials, handed back when they merge.
+    reserved: usize,
+}
+
+/// Merges the pool's partials into the dense slots, which every reader of
+/// the slots must see whole.
+fn settle_dense(
+    dense: &mut Option<DenseGroupSlots>,
+    pool: &mut DensePool,
+    aggregates: &[CompiledAggregate],
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
+    let partials = std::mem::take(&mut pool.partials);
+    let outcome = (|| {
+        if let Some(slots) = dense.as_mut() {
+            for partial in partials {
+                *slots = merge_dense_slots(std::mem::take(slots), partial, aggregates, memory)?;
+            }
+        }
+        Ok(())
+    })();
+    memory.release(pool.reserved);
+    pool.reserved = 0;
+    outcome
+}
+
+/// Whether worker partials may live across batches and windows: only when
+/// every lane's merge is order-free. Which rows a pooled partial sees
+/// depends on scheduling, and a floating-point total depends on the order
+/// its parts are added in, as does where a checked integer sum overflows,
+/// so those lanes keep one partial per chunk, merged in chunk order.
+fn poolable(lanes: &[TwoPassLane]) -> bool {
+    lanes.iter().all(|lane| {
+        matches!(
+            lane,
+            TwoPassLane::CountStar
+                | TwoPassLane::DecimalUnits { .. }
+                | TwoPassLane::ExtremeDecimal { .. }
+                | TwoPassLane::Distinct { .. }
+                | TwoPassLane::Exact { .. }
+        )
+    })
+}
+
 /// The persistent slab also bounds the states allocated lazily in its
 /// occupied slots. Worker slabs have their own temporary reservation.
 fn dense_reservation(keys: TwoPassKeySource, slots: usize, lanes: usize) -> usize {
@@ -3286,6 +3359,7 @@ fn dense_text_window(
     lanes: &[TwoPassLane],
     aggregates: &[CompiledAggregate],
     slots: &mut DenseGroupSlots,
+    pool: &mut DensePool,
     memory: &MemoryTracker,
 ) -> Result<bool, ExecError> {
     let columns: &[usize] = match keys {
@@ -3303,42 +3377,71 @@ fn dense_text_window(
         .len()
         .div_ceil(rayon::current_num_threads().saturating_mul(4))
         .max(1);
-    let workers = window.len().div_ceil(chunk_size);
-    let partial_bytes = workers.saturating_mul(slot_count).saturating_mul(
-        size_of::<Option<Vec<AggregateState>>>() + aggregates.len() * size_of::<AggregateState>(),
-    );
-    if memory.reserve(partial_bytes).is_err() {
-        return Ok(false);
-    }
     let packed = lanes
         .iter()
         .zip(aggregates)
         .map(|(lane, aggregate)| packed_lane(lane, aggregate))
         .collect::<Vec<_>>();
     let any_packed = packed.iter().any(Option::is_some);
+    let fold_chunk = |chunk: &[(RecordBatch, Vec<Vec<u64>>)], acc: &mut DenseGroupSlots| {
+        if any_packed {
+            return dense_packed_chunk(
+                chunk, keys, columns, lanes, &packed, aggregates, acc, memory,
+            );
+        }
+        for (batch, translations) in chunk {
+            two_pass_dense_batch(
+                batch,
+                keys,
+                columns,
+                translations,
+                lanes,
+                aggregates,
+                acc,
+                memory,
+            )?;
+        }
+        Ok(())
+    };
+    let partial_bytes = |partials: usize| {
+        partials.saturating_mul(slot_count).saturating_mul(
+            size_of::<Option<Vec<AggregateState>>>()
+                + aggregates.len() * size_of::<AggregateState>(),
+        )
+    };
+    if poolable(lanes) {
+        // One partial per worker at most, charged once for the pool's life.
+        if pool.reserved == 0 {
+            let bytes = partial_bytes(rayon::current_num_threads().max(1));
+            if memory.reserve(bytes).is_err() {
+                return Ok(false);
+            }
+            pool.reserved = bytes;
+        }
+        let shared = std::sync::Mutex::new(std::mem::take(&mut pool.partials));
+        let poisoned = || ExecError::InvalidBatch("dense partial pool poisoned");
+        let outcome = window.par_chunks(chunk_size).try_for_each(|chunk| {
+            let taken = shared.lock().map_err(|_| poisoned())?.pop();
+            let mut acc = taken.unwrap_or_else(|| vec![None; slot_count]);
+            let folded = fold_chunk(chunk, &mut acc);
+            shared.lock().map_err(|_| poisoned())?.push(acc);
+            folded
+        });
+        pool.partials = shared.into_inner().map_err(|_| poisoned())?;
+        outcome?;
+        return Ok(true);
+    }
+    let workers = window.len().div_ceil(chunk_size);
+    let partial_bytes = partial_bytes(workers);
+    if memory.reserve(partial_bytes).is_err() {
+        return Ok(false);
+    }
     let outcome = (|| {
         let partials = window
             .par_chunks(chunk_size)
             .map(|chunk| {
                 let mut acc = vec![None; slot_count];
-                if any_packed {
-                    dense_packed_chunk(
-                        chunk, keys, columns, lanes, &packed, aggregates, &mut acc, memory,
-                    )?;
-                    return Ok(acc);
-                }
-                for (batch, translations) in chunk {
-                    two_pass_dense_batch(
-                        batch,
-                        keys,
-                        columns,
-                        translations,
-                        lanes,
-                        aggregates,
-                        &mut acc,
-                        memory,
-                    )?;
-                }
+                fold_chunk(chunk, &mut acc)?;
                 Ok(acc)
             })
             .collect::<Result<Vec<_>, ExecError>>()?;
