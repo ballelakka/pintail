@@ -1658,6 +1658,14 @@ pub trait BatchStream: Send {
         false
     }
 
+    /// What the stream's reads cost so far, for a profiled execution:
+    /// bytes decompressed and values decoded, in total and per column id.
+    /// `None` for a stream that does not decode stored blocks.
+    #[must_use]
+    fn decode_note(&self) -> Option<String> {
+        None
+    }
+
     /// `(table directory, manifest generation, scan signature)` over a
     /// settled snapshot — the exactness-preserving identity for the settled
     /// aggregate memo. Default: not settled.
@@ -4752,6 +4760,13 @@ impl PullOperator {
                     _ => None,
                 };
                 sink.record(*slot, started.elapsed(), rows, memory.used());
+                // A scan's decode cost is known once it is drained.
+                if matches!(result, Ok(None))
+                    && let Self::Scan { stream, .. } = input.as_ref()
+                    && let Some(note) = stream.decode_note()
+                {
+                    sink.annotate(*slot, &note);
+                }
                 result
             }
             Self::KeyFilter {

@@ -2678,6 +2678,22 @@ pub(crate) struct ProjectedColumnFetch {
     pub(crate) blocks_read: usize,
     pub(crate) blocks_pruned: usize,
     pub(crate) reserved_bytes: usize,
+    /// What each projected column cost to read, in projection order.
+    pub(crate) column_decode: Vec<ColumnDecode>,
+}
+
+/// What reading one column cost a scan: the bytes its blocks decompressed
+/// to and the values it put in the output. A filter-first read that keeps
+/// few rows shows it here - fewer values for the same bytes when it keeps
+/// a few rows of every block, fewer bytes when whole blocks hold none.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ColumnDecode {
+    /// The column's stable id.
+    pub column_id: u32,
+    /// Bytes its decoded blocks decompressed to.
+    pub bytes_decompressed: u64,
+    /// Values it delivered to the scan's output.
+    pub values_decoded: u64,
 }
 
 /// An in-progress [`DecodedColumn`] receiving one block of cells at a time.
@@ -3287,6 +3303,16 @@ pub(crate) fn read_projected_column_ranges(
     let selected_rows = ranges.iter().map(std::ops::Range::len).sum::<usize>();
     let mut builders: Vec<Option<ColumnBuilder>> = (0..projection.len()).map(|_| None).collect();
     let mut found = vec![false; projection.len()];
+    let mut column_decode = projection
+        .iter()
+        .map(|index| ColumnDecode {
+            column_id: schema
+                .columns()
+                .get(*index)
+                .map_or(0, pintail_types::Column::id),
+            ..ColumnDecode::default()
+        })
+        .collect::<Vec<_>>();
     let mut reserved_bytes = 0_usize;
     let mut blocks_decoded = 0_usize;
     // Counted alongside the decode tally so this path reports the same
@@ -3438,6 +3464,12 @@ pub(crate) fn read_projected_column_ranges(
                 skip_file_block(&path, &mut decoder)?
             };
             reserved_bytes = reserved_bytes.saturating_add(block.reserved_bytes);
+            if let Some(position) = projected_position {
+                let tally = &mut column_decode[position];
+                tally.bytes_decompressed = tally
+                    .bytes_decompressed
+                    .saturating_add(block.decompressed_bytes as u64);
+            }
             let block_end = block_start
                 .checked_add(block.row_count)
                 .ok_or_else(|| corrupt_here(&path, &decoder, "column row count overflow"))?;
@@ -3494,6 +3526,7 @@ pub(crate) fn read_projected_column_ranges(
                     "projected column row count differs from the requested range",
                 ));
             }
+            column_decode[position].values_decoded = selected_rows as u64;
             columns.push(column);
             continue;
         }
@@ -3516,6 +3549,7 @@ pub(crate) fn read_projected_column_ranges(
         blocks_read,
         blocks_pruned,
         reserved_bytes,
+        column_decode,
     })
 }
 
@@ -3838,6 +3872,8 @@ struct BlockRead {
     row_count: usize,
     cells: Option<Vec<Cell>>,
     reserved_bytes: usize,
+    /// Bytes the block's payload decompressed to; zero for a skipped block.
+    decompressed_bytes: usize,
 }
 
 /// A columnar destination for one string block: rows in `lo..hi`
@@ -4218,6 +4254,7 @@ fn skip_file_block(path: &Path, decoder: &mut FileDecoder) -> Result<BlockRead, 
         row_count,
         cells: None,
         reserved_bytes: 0,
+        decompressed_bytes: 0,
     })
 }
 
@@ -4495,6 +4532,7 @@ where
             row_count,
             cells: None,
             reserved_bytes: 0,
+            decompressed_bytes: 0,
         });
     }
     let non_null_count = row_count - actual_nulls;
@@ -4531,6 +4569,7 @@ where
             row_count,
             cells: None,
             reserved_bytes: 0,
+            decompressed_bytes: uncompressed_length,
         });
     }
     if let Some(sink) = int_sink
@@ -4549,6 +4588,7 @@ where
             row_count,
             cells: None,
             reserved_bytes: 0,
+            decompressed_bytes: uncompressed_length,
         });
     }
     let decoded_heap =
@@ -4591,6 +4631,7 @@ where
             row_count,
             cells: Some(decoded_values),
             reserved_bytes: memory.map_or(0, |_| reserved_bytes),
+            decompressed_bytes: uncompressed_length,
         });
     }
     let mut decoded_values = decoded_values.into_iter();
@@ -4615,6 +4656,7 @@ where
         row_count,
         cells: Some(cells),
         reserved_bytes: memory.map_or(0, |_| reserved_bytes),
+        decompressed_bytes: uncompressed_length,
     })
 }
 
@@ -4730,6 +4772,7 @@ fn read_file_framed_utf8_rows(
     // The loaded frame's index and bytes, the byte offset of its next
     // unread value and that value's ordinal.
     let mut loaded: Option<(usize, Vec<u8>)> = None;
+    let mut decompressed = 0_usize;
     let mut cursor = 0_usize;
     let mut cursor_value = 0_usize;
     let mut ordinal = 0_usize;
@@ -4763,6 +4806,7 @@ fn read_file_framed_utf8_rows(
                     let bytes = decompress_frame(entry, &stored).map_err(|reason| {
                         corrupt(path, data_start + entry.stored_offset, reason)
                     })?;
+                    decompressed = decompressed.saturating_add(bytes.len());
                     loaded = Some((frame_index, bytes));
                     cursor = 0;
                     cursor_value = entry.first_value;
@@ -4797,6 +4841,7 @@ fn read_file_framed_utf8_rows(
         row_count,
         cells: None,
         reserved_bytes: 0,
+        decompressed_bytes: decompressed,
     }))
 }
 

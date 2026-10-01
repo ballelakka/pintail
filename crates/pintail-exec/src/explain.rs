@@ -184,6 +184,13 @@ fn write_plan(
                     stats.blocks_total(),
                     stats.blocks_decoded
                 )?;
+                if stats.bytes_decompressed > 0 || stats.values_decoded > 0 {
+                    write!(
+                        output,
+                        " decompressed_bytes={} decoded_values={}",
+                        stats.bytes_decompressed, stats.values_decoded
+                    )?;
+                }
             }
             writeln!(output)
         }

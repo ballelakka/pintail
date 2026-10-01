@@ -10,7 +10,7 @@ use pintail_types::{KeyPart, PrimaryKey, StoredRow};
 use rayon::prelude::*;
 
 use super::{TableSnapshot, projected_scan_pool};
-use crate::{StoreError, segment};
+use crate::{StoreError, segment, segment::ColumnDecode};
 
 /// A scan row containing only the requested user columns.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,9 +81,35 @@ pub struct ScanStats {
     pub(super) blocks_pruned: usize,
     pub(super) blocks_read: usize,
     pub(super) blocks_decoded: usize,
+    pub(super) bytes_decompressed: u64,
+    pub(super) values_decoded: u64,
 }
 
 impl ScanStats {
+    /// Returns the bytes the scan's decoded blocks decompressed to.
+    #[must_use]
+    pub fn bytes_decompressed(self) -> u64 {
+        self.bytes_decompressed
+    }
+
+    /// Returns the column values the scan's reads delivered, predicate
+    /// columns included.
+    #[must_use]
+    pub fn values_decoded(self) -> u64 {
+        self.values_decoded
+    }
+
+    /// Adds what the columns of one read cost to these counters.
+    fn with_decode(mut self, decode: &[ColumnDecode]) -> Self {
+        for column in decode {
+            self.bytes_decompressed = self
+                .bytes_decompressed
+                .saturating_add(column.bytes_decompressed);
+            self.values_decoded = self.values_decoded.saturating_add(column.values_decoded);
+        }
+        self
+    }
+
     /// Returns segments rejected from manifest key bounds.
     #[must_use]
     pub fn segments_pruned(self) -> usize {
@@ -120,6 +146,10 @@ impl ScanStats {
         self.blocks_pruned += other.blocks_pruned;
         self.blocks_read += other.blocks_read;
         self.blocks_decoded += other.blocks_decoded;
+        self.bytes_decompressed = self
+            .bytes_decompressed
+            .saturating_add(other.bytes_decompressed);
+        self.values_decoded = self.values_decoded.saturating_add(other.values_decoded);
     }
 }
 
@@ -259,6 +289,7 @@ fn values_chunk(
         row_count,
         stats: ScanStats::default(),
         retained_bytes,
+        column_decode: Vec::new(),
     })
 }
 
@@ -1346,6 +1377,9 @@ pub struct ProjectedColumnChunk {
     /// Every row satisfies the scan's prewhere predicate: the chunk holds
     /// only rows an exact selector kept.
     prefiltered: bool,
+    /// What each column read for this chunk cost, predicate columns
+    /// included; a column read twice appears twice.
+    column_decode: Vec<ColumnDecode>,
 }
 
 impl ProjectedValueChunk {
@@ -1379,6 +1413,14 @@ impl ProjectedColumnChunk {
     #[must_use]
     pub fn columns(&self) -> &[DecodedColumn] {
         &self.columns
+    }
+
+    /// What each column read for this chunk cost: decompressed bytes and
+    /// delivered values per column id. Empty for rows that came from the
+    /// memtable or the row-merge path.
+    #[must_use]
+    pub fn column_decode(&self) -> &[ColumnDecode] {
+        &self.column_decode
     }
 
     /// Moves the packed projected columns into a columnar executor.
@@ -2285,6 +2327,7 @@ impl ProjectedScanStream {
             stats,
             retained_bytes: _,
             prefiltered: _,
+            column_decode,
         } = segment_chunk;
         let columns = columns
             .into_iter()
@@ -2318,6 +2361,7 @@ impl ProjectedScanStream {
             row_count: row_count + live.len(),
             stats,
             retained_bytes,
+            column_decode,
         })
     }
 
@@ -2539,13 +2583,16 @@ impl ProjectedScanStream {
         };
         let mut reserved = held;
         let mut rest_columns = Vec::new().into_iter();
+        let mut column_decode = predicate.column_decode;
         if let Some(fetch) = rest {
             stats.blocks_read += fetch.blocks_read;
             stats.blocks_pruned += fetch.blocks_pruned;
             stats.blocks_decoded += fetch.blocks_decoded;
             reserved = reserved.saturating_add(fetch.reserved_bytes);
             rest_columns = fetch.columns.into_iter();
+            column_decode.extend(fetch.column_decode);
         }
+        let stats = stats.with_decode(&column_decode);
         let mut columns = Vec::with_capacity(self.column_ids.len());
         for (position, reused) in reuse.iter().enumerate() {
             let column = match reused {
@@ -2576,6 +2623,7 @@ impl ProjectedScanStream {
             stats,
             retained_bytes,
             prefiltered,
+            column_decode,
         })
     }
 
@@ -3083,6 +3131,7 @@ impl ProjectedScanStream {
                 ..ScanStats::default()
             },
             retained_bytes,
+            column_decode: Vec::new(),
         }))
     }
 
@@ -3219,8 +3268,10 @@ impl ProjectedScanStream {
                 blocks_read: fetch.blocks_read,
                 blocks_pruned: fetch.blocks_pruned,
                 ..ScanStats::default()
-            },
+            }
+            .with_decode(&fetch.column_decode),
             retained_bytes,
+            column_decode: fetch.column_decode,
         })
     }
 
@@ -3425,8 +3476,10 @@ impl ProjectedScanStream {
                 blocks_read: fetch.blocks_read,
                 blocks_pruned: fetch.blocks_pruned,
                 ..ScanStats::default()
-            },
+            }
+            .with_decode(&fetch.column_decode),
             retained_bytes,
+            column_decode: fetch.column_decode,
         })
     }
 
@@ -3502,6 +3555,7 @@ impl ProjectedScanStream {
             row_count,
             stats,
             retained_bytes,
+            column_decode: Vec::new(),
         })
     }
 
@@ -3777,8 +3831,10 @@ fn retain_predicate_fetch(
             blocks_pruned: fetch.blocks_pruned,
             blocks_decoded: fetch.blocks_decoded,
             ..ScanStats::default()
-        },
+        }
+        .with_decode(&fetch.column_decode),
         retained_bytes,
+        column_decode: fetch.column_decode,
     })
 }
 

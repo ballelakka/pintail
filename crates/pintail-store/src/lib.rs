@@ -23,8 +23,8 @@ pub use publication::{
     lease_unwritten_table, publish_changes_under, published_generation, retain_writer_locks,
 };
 pub use segment::{
-    BoundDomain, ColumnBounds, ColumnSma, NativeUnits, SegmentSmas, SmaExtremes, SmaSum,
-    sync_directory,
+    BoundDomain, ColumnBounds, ColumnDecode, ColumnSma, NativeUnits, SegmentSmas, SmaExtremes,
+    SmaSum, sync_directory,
 };
 pub use sketch::DistinctSketch;
 pub use store::GroupedFoldSpan;
