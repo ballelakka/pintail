@@ -248,6 +248,7 @@ fn unsigned_integer_range_fold_matches_general() {
 #[test]
 fn dense_text_column_folds_match_general() {
     let fixture = fixture(DataType::Int64);
+    let unsigned = self::fixture(DataType::UInt64);
     for filter in ["", "WHERE id % 3 <> 1"] {
         assert_same(
             &fixture,
@@ -267,6 +268,39 @@ fn dense_text_column_folds_match_general() {
                  {filter} GROUP BY a, b ORDER BY a, b"
             ),
         );
+        // A lane that is not packed beside the packed ones: distinct keys
+        // that fit a bitmap, and the sparse stretch that does not.
+        for key_type in [DataType::Int64, DataType::UInt64] {
+            let fixture = if key_type == DataType::Int64 {
+                &fixture
+            } else {
+                &unsigned
+            };
+            assert_same(
+                fixture,
+                &format!(
+                    "SELECT shelf AS k, {LANES}, COUNT(DISTINCT owner) FROM stock {filter} \
+                     GROUP BY k ORDER BY k"
+                ),
+                &format!(
+                    "SELECT CONCAT(shelf, '') AS k, {LANES}, COUNT(DISTINCT owner) FROM stock \
+                     {filter} GROUP BY k ORDER BY k"
+                ),
+            );
+            assert_same(
+                fixture,
+                &format!(
+                    "SELECT shelf AS k, COUNT(DISTINCT owner) FROM stock \
+                     WHERE id < 400000 {} GROUP BY k ORDER BY k",
+                    filter.replace("WHERE", "AND")
+                ),
+                &format!(
+                    "SELECT CONCAT(shelf, '') AS k, COUNT(DISTINCT owner) FROM stock \
+                     WHERE id < 400000 {} GROUP BY k ORDER BY k",
+                    filter.replace("WHERE", "AND")
+                ),
+            );
+        }
     }
 }
 
