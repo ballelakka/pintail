@@ -45,6 +45,7 @@ struct Fixture {
     catalog: CatalogSnapshot,
 }
 
+#[allow(clippy::too_many_lines)] // one generated table, every column beside the others
 fn fixture(key_type: DataType) -> Fixture {
     let schema = TableSchema::new(
         1,
@@ -62,6 +63,7 @@ fn fixture(key_type: DataType) -> Fixture {
             ),
             Column::new(4, "shelf", DataType::Utf8, true),
             Column::new(5, "aisle", DataType::Utf8, true),
+            Column::new(6, "stocked", DataType::Date32, true),
         ],
     )
     .expect("schema");
@@ -107,6 +109,18 @@ fn fixture(key_type: DataType) -> Fixture {
                         } else {
                             Value::Utf8(SHELVES[usize::try_from(id % 6).expect("small")].to_owned())
                         };
+                        // About five years of days, starting mid-year, NULL now and then.
+                        let stocked = if id.is_multiple_of(41) {
+                            Value::Null
+                        } else {
+                            let day = (id * 7) % 1_900;
+                            Value::Utf8(format!(
+                                "{}-{:02}-{:02}",
+                                2019 + day / 365,
+                                1 + (day % 365) / 31,
+                                1 + (day % 365) % 28
+                            ))
+                        };
                         let aisle = if id.is_multiple_of(37) {
                             Value::Null
                         } else {
@@ -114,7 +128,7 @@ fn fixture(key_type: DataType) -> Fixture {
                         };
                         StoredRow::new(
                             PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
-                            vec![Value::UInt64(id), owner, amount, shelf, aisle],
+                            vec![Value::UInt64(id), owner, amount, shelf, aisle, stocked],
                             1,
                             false,
                         )
@@ -255,6 +269,40 @@ fn dense_text_column_folds_match_general() {
             &format!(
                 "SELECT CONCAT(shelf, '') AS a, CONCAT(aisle, '') AS b, {LANES} FROM stock \
                  {filter} GROUP BY a, b ORDER BY a, b"
+            ),
+        );
+    }
+}
+
+#[test]
+fn date_part_folds_match_general() {
+    let fixture = fixture(DataType::Int64);
+    for filter in ["", "WHERE id % 3 <> 1"] {
+        assert_same(
+            &fixture,
+            &format!(
+                "SELECT YEAR(stocked) AS y, MONTH(stocked) AS m, {LANES} FROM stock {filter} \
+                 GROUP BY y, m ORDER BY y, m"
+            ),
+            &format!(
+                "SELECT YEAR(stocked) + 0 AS y, MONTH(stocked) + 0 AS m, {LANES} FROM stock \
+                 {filter} GROUP BY y, m ORDER BY y, m"
+            ),
+        );
+        assert_same(
+            &fixture,
+            &format!(
+                "SELECT YEAR(stocked) AS y, {LANES} FROM stock {filter} GROUP BY y ORDER BY y"
+            ),
+            &format!(
+                "SELECT YEAR(stocked) + 0 AS y, {LANES} FROM stock {filter} GROUP BY y ORDER BY y"
+            ),
+        );
+        assert_same(
+            &fixture,
+            &format!("SELECT DAY(stocked) AS d, {LANES} FROM stock {filter} GROUP BY d ORDER BY d"),
+            &format!(
+                "SELECT DAY(stocked) + 0 AS d, {LANES} FROM stock {filter} GROUP BY d ORDER BY d"
             ),
         );
     }

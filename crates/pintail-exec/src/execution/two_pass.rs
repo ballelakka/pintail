@@ -3200,15 +3200,49 @@ fn dense_date_parts_window(
     memory: &MemoryTracker,
 ) -> Result<bool, ExecError> {
     let slot_count = slots.len();
+    let packed = lanes
+        .iter()
+        .zip(aggregates)
+        .map(|(lane, aggregate)| packed_lane(lane, aggregate))
+        .collect::<Vec<_>>();
+    let any_packed = packed.iter().any(Option::is_some);
     let folded = window
         .par_iter()
         .try_fold(
-            || vec![None; slot_count],
-            |mut acc, (batch, _)| {
-                two_pass_dense_date_parts_batch(batch, parts, lanes, aggregates, &mut acc, memory)?;
-                Ok(acc)
+            || {
+                (
+                    vec![None; slot_count],
+                    any_packed.then(|| PackedFold::new(slot_count, &packed)),
+                )
+            },
+            |(mut acc, mut fold), (batch, _)| {
+                if let Some(fold) = &mut fold {
+                    dense_date_parts_packed_batch(
+                        batch, parts, lanes, &packed, aggregates, &mut acc, fold, memory,
+                    )?;
+                } else {
+                    two_pass_dense_date_parts_batch(
+                        batch, parts, lanes, aggregates, &mut acc, memory,
+                    )?;
+                }
+                Ok((acc, fold))
             },
         )
+        .map(|folded| {
+            let (mut acc, fold) = folded?;
+            if let Some(fold) = fold {
+                for (slot, entry) in acc.iter_mut().enumerate() {
+                    if fold.occupied(slot) {
+                        let states = entry.get_or_insert_with(|| {
+                            aggregates.iter().map(AggregateState::new).collect()
+                        });
+                        fold.commit_slot(slot, states, aggregates, memory)
+                            .map_err(DenseFold::Exec)?;
+                    }
+                }
+            }
+            Ok(acc)
+        })
         .try_reduce(
             || vec![None; slot_count],
             |left, right| {
@@ -3223,6 +3257,169 @@ fn dense_date_parts_window(
         Err(DenseFold::Exec(error)) => Err(error),
         Err(DenseFold::OutOfDomain) => Ok(false),
     }
+}
+
+/// Each selected row's date-part slot, in selection order, or
+/// [`DenseFold::OutOfDomain`] when a value has no slot.
+///
+/// Two calendar parts of one DATE column - the YEAR/MONTH grouping - are
+/// tabled over the batch's span of days: one civil conversion per distinct
+/// day instead of one per row, then a lookup per row.
+fn date_part_slots(
+    batch: &RecordBatch,
+    parts: [Option<(DatePart, usize)>; 2],
+) -> Result<Vec<u32>, DenseFold> {
+    const NO_SLOT: u32 = u32::MAX;
+    let slot_of = |key_bits: u64| -> Result<u32, DenseFold> {
+        dense_date_slot(parts, key_bits)
+            .and_then(|slot| u32::try_from(slot).ok())
+            .ok_or(DenseFold::OutOfDomain)
+    };
+    let mut slots = Vec::with_capacity(batch.visible_row_count());
+    let mut present = parts.iter().flatten();
+    let column = present.next().map(|(_, column)| *column);
+    if let Some(column) = column
+        && parts.iter().flatten().all(|(part, each)| {
+            *each == column && matches!(part, DatePart::Year | DatePart::Month | DatePart::Day)
+        })
+        && let Some(vector) = batch.column(column)
+        && vector.data_type() == DataType::Date32
+        && let Some((crate::batch::TypedValues::Temporal { units, .. }, validity)) = vector.typed()
+        && units.len() >= batch.row_count()
+    {
+        let pick = |part: DatePart, year: i64, month: i64, day: i64| -> u64 {
+            let value = match part {
+                DatePart::Year => year,
+                DatePart::Month => month,
+                _ => day,
+            };
+            // Matches evaluate_units_date_part: out-of-range clamps to 0,
+            // then the scatter packing adds one.
+            u64::try_from(value).unwrap_or(0) + 1
+        };
+        let key_of = |day_units: i64| {
+            let (year, month, day) = pintail_types::civil_from_days(day_units);
+            parts.iter().flatten().fold(0_u64, |bits, (part, _)| {
+                (bits << 20) | pick(*part, year, month, day)
+            })
+        };
+        let null_slot = slot_of(0)?;
+        let bounds = batch
+            .selection()
+            .selected_rows()
+            .filter(|row| validity.is_valid(*row))
+            .map(|row| units[row])
+            .fold(None, |bounds: Option<(i64, i64)>, day| {
+                Some(bounds.map_or((day, day), |(low, high)| (low.min(day), high.max(day))))
+            });
+        let span = bounds.and_then(|(low, high)| usize::try_from(high.checked_sub(low)?).ok());
+        if let (Some((low, _)), Some(span)) = (bounds, span)
+            && span < DENSE_DATE_SLOT_CAP
+        {
+            let table = (0..=span)
+                .map(|offset| {
+                    let day = low + i64::try_from(offset).expect("span fits i64");
+                    slot_of(key_of(day)).unwrap_or(NO_SLOT)
+                })
+                .collect::<Vec<u32>>();
+            for row in batch.selection().selected_rows() {
+                let slot = if validity.is_valid(row) {
+                    let offset = usize::try_from(units[row] - low).expect("inside the bounds");
+                    table[offset]
+                } else {
+                    null_slot
+                };
+                if slot == NO_SLOT {
+                    return Err(DenseFold::OutOfDomain);
+                }
+                slots.push(slot);
+            }
+            return Ok(slots);
+        }
+        for row in batch.selection().selected_rows() {
+            let key_bits = if validity.is_valid(row) {
+                key_of(units[row])
+            } else {
+                0
+            };
+            slots.push(slot_of(key_bits)?);
+        }
+        return Ok(slots);
+    }
+    for row in batch.selection().selected_rows() {
+        let mut key_bits = 0_u64;
+        for (part, column) in parts.iter().flatten() {
+            let id = match crate::expression::evaluate_units_date_part(batch, *column, row, *part) {
+                // Same 20-bit lane contract as the sparse encoder.
+                Some(Ok(Value::Int64(value))) => match u64::try_from(value) {
+                    Ok(value) if value < 0xF_FFFF => value + 1,
+                    _ => {
+                        return Err(DenseFold::Exec(ExecError::InvalidBatch(
+                            "date-part group key does not fit its 20-bit lane",
+                        )));
+                    }
+                },
+                Some(Ok(Value::Null)) => 0,
+                Some(Err(error)) => return Err(DenseFold::Exec(error)),
+                _ => {
+                    return Err(DenseFold::Exec(ExecError::InvalidBatch(
+                        "date-part group key column lost its packed units",
+                    )));
+                }
+            };
+            key_bits = (key_bits << 20) | id;
+        }
+        slots.push(slot_of(key_bits)?);
+    }
+    Ok(slots)
+}
+
+/// [`two_pass_dense_date_parts_batch`] with the packed lanes folded a column
+/// at a time into `fold`; the other lanes apply per row as before.
+#[allow(clippy::too_many_arguments)]
+fn dense_date_parts_packed_batch(
+    batch: &RecordBatch,
+    parts: [Option<(DatePart, usize)>; 2],
+    lanes: &[TwoPassLane],
+    packed: &[Option<PackedLane>],
+    aggregates: &[CompiledAggregate],
+    acc: &mut DenseGroupSlots,
+    fold: &mut PackedFold,
+    memory: &MemoryTracker,
+) -> Result<(), DenseFold> {
+    let slots = date_part_slots(batch, parts)?;
+    let mut selected = Vec::new();
+    let rows = fold_rows(batch, 0..batch.row_count(), &mut selected);
+    if let Some(inputs) = fold.resolve(batch, lanes) {
+        fold.fold(&inputs, &slots, &rows);
+    } else {
+        let readers = lane_readers(batch, lanes);
+        for (row, slot) in batch.selection().selected_rows().zip(&slots) {
+            fold.add_row(*slot as usize, &readers, row);
+        }
+    }
+    if packed.iter().any(Option::is_none) {
+        let readers = lane_readers(batch, lanes);
+        for (row, slot) in batch.selection().selected_rows().zip(&slots) {
+            let states = acc[*slot as usize]
+                .get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
+            for (index, (((state, reader), lane), aggregate)) in states
+                .iter_mut()
+                .zip(&readers)
+                .zip(lanes)
+                .zip(aggregates)
+                .enumerate()
+            {
+                if packed[index].is_none()
+                    && let Some(bits) = reader.bits(row)
+                {
+                    apply_two_pass_lane(state, lane, aggregate, bits, memory)
+                        .map_err(DenseFold::Exec)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Dense pass over one batch for a date-part key: the same part extraction
