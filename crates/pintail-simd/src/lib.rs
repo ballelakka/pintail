@@ -271,7 +271,81 @@ dispatched! {
         => portable::gather;
 }
 
+dispatched! {
+    /// Exact sum of Decimal128 payloads, `None` on overflow.
+    pub fn sum_i128<'a>(values: &'a [i128]) -> Option<i128> => portable::sum_i128;
+
+    /// Grouped exact sum: `sums[groups[i]] += values[i]` as `i128`, in row
+    /// order (see [`portable::grouped`]).
+    ///
+    /// # Panics
+    ///
+    /// When a group index is out of bounds or the slices differ in length.
+    pub fn sum_by_group_i64<'a, 'b, 'c>(values: &'a [i64], groups: &'b [u32], sums: &'c mut [i128]) -> ()
+        => portable::sum_by_group_i64;
+
+    /// Grouped Decimal128 sum (wrapping; see [`portable::sum_by_group_i128`]).
+    ///
+    /// # Panics
+    ///
+    /// When a group index is out of bounds or the slices differ in length.
+    pub fn sum_by_group_i128<'a, 'b, 'c>(values: &'a [i128], groups: &'b [u32], sums: &'c mut [i128]) -> ()
+        => portable::sum_by_group_i128;
+
+    /// Grouped float sum in strict row order per group.
+    ///
+    /// # Panics
+    ///
+    /// When a group index is out of bounds or the slices differ in length.
+    pub fn sum_by_group_f64<'a, 'b, 'c>(values: &'a [f64], groups: &'b [u32], sums: &'c mut [f64]) -> ()
+        => portable::sum_by_group_f64;
+
+    /// AVG's state in one pass: grouped exact sum and row count.
+    ///
+    /// # Panics
+    ///
+    /// When a group index is out of bounds or the slices differ in length.
+    pub fn sum_count_by_group_i64<'a, 'b, 'c, 'd>(
+        values: &'a [i64],
+        groups: &'b [u32],
+        sums: &'c mut [i128],
+        counts: &'d mut [u64],
+    ) -> () => portable::sum_count_by_group_i64;
+
+    /// Grouped row count: `counts[group] += 1`.
+    ///
+    /// # Panics
+    ///
+    /// When a group index is out of bounds.
+    pub fn count_by_group<'a, 'b>(groups: &'a [u32], counts: &'b mut [u64]) -> ()
+        => portable::count_by_group;
+
+    /// Grouped minimum (start the slice at `i64::MAX`).
+    ///
+    /// # Panics
+    ///
+    /// When a group index is out of bounds or the slices differ in length.
+    pub fn min_by_group_i64<'a, 'b, 'c>(values: &'a [i64], groups: &'b [u32], minimums: &'c mut [i64]) -> ()
+        => portable::min_by_group_i64;
+
+    /// Grouped maximum (start the slice at `i64::MIN`).
+    ///
+    /// # Panics
+    ///
+    /// When a group index is out of bounds or the slices differ in length.
+    pub fn max_by_group_i64<'a, 'b, 'c>(values: &'a [i64], groups: &'b [u32], maximums: &'c mut [i64]) -> ()
+        => portable::max_by_group_i64;
+}
+
 dispatched_avx2! {
+    /// Packs per-row flags into mask words (`bools.len().div_ceil(64)`).
+    ///
+    /// # Panics
+    ///
+    /// When `out` is too short.
+    pub fn pack_bools<'a, 'b>(bools: &'a [bool], out: &'b mut [u64])
+        => portable::pack_bools, avx2::pack_bools;
+
     /// Appends the index of every set mask bit below `len` to `out`.
     ///
     /// # Panics

@@ -262,6 +262,72 @@ fn main() {
                 ],
             );
         }
+        for (label, group_count) in [("group_sum_8", 8_u32), ("group_sum_64k", 65_536)] {
+            let groups: Vec<u32> = (0..rows)
+                .map(|_| rng.random_range(0..group_count))
+                .collect();
+            let slots = group_count as usize;
+            let (mut sums_a, mut sums_b, mut sums_c) = (
+                vec![0_i128; slots],
+                vec![0_i128; slots],
+                vec![0_i128; slots],
+            );
+            let (mut counts_a, mut counts_b, mut counts_c) =
+                (vec![0_u64; slots], vec![0_u64; slots], vec![0_u64; slots]);
+            report(
+                label,
+                size,
+                rows,
+                scratch,
+                [
+                    ("naive", &mut |_: &mut Scratch| {
+                        for (&value, &group) in black_box(&ints).iter().zip(&groups) {
+                            sums_a[group as usize] += i128::from(value);
+                            counts_a[group as usize] += 1;
+                        }
+                    }),
+                    ("portable", &mut |_: &mut Scratch| {
+                        portable::sum_count_by_group_i64(
+                            black_box(&ints),
+                            &groups,
+                            &mut sums_b,
+                            &mut counts_b,
+                        );
+                    }),
+                    ("dispatch", &mut |_: &mut Scratch| {
+                        pintail_simd::sum_count_by_group_i64(
+                            black_box(&ints),
+                            &groups,
+                            &mut sums_c,
+                            &mut counts_c,
+                        );
+                    }),
+                ],
+            );
+        }
+        let flags: Vec<bool> = ints.iter().map(|&v| v > -500_000).collect();
+        report(
+            "pack_bools",
+            size,
+            rows,
+            scratch,
+            [
+                ("naive", &mut |s: &mut Scratch| {
+                    s.words.fill(0);
+                    for (row, &flag) in black_box(&flags).iter().enumerate() {
+                        if flag {
+                            s.words[row / 64] |= 1 << (row % 64);
+                        }
+                    }
+                }),
+                ("portable", &mut |s: &mut Scratch| {
+                    portable::pack_bools(black_box(&flags), &mut s.words);
+                }),
+                ("dispatch", &mut |s: &mut Scratch| {
+                    pintail_simd::pack_bools(black_box(&flags), &mut s.words);
+                }),
+            ],
+        );
         report(
             "gather_i64",
             size,

@@ -186,3 +186,86 @@ fn gather_rejects_an_out_of_range_code() {
 fn level_is_reported() {
     assert!(!level().name().is_empty());
 }
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn grouped_aggregates_match_per_row_updates() {
+    let mut rng = StdRng::seed_from_u64(19);
+    for &len in &LENGTHS {
+        for group_count in [1_u32, 8, 64, 65, 1000] {
+            let groups: Vec<u32> = (0..len).map(|_| rng.random_range(0..group_count)).collect();
+            let values: Vec<i64> = (0..len).map(|_| rng.random()).collect();
+            let wide: Vec<i128> = values.iter().map(|&v| i128::from(v) << 40).collect();
+            let floats: Vec<f64> = values
+                .iter()
+                .map(|&v| f64::from(i32::try_from(v >> 40).unwrap()) / 7.0)
+                .collect();
+            let slots = group_count as usize;
+
+            let (mut sums, mut wide_sums, mut float_sums) =
+                (vec![0_i128; slots], vec![0_i128; slots], vec![0.0; slots]);
+            let (mut counts, mut mins, mut maxs) = (
+                vec![0_u64; slots],
+                vec![i64::MAX; slots],
+                vec![i64::MIN; slots],
+            );
+            let (mut e_sums, mut e_wide, mut e_floats) =
+                (sums.clone(), wide_sums.clone(), float_sums.clone());
+            let (mut e_counts, mut e_mins, mut e_maxs) =
+                (counts.clone(), mins.clone(), maxs.clone());
+            for (row, &group) in groups.iter().enumerate() {
+                let g = group as usize;
+                e_sums[g] += i128::from(values[row]);
+                e_wide[g] = e_wide[g].wrapping_add(wide[row]);
+                e_floats[g] += floats[row];
+                e_counts[g] += 1;
+                e_mins[g] = e_mins[g].min(values[row]);
+                e_maxs[g] = e_maxs[g].max(values[row]);
+            }
+            sum_by_group_i64(&values, &groups, &mut sums);
+            sum_by_group_i128(&wide, &groups, &mut wide_sums);
+            sum_by_group_f64(&floats, &groups, &mut float_sums);
+            count_by_group(&groups, &mut counts);
+            let (mut fused_sums, mut fused_counts) = (vec![0_i128; slots], vec![0_u64; slots]);
+            sum_count_by_group_i64(&values, &groups, &mut fused_sums, &mut fused_counts);
+            assert_eq!(fused_sums, e_sums);
+            assert_eq!(fused_counts, e_counts);
+            min_by_group_i64(&values, &groups, &mut mins);
+            max_by_group_i64(&values, &groups, &mut maxs);
+            assert_eq!(sums, e_sums);
+            assert_eq!(wide_sums, e_wide);
+            assert_eq!(float_sums, e_floats, "float sums keep row order");
+            assert_eq!(counts, e_counts);
+            assert_eq!(mins, e_mins);
+            assert_eq!(maxs, e_maxs);
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "out of bounds")]
+fn grouped_rejects_an_out_of_range_group() {
+    let groups = vec![0, 1, 2, 3];
+    let mut counts = vec![0_u64; 3];
+    count_by_group(&groups, &mut counts);
+}
+
+#[test]
+fn decimal_sum_reports_overflow() {
+    assert_eq!(sum_i128(&[1, 2, 3, 4, 5]), Some(15));
+    assert_eq!(sum_i128(&[i128::MAX, 1]), None);
+    assert_eq!(sum_i128(&[i128::MAX, 0, 0, 0, 1]), None);
+    assert_eq!(sum_i128(&[i128::MAX, -1, 0, 0, 1]), Some(i128::MAX));
+}
+
+#[test]
+fn bools_pack_into_words() {
+    let mut rng = StdRng::seed_from_u64(23);
+    for &len in &LENGTHS {
+        let bools: Vec<bool> = (0..len).map(|_| rng.random_bool(0.6)).collect();
+        assert_eq!(
+            masked(&bools, pack_bools),
+            reference_mask(&bools, |flag| flag)
+        );
+    }
+}

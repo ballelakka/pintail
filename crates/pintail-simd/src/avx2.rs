@@ -348,3 +348,26 @@ pub fn mask_to_indices(simd: V3, words: &[u64], len: usize, out: &mut Vec<u32>) 
         *window = pulp::cast(rows);
     });
 }
+
+/// [`crate::pack_bools`] on AVX2: one byte compare and one byte mask move
+/// per 32 rows.
+#[inline(always)]
+pub fn pack_bools(simd: V3, bools: &[bool], out: &mut [u64]) {
+    let zero = simd.avx._mm256_setzero_si256();
+    pack_words(
+        bools,
+        out,
+        true,
+        |rows| {
+            let mut bits = 0_u64;
+            for (half, lanes) in rows.chunks_exact(32).enumerate() {
+                let bytes: [u8; 32] = core::array::from_fn(|lane| u8::from(lanes[lane]));
+                let clear = simd.avx2._mm256_cmpeq_epi8(pulp::cast(bytes), zero);
+                let mask = simd.avx2._mm256_movemask_epi8(clear).cast_unsigned();
+                bits |= u64::from(mask) << (half * 32);
+            }
+            bits
+        },
+        |valid| !valid,
+    );
+}

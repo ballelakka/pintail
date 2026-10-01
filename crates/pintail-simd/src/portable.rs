@@ -340,3 +340,154 @@ pub(crate) fn expand_mask(
 pub fn gather<T: Copy>(source: &[T], indices: &[u32], out: &mut Vec<T>) {
     out.extend(indices.iter().map(|&index| source[index as usize]));
 }
+
+/// Applies `update(&mut accumulators[groups[i]], values[i])` for each row,
+/// in row order.
+///
+/// A grouped update is a scatter: rows of one batch hit arbitrary slots, so
+/// it does not vectorize, and splitting it across interleaved partial tables
+/// (to break the store-to-load chain on repeated groups) measured within
+/// noise. What it buys over a per-row engine loop is one typed pass per
+/// batch with no per-row dispatch, `Option` or `Result`.
+///
+/// # Panics
+///
+/// When a group index is out of bounds or the slices differ in length.
+#[inline(always)]
+pub fn grouped<V: Copy, A>(
+    values: &[V],
+    groups: &[u32],
+    accumulators: &mut [A],
+    update: impl Fn(&mut A, V),
+) {
+    assert_eq!(values.len(), groups.len(), "one group index per value");
+    for (&value, &group) in values.iter().zip(groups) {
+        update(&mut accumulators[group as usize], value);
+    }
+}
+
+/// Adds each value into `sums[groups[i]]`, exactly (`i128` accumulators,
+/// for BIGINT and scaled-decimal sums).
+///
+/// # Panics
+///
+/// When a group index is out of bounds or the slices differ in length.
+#[inline(always)]
+pub fn sum_by_group_i64(values: &[i64], groups: &[u32], sums: &mut [i128]) {
+    grouped(values, groups, sums, |sum, value| *sum += i128::from(value));
+}
+
+/// Adds each `i128` value (a Decimal128 payload) into `sums[groups[i]]`.
+/// Overflow wraps; callers bound their inputs (65 decimal digits do not fit
+/// `i128` either) or check the result's magnitude.
+///
+/// # Panics
+///
+/// When a group index is out of bounds or the slices differ in length.
+#[inline(always)]
+pub fn sum_by_group_i128(values: &[i128], groups: &[u32], sums: &mut [i128]) {
+    grouped(values, groups, sums, |sum, value| {
+        *sum = sum.wrapping_add(value);
+    });
+}
+
+/// Adds each value into `sums[groups[i]]` in row order, so each group's float sum is the strict left-to-right sum.
+///
+/// # Panics
+///
+/// When a group index is out of bounds or the slices differ in length.
+#[inline(always)]
+pub fn sum_by_group_f64(values: &[f64], groups: &[u32], sums: &mut [f64]) {
+    grouped(values, groups, sums, |sum, value| *sum += value);
+}
+
+/// Adds one to `counts[group]` for each group index.
+///
+/// # Panics
+///
+/// When a group index is out of bounds.
+#[inline(always)]
+pub fn count_by_group(groups: &[u32], counts: &mut [u64]) {
+    grouped(groups, groups, counts, |count, _| *count += 1);
+}
+
+/// Lowers `minimums[groups[i]]` to each value. Start the slice at
+/// `i64::MAX` (or the running minimum); a group with no rows keeps it.
+///
+/// # Panics
+///
+/// When a group index is out of bounds or the slices differ in length.
+#[inline(always)]
+pub fn min_by_group_i64(values: &[i64], groups: &[u32], minimums: &mut [i64]) {
+    grouped(values, groups, minimums, |min, value| {
+        *min = (*min).min(value);
+    });
+}
+
+/// Raises `maximums[groups[i]]` to each value. Start the slice at
+/// `i64::MIN` (or the running maximum); a group with no rows keeps it.
+///
+/// # Panics
+///
+/// When a group index is out of bounds or the slices differ in length.
+#[inline(always)]
+pub fn max_by_group_i64(values: &[i64], groups: &[u32], maximums: &mut [i64]) {
+    grouped(values, groups, maximums, |max, value| {
+        *max = (*max).max(value);
+    });
+}
+
+/// Exact sum of `i128` values (Decimal128 payloads), `None` on overflow.
+/// Four independent accumulators, checked per add.
+#[inline(always)]
+#[must_use]
+pub fn sum_i128(values: &[i128]) -> Option<i128> {
+    let mut lanes = [0_i128; 4];
+    let mut overflow = false;
+    let mut chunks = values.chunks_exact(4);
+    for chunk in &mut chunks {
+        for (lane, &value) in lanes.iter_mut().zip(chunk) {
+            let (sum, carried) = lane.overflowing_add(value);
+            *lane = sum;
+            overflow |= carried;
+        }
+    }
+    if overflow {
+        return None;
+    }
+    lanes
+        .iter()
+        .chain(chunks.remainder())
+        .try_fold(0_i128, |sum, &value| sum.checked_add(value))
+}
+
+/// Packs per-row flags (a decoded validity or a filter's `bool` output)
+/// into mask words, as [`pack_predicate`] lays them out.
+///
+/// # Panics
+///
+/// When `out` is shorter than `bools.len().div_ceil(64)`.
+#[inline(always)]
+pub fn pack_bools(bools: &[bool], out: &mut [u64]) {
+    pack_predicate(bools, out, |flag| flag);
+}
+
+/// AVG's state in one pass: `sums[g] += value` (exact) and `counts[g] += 1`.
+///
+/// # Panics
+///
+/// When a group index is out of bounds or the slices differ in length.
+#[inline(always)]
+pub fn sum_count_by_group_i64(
+    values: &[i64],
+    groups: &[u32],
+    sums: &mut [i128],
+    counts: &mut [u64],
+) {
+    assert_eq!(values.len(), groups.len(), "one group index per value");
+    assert_eq!(sums.len(), counts.len(), "one count per sum");
+    for (&value, &group) in values.iter().zip(groups) {
+        sums[group as usize] += i128::from(value);
+        counts[group as usize] += 1;
+    }
+}
