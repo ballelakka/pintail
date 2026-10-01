@@ -438,10 +438,14 @@ impl ScanProvider for SnapshotScanProvider<'_> {
         // materialized scan paths carry the same fold input.
         #[allow(clippy::items_after_statements)]
         const SMA_RESIDUAL_ROW_CAP: usize = 16_384;
-        let sma = (scan.predicates.is_empty() && scan.limit.is_none() && unique_keys.is_none())
+        // Every residual row is a memtable row, so a larger memtable
+        // declines before the store walks it.
+        let sma = (scan.predicates.is_empty()
+            && scan.limit.is_none()
+            && unique_keys.is_none()
+            && snapshot.memtable_len() <= SMA_RESIDUAL_ROW_CAP)
             .then(|| snapshot.sma_fold_state())
             .flatten()
-            .filter(|(_, rows)| rows.len() <= SMA_RESIDUAL_ROW_CAP)
             .map(|(smas, rows)| crate::execution::SmaFoldInput {
                 column_ids: scan.projected_column_ids.clone(),
                 segments: smas.into_iter().cloned().collect(),
@@ -460,13 +464,12 @@ impl ScanProvider for SnapshotScanProvider<'_> {
         // a memtable that supersedes segment rows, because it re-reads the
         // spans those rows fall in rather than trusting a statistic.
         let grouped = (scan.predicates.is_empty() && scan.limit.is_none() && unique_keys.is_none())
-            .then(|| snapshot.grouped_fold_spans())
-            .flatten()
             // Bounded like the SMA residual and the delta beside it: the
             // rows outside every span are cloned into the projection here,
             // and without a bound a large memtable pays that clone on every
             // scan open, including the scans that never aggregate.
-            .filter(|(_, outside)| outside.len() <= SMA_RESIDUAL_ROW_CAP)
+            .then(|| snapshot.grouped_fold_spans(SMA_RESIDUAL_ROW_CAP))
+            .flatten()
             .map(|(spans, outside)| crate::execution::GroupedFoldInput {
                 snapshot: (*snapshot).clone(),
                 directory: snapshot.directory().to_path_buf(),
@@ -492,10 +495,12 @@ impl ScanProvider for SnapshotScanProvider<'_> {
         // delta-maintained memo was dead for every scan that took it.
         #[allow(clippy::items_after_statements)]
         const DELTA_ROW_CAP: usize = 4096;
-        let delta = (scan.predicates.is_empty() && scan.limit.is_none() && unique_keys.is_none())
+        let delta = (scan.predicates.is_empty()
+            && scan.limit.is_none()
+            && unique_keys.is_none()
+            && snapshot.memtable_len() <= DELTA_ROW_CAP)
             .then(|| snapshot.insert_only_delta())
             .flatten()
-            .filter(|(_, _, rows)| rows.len() <= DELTA_ROW_CAP)
             .map(
                 |(directory, generation, rows)| crate::execution::InsertOnlyDelta {
                     directory: directory.to_path_buf(),

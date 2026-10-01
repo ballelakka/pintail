@@ -32,6 +32,10 @@ pub struct TableSnapshot {
     /// The opening this snapshot came from; see `TableStore::instance`.
     pub(super) instance: u64,
     pub(super) memtable: Arc<BTreeMap<PrimaryKey, StoredRow>>,
+    /// No memtable row is older than this; `None` when it is empty. A
+    /// bound, not always the oldest row: a replaced version can leave it
+    /// lower, which only sends a caller to the exact check.
+    pub(super) memtable_oldest: Option<u64>,
     pub(super) manifest: Arc<Manifest>,
     pub(super) directory: PathBuf,
     pub(super) schema: TableSchema,
@@ -224,6 +228,22 @@ impl TableSnapshot {
         Some((smas, rows))
     }
 
+    /// How many rows - versions and tombstones - the memtable holds. Every
+    /// row [`Self::sma_fold_state`] and [`Self::insert_only_delta`] return
+    /// is one of these, so a caller that bounds those rows can decline
+    /// before either walks the memtable.
+    #[must_use]
+    pub fn memtable_len(&self) -> usize {
+        self.memtable.len()
+    }
+
+    /// The table directory these segments live in; with a segment's file
+    /// name it identifies bytes that are never rewritten.
+    #[must_use]
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
     /// Per-segment identity and key span for a grouped fold, plus the
     /// memtable rows that fall outside every segment.
     ///
@@ -236,16 +256,13 @@ impl TableSnapshot {
     ///
     /// `None` unless the segments are key-disjoint. Overlapping segments
     /// would put the same row in two spans, and a fold over each would
-    /// count it twice.
-    /// The table directory these segments live in; with a segment's file
-    /// name it identifies bytes that are never rewritten.
+    /// count it twice. `None` too past `outside_limit` rows outside every
+    /// span: the caller clones each one, and stops walking there.
     #[must_use]
-    pub fn directory(&self) -> &std::path::Path {
-        &self.directory
-    }
-
-    #[must_use]
-    pub fn grouped_fold_spans(&self) -> Option<(Vec<GroupedFoldSpan>, Vec<&StoredRow>)> {
+    pub fn grouped_fold_spans(
+        &self,
+        outside_limit: usize,
+    ) -> Option<(Vec<GroupedFoldSpan>, Vec<&StoredRow>)> {
         let mut segments: Vec<&crate::segment::SegmentMeta> =
             self.manifest.segments.iter().collect();
         segments.sort_by(|left, right| left.min_key.cmp(&right.min_key));
@@ -263,27 +280,38 @@ impl TableSnapshot {
                 dirty: false,
             })
             .collect::<Vec<_>>();
+        // A span is dirty when the memtable holds any key inside it, which
+        // one ordered lookup per span answers; only the gaps between spans
+        // are walked, for the rows no segment covers. Walking every memtable
+        // row instead made each scan open pay for the whole memtable - for a
+        // table taking updates, every scan of it, folded or not.
+        for span in &mut spans {
+            span.dirty = self
+                .memtable
+                .range(span.min_key.clone()..=span.max_key.clone())
+                .next()
+                .is_some();
+        }
         let mut outside = Vec::new();
-        for row in self.memtable.values() {
-            // The spans are sorted by `min_key` and were just proved
-            // disjoint, so the only one that can hold this key is the last
-            // whose `min_key` is not past it. Scanning for it instead cost
-            // a walk of every span for every memtable row, and rows
-            // appended above the segment key space - the common shape
-            // during ingest - took the whole walk every time before
-            // falling out here.
-            let above = spans.partition_point(|span| &span.min_key <= row.key());
-            match above
+        for gap in 0..=spans.len() {
+            let lo = gap
                 .checked_sub(1)
-                .filter(|index| row.key() <= &spans[*index].max_key)
-            {
-                Some(index) => spans[index].dirty = true,
-                // A key no segment covers contributes on its own; a
-                // tombstone out here supersedes nothing and is dropped.
-                None => {
-                    if !row.is_deleted() {
-                        outside.push(row);
+                .map_or(std::ops::Bound::Unbounded, |before| {
+                    std::ops::Bound::Excluded(spans[before].max_key.clone())
+                });
+            let hi = spans.get(gap).map_or(std::ops::Bound::Unbounded, |after| {
+                std::ops::Bound::Excluded(after.min_key.clone())
+            });
+            if !bound_range_is_searchable(&lo, &hi) {
+                continue;
+            }
+            // A tombstone outside every span supersedes nothing.
+            for (_, row) in self.memtable.range((lo, hi)) {
+                if !row.is_deleted() {
+                    if outside.len() == outside_limit {
+                        return None;
                     }
+                    outside.push(row);
                 }
             }
         }
@@ -367,6 +395,7 @@ impl TableSnapshot {
             return Ok(Self {
                 instance: super::STORE_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 memtable: memtable.snapshot(),
+                memtable_oldest: memtable.oldest_version(),
                 manifest,
                 directory,
                 schema,
@@ -386,6 +415,7 @@ impl TableSnapshot {
         Self {
             instance: super::STORE_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             memtable: Arc::new(BTreeMap::new()),
+            memtable_oldest: None,
             manifest: Arc::new(Manifest::empty(&schema)),
             directory: directory.into(),
             schema,
@@ -624,7 +654,9 @@ impl TableSnapshot {
         // The memtable is one more reader under the same rule: it usually
         // holds only newer versions, but a replay can leave an older one
         // there, and dropping the segment that shadows it would surface it.
-        let memtable_oldest = self.memtable.values().map(StoredRow::version).min();
+        // The memtable keeps that bound as it applies rows: taking the
+        // minimum here walked every memtable row on every filtered scan.
+        let memtable_oldest = self.memtable_oldest;
         let memtable_shadowed = |meta: &crate::segment::SegmentMeta| {
             memtable_oldest.is_some_and(|oldest| oldest <= meta.max_version)
                 && self

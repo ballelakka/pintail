@@ -1665,6 +1665,7 @@ impl TableStore {
         TableSnapshot {
             instance: self.instance,
             memtable: self.memtable.snapshot(),
+            memtable_oldest: self.memtable.oldest_version(),
             manifest: Arc::clone(&self.manifest),
             directory: self.directory.clone(),
             schema: self.schema.clone(),

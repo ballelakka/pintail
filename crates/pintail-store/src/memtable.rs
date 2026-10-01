@@ -6,6 +6,10 @@ use pintail_types::{PrimaryKey, StoredRow};
 pub(crate) struct Memtable {
     rows: Arc<BTreeMap<PrimaryKey, StoredRow>>,
     estimated_bytes: usize,
+    /// The lowest version applied since the memtable was last cleared: no
+    /// row it holds is older. Replacing a row can leave this below the
+    /// oldest one still held, never above it.
+    oldest_version: Option<u64>,
 }
 
 impl Memtable {
@@ -24,6 +28,10 @@ impl Memtable {
                 .saturating_sub(previous.estimated_bytes());
         }
         self.estimated_bytes = self.estimated_bytes.saturating_add(row.estimated_bytes());
+        self.oldest_version = Some(
+            self.oldest_version
+                .map_or(row.version(), |oldest| oldest.min(row.version())),
+        );
         true
     }
 
@@ -35,8 +43,13 @@ impl Memtable {
         self.estimated_bytes
     }
 
+    pub(crate) fn oldest_version(&self) -> Option<u64> {
+        self.oldest_version
+    }
+
     pub(crate) fn clear(&mut self) {
         self.rows = Arc::new(BTreeMap::new());
         self.estimated_bytes = 0;
+        self.oldest_version = None;
     }
 }
