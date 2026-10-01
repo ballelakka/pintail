@@ -4702,6 +4702,44 @@ fn read_file_block_int_into(
     )
 }
 
+/// Set bits of a block's null bitmap among its first `row_count` rows.
+///
+/// Eight bytes at a time: the build targets baseline x86-64, which has no
+/// population-count instruction, so each count is a dozen arithmetic steps
+/// whether it covers one byte or eight. Counted a byte at a time, this
+/// check cost about a twentieth of a filtered scan's CPU. Bits past
+/// `row_count` in the trailing byte are masked off, so a corrupt file
+/// cannot hide a set bit there that the per-row walk would refuse.
+fn covered_null_count(null_bitmap: &[u8], row_count: usize) -> usize {
+    let whole = (row_count / 8).min(null_bitmap.len());
+    let (full, rest) = null_bitmap.split_at(whole);
+    let mut count = 0_usize;
+    let mut words = full.chunks_exact(8);
+    for word in &mut words {
+        let word = u64::from_le_bytes([
+            word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
+        ]);
+        count += word.count_ones() as usize;
+    }
+    count += words
+        .remainder()
+        .iter()
+        .map(|bits| bits.count_ones() as usize)
+        .sum::<usize>();
+    let covered = row_count - whole * 8;
+    if covered > 0
+        && let Some(bits) = rest.first()
+    {
+        let mask = if covered >= 8 {
+            u8::MAX
+        } else {
+            (1_u8 << covered) - 1
+        };
+        count += (bits & mask).count_ones() as usize;
+    }
+    count
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn read_block_if_with_budget<F>(
     path: &Path,
@@ -4803,19 +4841,7 @@ where
     // decoding it guards. The trailing byte is masked to the bits the row
     // count actually covers: without that, a corrupt file could hide a set
     // bit past the end that the per-row walk would have refused to count.
-    let actual_nulls: usize = null_bitmap
-        .iter()
-        .enumerate()
-        .map(|(byte, bits)| {
-            let covered = row_count.saturating_sub(byte * 8).min(8);
-            let mask = if covered >= 8 {
-                u8::MAX
-            } else {
-                (1_u8 << covered) - 1
-            };
-            (bits & mask).count_ones() as usize
-        })
-        .sum();
+    let actual_nulls = covered_null_count(null_bitmap, row_count);
     if actual_nulls != declared_nulls {
         return Err(corrupt(path, block_offset, "null count mismatch"));
     }
@@ -7019,5 +7045,29 @@ mod bit_packed_selection_tests {
         check(LogicalType::UInt64, true, wide);
         let near_top = |row: usize| Cell::UInt64(u64::MAX - (row as u64 % 3_000));
         check(LogicalType::UInt64, false, near_top);
+    }
+}
+
+#[cfg(test)]
+mod null_count_tests {
+    use super::covered_null_count;
+
+    #[test]
+    fn counts_only_the_covered_rows_eight_bytes_at_a_time() {
+        for bytes in [0_usize, 1, 7, 8, 9, 17, 64] {
+            let bitmap: Vec<u8> = (0..bytes)
+                .map(|index| u8::try_from((index * 151 + 7) % 256).expect("byte"))
+                .collect();
+            for row_count in 0..=bytes * 8 {
+                let expected: usize = (0..row_count)
+                    .filter(|row| bitmap[row / 8] >> (row % 8) & 1 == 1)
+                    .count();
+                assert_eq!(
+                    covered_null_count(&bitmap, row_count),
+                    expected,
+                    "bytes {bytes} rows {row_count}"
+                );
+            }
+        }
     }
 }
