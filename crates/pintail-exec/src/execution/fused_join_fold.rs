@@ -48,31 +48,38 @@ pub(super) struct UniqueKeyGroups {
 }
 
 impl UniqueKeyGroups {
-    /// `None` unless the build finalized to a dense table and every bucket
-    /// holds one row: a key with several rows folds each of them, which is
-    /// the row fold's job.
+    /// Why not, unless the build finalized to a dense table and every
+    /// bucket holds one row: a key with several rows folds each of them,
+    /// which is the row fold's job.
     pub(super) fn resolve(
         build: &PartitionedBuild,
         dense_group_indexes: &[Option<&[usize]>],
         group_count: usize,
-    ) -> Option<Self> {
-        let (minimum, slots) = build.dense_layout()?;
+    ) -> Result<Self, &'static str> {
+        const TOO_MANY_GROUPS: &str = "more groups than the key table addresses";
+        let (minimum, slots) = build
+            .dense_layout()
+            .ok_or("a build key that is not a dense integer range")?;
         let miss = u32::try_from(group_count)
             .ok()
-            .filter(|miss| *miss < u32::MAX - 1)?;
+            .filter(|miss| *miss < u32::MAX - 1)
+            .ok_or(TOO_MANY_GROUPS)?;
         let mut groups = Vec::with_capacity(slots.len());
         for slot in slots {
             let group = match slot.checked_sub(1) {
                 None => miss,
                 Some(bucket) => match dense_group_indexes.get(bucket as usize).copied().flatten() {
                     None | Some([]) => miss,
-                    Some([group]) => u32::try_from(*group).ok().filter(|g| *g < miss)?,
-                    Some(_) => return None,
+                    Some([group]) => u32::try_from(*group)
+                        .ok()
+                        .filter(|g| *g < miss)
+                        .ok_or(TOO_MANY_GROUPS)?,
+                    Some(_) => return Err("a build key with several rows"),
                 },
             };
             groups.push(group);
         }
-        Some(Self {
+        Ok(Self {
             minimum,
             groups,
             miss,

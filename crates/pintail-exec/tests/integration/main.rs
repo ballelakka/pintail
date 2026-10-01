@@ -102,6 +102,7 @@ mod side_index;
 mod side_index_text;
 mod sort_determinism;
 mod spatial_parity;
+mod star_join_fold;
 mod statement_warnings;
 mod subquery_scaling;
 mod temporal_predicate_rewrite;

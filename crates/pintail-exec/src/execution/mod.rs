@@ -5352,10 +5352,29 @@ fn unprofiled_ref(operator: &PullOperator) -> &PullOperator {
 }
 
 /// Records on an operator's profile that something other than its own
-/// pulls decided its fate; a no-op when the execution is not profiled.
-fn annotate_profile(operator: &PullOperator, note: &str) {
-    if let PullOperator::Profiled { slot, sink, .. } = operator {
-        sink.annotate(*slot, note);
+/// pulls decided its fate. The slot is kept, so a decision taken after the
+/// operator has been unwrapped still lands on its line; a no-op when the
+/// execution is not profiled.
+struct ProfileNote(Option<(usize, std::sync::Arc<ProfileSink>)>);
+
+impl ProfileNote {
+    fn of(operator: &PullOperator) -> Self {
+        match operator {
+            PullOperator::Profiled { slot, sink, .. } => {
+                Self(Some((*slot, std::sync::Arc::clone(sink))))
+            }
+            _ => Self(None),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    fn set(&self, note: &str) {
+        if let Some((slot, sink)) = &self.0 {
+            sink.annotate(*slot, note);
+        }
     }
 }
 

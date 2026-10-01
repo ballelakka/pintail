@@ -4773,10 +4773,10 @@ fn build_fused_inner_join_aggregate(
     collation: Collation,
     group_collation: Collation,
 ) -> Result<Option<MaterializedRows>, ExecError> {
-    super::annotate_profile(
-        input,
-        "fused into the aggregate above; its inputs ran directly",
-    );
+    // The join's profile line says whether it fused and, if it did, which
+    // fold ran: a star join that misses the column fold looks the same as
+    // one that took it, except for its wall clock.
+    let note = super::ProfileNote::of(input);
     let input = super::unprofiled(input);
     let PullOperator::HashJoin {
         left,
@@ -4803,33 +4803,42 @@ fn build_fused_inner_join_aggregate(
     // pairs, so it cannot apply a residual ON predicate. Declining here sends
     // the join to the general operator, which can - silently ignoring it
     // would return rows the ON clause excludes.
-    if residual.is_some() {
-        return Ok(None);
-    }
     let left_width = column_types.len().saturating_sub(*right_width);
     // The fused spine probes on the primary key alone; composite-key joins
     // stay on the general operator.
-    if !extra_keys.is_empty()
-        || !matches!(kind, BoundJoinKind::Inner | BoundJoinKind::Left)
-        || state.is_some()
-        || *right_width > column_types.len()
-        || group_columns
-            .iter()
-            .any(|column| *column < left_width || *column >= column_types.len())
-        || aggregates.iter().any(|aggregate| {
-            aggregate.distinct
-                || matches!(
-                    aggregate.function,
-                    AggregateFunction::GroupConcat | AggregateFunction::JsonArrayAgg
-                )
-        })
-        || aggregates.iter().any(|aggregate| {
-            aggregate
-                .expr
-                .as_ref()
-                .is_some_and(|expression| expression.column_index().is_none())
-        })
+    let declined = if residual.is_some() {
+        Some("a residual ON predicate")
+    } else if !extra_keys.is_empty() {
+        Some("a composite join key")
+    } else if !matches!(kind, BoundJoinKind::Inner | BoundJoinKind::Left) {
+        Some("a join kind other than inner or left")
+    } else if state.is_some() || *right_width > column_types.len() {
+        Some("the join had already started")
+    } else if group_columns
+        .iter()
+        .any(|column| *column < left_width || *column >= column_types.len())
     {
+        Some("a group column from the probe side")
+    } else if aggregates.iter().any(|aggregate| {
+        aggregate.distinct
+            || matches!(
+                aggregate.function,
+                AggregateFunction::GroupConcat | AggregateFunction::JsonArrayAgg
+            )
+    }) {
+        Some("a DISTINCT or concatenating aggregate")
+    } else if aggregates.iter().any(|aggregate| {
+        aggregate
+            .expr
+            .as_ref()
+            .is_some_and(|expression| expression.column_index().is_none())
+    }) {
+        Some("an aggregate over an expression")
+    } else {
+        None
+    };
+    if let Some(reason) = declined {
+        note.set(&format!("not fused into the aggregate: {reason}"));
         return Ok(None);
     }
 
@@ -4867,6 +4876,7 @@ fn build_fused_inner_join_aggregate(
     // guarded anyway because the failure mode is a wrong answer, not a crash,
     // and the guard costs one branch per query.
     if join.spilled() {
+        note.set("not fused into the aggregate: the build side spilled");
         *state = Some(Box::new(join));
         return Ok(None);
     }
@@ -4889,10 +4899,19 @@ fn build_fused_inner_join_aggregate(
     };
     // A unique dense key with lane-shaped aggregates folds a column at a
     // time; anything else keeps the row fold below.
-    let unique_keys = plan_lanes(aggregates, left_width).and_then(|lanes| {
-        let keys = UniqueKeyGroups::resolve(&join.build, &dense_group_indexes, plan.values.len())?;
-        Some((keys, lanes))
-    });
+    let unique_keys = plan_lanes(aggregates, left_width)
+        .ok_or("an aggregate without a column lane")
+        .and_then(|lanes| {
+            let keys =
+                UniqueKeyGroups::resolve(&join.build, &dense_group_indexes, plan.values.len())?;
+            Ok((keys, lanes))
+        });
+    let row_fold_reason = unique_keys.as_ref().err().copied();
+    let unique_keys = unique_keys.ok();
+    // Morsels the column fold took; any other went to the row fold because
+    // one of its batch columns was not in a representation a lane reads.
+    let lane_morsels = std::sync::atomic::AtomicUsize::new(0);
+    let all_morsels = std::sync::atomic::AtomicUsize::new(0);
     let unique_reserved = unique_keys.as_ref().map_or(0, |(keys, _)| keys.bytes());
     memory.reserve(unique_reserved)?;
     let mut groups = HashMap::<Vec<Value>, AggregateGroup>::new();
@@ -4986,6 +5005,13 @@ fn build_fused_inner_join_aggregate(
                     &plan,
                     memory,
                 )
+                .map(|(groups, folded)| {
+                    all_morsels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if folded {
+                        lane_morsels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    groups
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         for partial in partials {
@@ -5037,6 +5063,21 @@ fn build_fused_inner_join_aggregate(
             probe_clock.elapsed().as_micros(),
             pull_us
         );
+    }
+    if note.is_active() {
+        let fold = row_fold_reason.map_or_else(
+            || {
+                format!(
+                    "column fold on {} of {} morsels",
+                    lane_morsels.into_inner(),
+                    all_morsels.into_inner()
+                )
+            },
+            |reason| format!("row fold: {reason}"),
+        );
+        note.set(&format!(
+            "fused into the aggregate above; its inputs ran directly; {fold}"
+        ));
     }
     drop(join);
     memory.release(build_reserved.saturating_add(unique_reserved));
@@ -5105,7 +5146,7 @@ fn build_local_fused_join_groups(
     unique_keys: Option<&(UniqueKeyGroups, Vec<Lane>)>,
     plan: &JoinGroupPlan,
     parent_memory: &MemoryTracker,
-) -> Result<HashMap<Vec<Value>, AggregateGroup>, ExecError> {
+) -> Result<(HashMap<Vec<Value>, AggregateGroup>, bool), ExecError> {
     // Groups are fixed by the build side: start with the resolved set and
     // index into it, so the probe loop never hashes or compares group
     // values (the Q8 profile's dominant cost).
@@ -5144,7 +5185,7 @@ fn build_local_fused_join_groups(
                 crate::batch::TypedValues::Int64(_) | crate::batch::TypedValues::UInt64(_)
             )
         });
-    let folded = match unique_keys {
+    let lane_folded = match unique_keys {
         Some((keys, lanes)) => fold_morsel(
             morsel,
             left_key,
@@ -5157,7 +5198,7 @@ fn build_local_fused_join_groups(
         )?,
         None => false,
     };
-    let rows = (!folded).then(|| morsel.selected_rows());
+    let rows = (!lane_folded).then(|| morsel.selected_rows());
     for (offset, row) in rows.into_iter().flatten().enumerate() {
         if offset % 1024 == 0 {
             memory.check_interruption()?;
@@ -5272,7 +5313,7 @@ fn build_local_fused_join_groups(
             }
         }
     }
-    Ok(folded)
+    Ok((folded, lane_folded))
 }
 
 /// Dictionary-code aggregation for low-cardinality string group keys
