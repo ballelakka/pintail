@@ -95,7 +95,14 @@ macro_rules! lane_extreme {
     };
 }
 
-lane_extreme!(min_i64, i64, i64::MAX, <, "Smallest value, or `None` for an empty slice.");
+lane_extreme!(
+    min_i64,
+    i64,
+    i64::MAX,
+    <,
+    "Smallest value, or `None` for an empty slice. The lane form is for the \
+     SSE2 baseline, which has no 64-bit compare; the AVX2 copy is a plain fold."
+);
 lane_extreme!(max_i64, i64, i64::MIN, >, "Largest value, or `None` for an empty slice.");
 lane_extreme!(
     min_f64,

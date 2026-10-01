@@ -371,3 +371,17 @@ pub fn pack_bools(simd: V3, bools: &[bool], out: &mut [u64]) {
         |valid| !valid,
     );
 }
+
+/// [`crate::min_i64`] on AVX2. The plain fold: LLVM lowers it to a
+/// compare-and-blend tree that beat the portable lane-array form (0.058 vs
+/// 0.093 ns/row in cache).
+#[inline(always)]
+pub fn min_i64(_simd: V3, values: &[i64]) -> Option<i64> {
+    values.iter().copied().min()
+}
+
+/// [`crate::max_i64`] on AVX2 (see [`min_i64`]).
+#[inline(always)]
+pub fn max_i64(_simd: V3, values: &[i64]) -> Option<i64> {
+    values.iter().copied().max()
+}

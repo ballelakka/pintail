@@ -204,28 +204,47 @@ macro_rules! dispatched_avx2 {
     )+};
 }
 
-/// Exact sum as `i128`; never overflows. See [`portable::sum_i64`].
-#[must_use]
-pub fn sum_i64(values: &[i64]) -> i128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(simd) = avx2() {
-        struct Fast<'a> {
-            simd: pulp::x86::V3,
-            values: &'a [i64],
-        }
+// Value-returning kernels with an AVX2 body of their own.
+macro_rules! dispatched_avx2_value {
+    ($(
+        $(#[$meta:meta])*
+        pub fn $name:ident(values: &[$ty:ty]) -> $ret:ty => $kernel:path, $fast:path;
+    )+) => {$(
+        $(#[$meta])*
+        #[must_use]
+        pub fn $name(values: &[$ty]) -> $ret {
+            #[cfg(target_arch = "x86_64")]
+            if let Some(simd) = avx2() {
+                struct Fast<'a> {
+                    simd: pulp::x86::V3,
+                    values: &'a [$ty],
+                }
 
-        impl pulp::WithSimd for Fast<'_> {
-            type Output = i128;
+                impl pulp::WithSimd for Fast<'_> {
+                    type Output = $ret;
 
-            #[inline(always)]
-            fn with_simd<S: pulp::Simd>(self, _simd: S) -> i128 {
-                avx2::sum_i64(self.simd, self.values)
+                    #[inline(always)]
+                    fn with_simd<S: pulp::Simd>(self, _simd: S) -> $ret {
+                        $fast(self.simd, self.values)
+                    }
+                }
+
+                return pulp::Simd::vectorize(simd, Fast { simd, values });
             }
+            $kernel(values)
         }
+    )+};
+}
 
-        return pulp::Simd::vectorize(simd, Fast { simd, values });
-    }
-    portable::sum_i64(values)
+dispatched_avx2_value! {
+    /// Exact sum as `i128`; never overflows. See [`portable::sum_i64`].
+    pub fn sum_i64(values: &[i64]) -> i128 => portable::sum_i64, avx2::sum_i64;
+
+    /// Smallest value, `None` when empty.
+    pub fn min_i64(values: &[i64]) -> Option<i64> => portable::min_i64, avx2::min_i64;
+
+    /// Largest value, `None` when empty.
+    pub fn max_i64(values: &[i64]) -> Option<i64> => portable::max_i64, avx2::max_i64;
 }
 
 /// Comparison applied between each value and a constant.
@@ -248,12 +267,6 @@ pub enum CmpOp {
 dispatched! {
     /// Reassociated float sum; see [`portable::sum_f64`] for the order.
     pub fn sum_f64<'a>(values: &'a [f64]) -> f64 => portable::sum_f64;
-
-    /// Smallest value, `None` when empty.
-    pub fn min_i64<'a>(values: &'a [i64]) -> Option<i64> => portable::min_i64;
-
-    /// Largest value, `None` when empty.
-    pub fn max_i64<'a>(values: &'a [i64]) -> Option<i64> => portable::max_i64;
 
     /// Smallest value of NaN-free input, `None` when empty.
     pub fn min_f64<'a>(values: &'a [f64]) -> Option<f64> => portable::min_f64;
