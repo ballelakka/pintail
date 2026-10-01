@@ -161,12 +161,29 @@ enum PackedBound {
 /// shape the single-comparison kernel answers some other way.
 fn packed_bound(typed: &TypedValues, logical: DataType, literal: &Value) -> Option<PackedBound> {
     match (typed, literal) {
-        (TypedValues::Int64(_), Value::Int64(value)) => Some(PackedBound::Signed(*value)),
+        (TypedValues::Int64(_), _) => signed_bound(SignedUnits::Integer, logical, literal),
+        (TypedValues::Temporal { .. }, _) => signed_bound(SignedUnits::Temporal, logical, literal),
         (TypedValues::UInt64(_), Value::UInt64(value)) => Some(PackedBound::Unsigned(*value)),
         (TypedValues::UInt64(_), Value::Int64(value)) => {
             u64::try_from(*value).ok().map(PackedBound::Unsigned)
         }
-        (TypedValues::Temporal { .. }, Value::Utf8(text)) => match logical {
+        _ => None,
+    }
+}
+
+/// What a run of packed signed values holds: plain integers, or temporal
+/// units (days of a `Date32`, microseconds of a `DateTime64`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignedUnits {
+    Integer,
+    Temporal,
+}
+
+/// [`packed_bound`] for a signed column, by what its values hold.
+fn signed_bound(units: SignedUnits, logical: DataType, literal: &Value) -> Option<PackedBound> {
+    match (units, literal) {
+        (SignedUnits::Integer, Value::Int64(value)) => Some(PackedBound::Signed(*value)),
+        (SignedUnits::Temporal, Value::Utf8(text)) => match logical {
             DataType::Date32 => crate::batch::parse_date_days(text).map(PackedBound::Signed),
             DataType::DateTime64 { fsp } => {
                 let expected_len = if fsp == 0 { 19 } else { 20 + usize::from(fsp) };
@@ -179,6 +196,89 @@ fn packed_bound(typed: &TypedValues, logical: DataType, literal: &Value) -> Opti
         },
         _ => None,
     }
+}
+
+/// The rows of NOT NULL signed values inside `[low, high]` adjusted by the
+/// bounds' strictness, through the vector range kernel.
+fn signed_range_rows(
+    values: &[i64],
+    validity: &ValidityMask,
+    (low, lower_strict): (i64, bool),
+    (high, upper_strict): (i64, bool),
+) -> SelectionMask {
+    let rows = validity.len();
+    let low = if lower_strict {
+        low.checked_add(1)
+    } else {
+        Some(low)
+    };
+    let high = if upper_strict {
+        high.checked_sub(1)
+    } else {
+        Some(high)
+    };
+    let (Some(low), Some(high)) = (low, high) else {
+        return SelectionMask::none(rows);
+    };
+    if low > high {
+        return SelectionMask::none(rows);
+    }
+    select_with(values, validity, |values, out| {
+        pintail_simd::between_i64(values, low, high, out);
+    })
+}
+
+/// A two-sided range over one column - `column > a AND column < b` in any
+/// mix of strictness, or `column BETWEEN a AND b` - answered over that
+/// column's packed signed values without building a batch for them.
+///
+/// `column_values` hands back a column's values, what they hold and its
+/// logical type, or `None` when it has no such form; every value must be
+/// valid. The answer is the one [`conjunction_range_mask`] or
+/// [`between_range_mask`] gives over a batch of the same values, and `None`
+/// wherever they would decline.
+pub(crate) fn signed_slice_range_mask<'a>(
+    expr: &CompiledExpr,
+    column_values: impl Fn(usize) -> Option<(&'a [i64], SignedUnits, DataType)>,
+) -> Option<SelectionMask> {
+    let (column, lower, upper) = match expr {
+        CompiledExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => range_sides(left, right)?,
+        CompiledExpr::Scalar {
+            function: pintail_sql::ScalarFunction::Between { negated: false },
+            args,
+            ..
+        } if args.len() == 3 => match (&args[0], &args[1], &args[2]) {
+            (
+                CompiledExpr::Column(column),
+                CompiledExpr::Literal(lower),
+                CompiledExpr::Literal(upper),
+            ) => (
+                *column,
+                (BinaryOp::GreaterOrEqual, lower),
+                (BinaryOp::LessOrEqual, upper),
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (values, units, logical) = column_values(column)?;
+    let PackedBound::Signed(low) = signed_bound(units, logical, lower.1)? else {
+        return None;
+    };
+    let PackedBound::Signed(high) = signed_bound(units, logical, upper.1)? else {
+        return None;
+    };
+    Some(signed_range_rows(
+        values,
+        &ValidityMask::all_valid(values.len()),
+        (low, lower.0 == BinaryOp::Greater),
+        (high, upper.0 == BinaryOp::Less),
+    ))
 }
 
 /// The rows of a packed column inside a two-sided range, in one pass.
@@ -204,27 +304,12 @@ fn packed_range_mask(
             TypedValues::Int64(values) | TypedValues::Temporal { units: values, .. },
             PackedBound::Signed(low),
             PackedBound::Signed(high),
-        ) => {
-            let low = if lower_strict {
-                low.checked_add(1)
-            } else {
-                Some(low)
-            };
-            let high = if upper_strict {
-                high.checked_sub(1)
-            } else {
-                Some(high)
-            };
-            let (Some(low), Some(high)) = (low, high) else {
-                return Some(SelectionMask::none(rows));
-            };
-            if low > high {
-                return Some(SelectionMask::none(rows));
-            }
-            Some(select_with(values, validity, |values, out| {
-                pintail_simd::between_i64(values, low, high, out);
-            }))
-        }
+        ) => Some(signed_range_rows(
+            values,
+            validity,
+            (low, lower_strict),
+            (high, upper_strict),
+        )),
         (TypedValues::UInt64(values), PackedBound::Unsigned(low), PackedBound::Unsigned(high)) => {
             let low = if lower_strict {
                 low.checked_add(1)

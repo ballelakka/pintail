@@ -1222,6 +1222,44 @@ impl SelectionMask {
         count + (self.words[last_word] & tail_mask).count_ones() as usize
     }
 
+    /// The selected rows as ascending, disjoint, maximal runs.
+    ///
+    /// A word at a time: an empty word costs one test, a full one extends
+    /// the run, and a mixed one yields its runs by counting zeros and ones.
+    #[must_use]
+    pub(crate) fn selected_runs(&self) -> Vec<std::ops::Range<usize>> {
+        let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut push = |start: usize, end: usize| match runs.last_mut() {
+            Some(last) if last.end == start => last.end = end,
+            _ => runs.push(start..end),
+        };
+        for (index, &word) in self.words.iter().enumerate() {
+            let base = index * 64;
+            if word == u64::MAX {
+                push(base, base + 64);
+                continue;
+            }
+            let mut bits = word;
+            while bits != 0 {
+                let start = bits.trailing_zeros() as usize;
+                let length = (bits >> start).trailing_ones() as usize;
+                push(base + start, base + start + length);
+                bits = if start + length >= 64 {
+                    0
+                } else {
+                    bits & (u64::MAX << (start + length))
+                };
+            }
+        }
+        if let Some(last) = runs.last_mut() {
+            last.end = last.end.min(self.len);
+            if last.start >= last.end {
+                runs.pop();
+            }
+        }
+        runs
+    }
+
     fn clear_unused_tail_bits(&mut self) {
         let used_tail_bits = self.len % 64;
         if used_tail_bits == 0 {
@@ -1884,6 +1922,35 @@ mod selection_tests {
             .map(|piece| mask.count_in(piece * 400..(piece + 1) * 400))
             .sum();
         assert_eq!(counted, selected.len());
+    }
+
+    #[test]
+    fn selected_runs_match_a_row_walk() {
+        let run_walk = |mask: &SelectionMask| {
+            let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+            for row in mask.selected_rows() {
+                match runs.last_mut() {
+                    Some(last) if last.end == row => last.end = row + 1,
+                    _ => runs.push(row..row + 1),
+                }
+            }
+            runs
+        };
+        for len in [0, 1, 63, 64, 65, 128, 300, 5_000] {
+            let patterns: [&dyn Fn(usize) -> bool; 6] = [
+                &|_| true,
+                &|_| false,
+                &|row| row % 7 == 0,
+                &|row| row % 1_825 < 365,
+                &|row| (60..70).contains(&(row % 128)),
+                &|row| row % 64 == 63 || row % 64 == 0,
+            ];
+            for keep in patterns {
+                let selected: Vec<usize> = (0..len).filter(|row| keep(*row)).collect();
+                let mask = mask_of(len, &selected);
+                assert_eq!(mask.selected_runs(), run_walk(&mask), "len {len}");
+            }
+        }
     }
 }
 

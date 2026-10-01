@@ -1,5 +1,5 @@
 mod selection;
-pub(crate) use selection::pair_column_ranges;
+pub(crate) use selection::{SignedUnits, pair_column_ranges, signed_slice_range_mask};
 mod spatial;
 mod sql_regex;
 mod str_to_date;

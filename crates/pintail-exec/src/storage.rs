@@ -2586,6 +2586,60 @@ fn membership_mask(
 /// The rows the scan's own filter-first predicates keep in one chunk, and
 /// whether they could be answered from the decoded columns at all. A spec
 /// with no predicates of its own answers with no mask.
+/// Every predicate of `spec` answered as a range over its column's packed
+/// signed values, read where they lie; `None` when any predicate is another
+/// shape or its column has another form or holds a NULL.
+///
+/// The general path clones each predicate column into a batch to test it,
+/// so a range filter on a date column copied the whole column of every
+/// chunk once more before comparing it.
+fn borrowed_range_masks(
+    spec: &PrewhereSpec,
+    columns: &[DecodedColumn],
+    row_count: usize,
+) -> Option<crate::batch::SelectionMask> {
+    use crate::expression::SignedUnits;
+    use pintail_types::DataType;
+    if spec.predicates.is_empty() {
+        return None;
+    }
+    let column_values = |index: usize| -> Option<(&[i64], SignedUnits, DataType)> {
+        let data_type = *spec.data_types.get(index)?;
+        let (values, units) = match columns.get(index)? {
+            DecodedColumn::NativeUnits {
+                units: pintail_store::NativeUnits::Date,
+                values,
+                validity,
+            } if data_type == DataType::Date32 && validity.all_valid() => {
+                (values, SignedUnits::Temporal)
+            }
+            DecodedColumn::NativeUnits {
+                units: pintail_store::NativeUnits::DateTime { .. },
+                values,
+                validity,
+            } if matches!(data_type, DataType::DateTime64 { .. }) && validity.all_valid() => {
+                (values, SignedUnits::Temporal)
+            }
+            DecodedColumn::Int64 { values, validity }
+                if data_type.storage_type() == DataType::Int64 && validity.all_valid() =>
+            {
+                (values, SignedUnits::Integer)
+            }
+            _ => return None,
+        };
+        (values.len() == row_count).then_some((values.as_slice(), units, data_type))
+    };
+    let mut combined: Option<crate::batch::SelectionMask> = None;
+    for predicate in &spec.predicates {
+        let mask = crate::expression::signed_slice_range_mask(predicate, column_values)?;
+        match &mut combined {
+            None => combined = Some(mask),
+            Some(existing) => existing.intersect(&mask).ok()?,
+        }
+    }
+    combined
+}
+
 fn predicate_mask(
     spec: &PrewhereSpec,
     columns: &[DecodedColumn],
@@ -2610,6 +2664,8 @@ fn predicate_mask(
                     .map_err(|error| error.to_string())?,
             }
         }
+    } else if let Some(mask) = borrowed_range_masks(spec, columns, row_count) {
+        combined = Some(mask);
     } else if !spec.predicates.is_empty() {
         let vectors = spec
             .data_types
@@ -2711,18 +2767,15 @@ fn prewhere_ranges(
     let Some(mask) = combined else {
         return Ok(None);
     };
-    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut row = 0;
-    while row < row_count {
-        if !mask.is_selected(row) {
-            row += 1;
-            continue;
+    // The mask's runs a word at a time: a per-row bit test over every row
+    // of a chunk cost as much as the comparison that built the mask.
+    let mut ranges = mask.selected_runs();
+    ranges.retain(|range| range.start < row_count);
+    if let Some(last) = ranges.last_mut() {
+        last.end = last.end.min(row_count);
+        if last.start >= last.end {
+            ranges.pop();
         }
-        let start = row;
-        while row < row_count && mask.is_selected(row) {
-            row += 1;
-        }
-        ranges.push(start..row);
     }
     if ranges.is_empty() {
         return Ok(Some(pintail_store::PrewhereRanges {
