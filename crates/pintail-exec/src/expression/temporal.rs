@@ -652,6 +652,7 @@ const fn ordinal_suffix(day: u32) -> &'static str {
 ///
 /// Unknown directives copy the bare character, which is `MySQL`'s documented
 /// behaviour — `%q` is `q`, not an error.
+#[cfg(test)]
 pub(super) fn mysql_date_format(value: NaiveDateTime, format: &str) -> String {
     mysql_date_format_locale(value, format, crate::calendar_locale::locale(0))
 }

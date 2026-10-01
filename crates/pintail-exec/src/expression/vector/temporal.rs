@@ -147,9 +147,19 @@ pub(super) fn date_format_column(
     data_type: Option<DataType>,
     effects: &mut Effects,
 ) -> Option<ColumnVector> {
-    let [argument, format] = args else {
-        return None;
+    // The planner appends the session's calendar locale, which names the
+    // days and months; a time argument takes a statement date as well,
+    // and that is row evaluation's.
+    let (argument, format, locale) = match args {
+        [argument, format] => (argument, format, 0),
+        [
+            argument,
+            format,
+            CompiledExpr::Literal(Value::UInt64(locale)),
+        ] => (argument, format, usize::try_from(*locale).unwrap_or(0)),
+        _ => return None,
     };
+    let locale = crate::calendar_locale::locale(locale);
     if data_type.is_some_and(|declared| declared != DataType::Utf8) {
         return None;
     }
@@ -161,16 +171,112 @@ pub(super) fn date_format_column(
         return None;
     };
     let units = temporal_column(column)?;
+    if let Some(step) = format_step(format, units.fsp) {
+        return coded_date_format(batch, &units, format, locale, step);
+    }
     let mut text = crate::array::StrColumn::default();
     for row in 0..batch.row_count() {
         if !units.validity.is_valid(row) {
             text.push(b"");
             continue;
         }
-        let formatted =
-            crate::expression::temporal::mysql_date_format(units.datetime(row)?, format);
+        let formatted = crate::expression::temporal::mysql_date_format_locale(
+            units.datetime(row)?,
+            format,
+            locale,
+        );
         text.push(formatted.as_bytes());
     }
+    Some(ColumnVector::from_typed(
+        DataType::Utf8,
+        TypedValues::Utf8(text),
+        units.validity.clone(),
+    ))
+}
+
+/// The units a constant `DATE_FORMAT` pattern cannot see within: a day
+/// when it names only calendar fields, an hour when it adds hour fields,
+/// `None` when it reads minutes or finer. Unknown directives print their
+/// own character, so they read nothing; every other directive is listed
+/// here by what it reads, and anything unlisted keeps the per-row format.
+fn format_step(format: &str, fsp: Option<u8>) -> Option<i64> {
+    let mut hourly = false;
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            continue;
+        }
+        match characters.next() {
+            None => break,
+            Some(
+                'a' | 'b' | 'c' | 'D' | 'd' | 'e' | 'j' | 'M' | 'm' | 'U' | 'u' | 'V' | 'v' | 'W'
+                | 'w' | 'X' | 'x' | 'Y' | 'y' | '%',
+            ) => {}
+            Some('H' | 'h' | 'I' | 'k' | 'l' | 'p') => hourly = true,
+            Some(other) if other.is_ascii_alphabetic() => return None,
+            Some(_) => {}
+        }
+    }
+    Some(match (fsp, hourly) {
+        // A date's units are days, and its hour is always midnight.
+        (None, _) => 1,
+        (Some(_), false) => MICROS_PER_DAY,
+        (Some(_), true) => 3_600_000_000,
+    })
+}
+
+/// `DATE_FORMAT` of a pattern blind within `step` units: formatted once per
+/// distinct step, the column coded by it. A recent window of events holds
+/// a few dozen days, so a million rows format a few dozen strings, and
+/// what groups or compares the answer next reads its codes.
+fn coded_date_format(
+    batch: &RecordBatch,
+    units: &Temporal<'_>,
+    format: &str,
+    locale: &crate::calendar_locale::CalendarLocale,
+    step: i64,
+) -> Option<ColumnVector> {
+    let rows = batch.row_count();
+    let mut codes = Vec::with_capacity(rows);
+    let mut heap = Vec::<u8>::new();
+    let mut offsets = vec![0_usize];
+    let mut by_step = std::collections::HashMap::<i64, u32>::new();
+    let mut last: Option<(i64, u32)> = None;
+    for row in 0..rows {
+        if !units.validity.is_valid(row) {
+            codes.push(0);
+            continue;
+        }
+        let bucket = units.units[row].div_euclid(step);
+        let code = match last {
+            Some((previous, code)) if previous == bucket => code,
+            _ => {
+                let code = if let Some(code) = by_step.get(&bucket) {
+                    *code
+                } else {
+                    let code = u32::try_from(offsets.len() - 1).ok()?;
+                    let formatted = crate::expression::temporal::mysql_date_format_locale(
+                        units.datetime(row)?,
+                        format,
+                        locale,
+                    );
+                    heap.extend_from_slice(formatted.as_bytes());
+                    offsets.push(heap.len());
+                    by_step.insert(bucket, code);
+                    code
+                };
+                last = Some((bucket, code));
+                code
+            }
+        };
+        codes.push(code);
+    }
+    if offsets.len() == 1 {
+        // Every row NULL: a one-entry dictionary keeps each code in range.
+        offsets.push(0);
+    }
+    let text =
+        crate::array::StrColumn::from_dictionary(&heap, &offsets, codes, units.validity.clone());
     Some(ColumnVector::from_typed(
         DataType::Utf8,
         TypedValues::Utf8(text),
@@ -185,7 +291,11 @@ pub(super) fn date_of_column(
     data_type: Option<DataType>,
     effects: &mut Effects,
 ) -> Option<ColumnVector> {
-    let [argument] = args else {
+    // The binder appends the session's zero-date policy to `DATE(x)`. It
+    // decides only how a zero or partial calendar casts, and a packed
+    // temporal holds neither: every row parsed strictly into a real
+    // instant, so the policy cannot change any row this kernel answers.
+    let ([argument] | [argument, CompiledExpr::Literal(Value::UInt64(_))]) = args else {
         return None;
     };
     if data_type != Some(DataType::Date32) {
@@ -205,6 +315,11 @@ fn dates_of(
 ) -> Option<ColumnVector> {
     use chrono::Datelike as _;
     let input = moment(input)?;
+    if function == ScalarFunction::Date
+        && let Moment::Column(column) = &input
+    {
+        return days_of(column);
+    }
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
     let mut days = Vec::with_capacity(batch.row_count());
     let mut valid = Vec::with_capacity(batch.row_count());
@@ -244,6 +359,38 @@ fn dates_of(
             text: LazyText::date(),
         },
         ValidityMask::from_bools(&valid),
+    ))
+}
+
+/// `DATE(column)` straight off the units: a datetime's day is its
+/// microseconds floored to whole days since the epoch, the date the
+/// calendar conversion arrives at, without one. Grouping a recent window by
+/// day reads this for every row, where the conversion cost more than the
+/// rest of the aggregate. A unit whose year canonical text cannot spell
+/// declines, as the calendar path does.
+fn days_of(column: &Temporal<'_>) -> Option<ColumnVector> {
+    let spellable = column.four_digit_years();
+    let mut days = Vec::with_capacity(column.units.len());
+    for (row, unit) in column.units.iter().enumerate() {
+        if !column.validity.is_valid(row) {
+            days.push(0);
+            continue;
+        }
+        if !spellable.contains(unit) {
+            return None;
+        }
+        days.push(match column.fsp {
+            None => *unit,
+            Some(_) => unit.div_euclid(MICROS_PER_DAY),
+        });
+    }
+    Some(ColumnVector::from_typed(
+        DataType::Date32,
+        TypedValues::Temporal {
+            units: days,
+            text: LazyText::date(),
+        },
+        column.validity.clone(),
     ))
 }
 
@@ -700,6 +847,22 @@ mod tests {
                     "{function:?} over {fsp:?} has a kernel"
                 );
             }
+            // `DATE(x)` as the binder builds it, with the session's zero-date
+            // policy appended: every policy answers a packed row alike.
+            for policy in [0_u64, 0b1, 0b11, 0b111, 0b1111] {
+                let expression = scalar(
+                    ScalarFunction::Date,
+                    vec![
+                        CompiledExpr::Column(0),
+                        CompiledExpr::Literal(Value::UInt64(policy)),
+                    ],
+                    DataType::Date32,
+                );
+                assert!(
+                    agrees_with_rows(&expression, &batch, DataType::Date32),
+                    "DATE with policy {policy} over {fsp:?} has a kernel"
+                );
+            }
         }
     }
 
@@ -716,6 +879,10 @@ mod tests {
                 "%d/%m/%Y",
                 "%H:%i",
                 "%W %M %Y",
+                "%Y-%m-%d",
+                "%Y-%m-%d %H:00",
+                "%l %p %q%%%-",
+                "%x-%v",
                 "",
             ] {
                 let expression = scalar(
@@ -730,6 +897,23 @@ mod tests {
                     agrees_with_rows(&expression, &batch, DataType::Utf8),
                     "{format:?} over {fsp:?} has a kernel"
                 );
+                // As the planner builds it, with the session's calendar
+                // locale appended: names come from that locale.
+                for locale in [0_u64, 1, 2, 5] {
+                    let expression = scalar(
+                        ScalarFunction::DateFormat,
+                        vec![
+                            CompiledExpr::Column(0),
+                            CompiledExpr::Literal(Value::Utf8(format.to_owned())),
+                            CompiledExpr::Literal(Value::UInt64(locale)),
+                        ],
+                        DataType::Utf8,
+                    );
+                    assert!(
+                        agrees_with_rows(&expression, &batch, DataType::Utf8),
+                        "{format:?} in locale {locale} over {fsp:?} has a kernel"
+                    );
+                }
             }
             // The format has to be one constant for every row; a column in
             // its place is row evaluation's.
