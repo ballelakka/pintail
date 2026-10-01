@@ -280,56 +280,58 @@ pub(crate) async fn change_member_role(
 
 #[cfg(test)]
 mod tests {
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode, header},
-    };
-    use http_body_util::BodyExt as _;
-    use serde_json::Value;
-    use tower::ServiceExt as _;
+    use axum::http::StatusCode;
 
-    use crate::{ApiState, auth::issue_token};
-
-    async fn call(
-        app: &axum::Router,
-        method: &str,
-        uri: &str,
-        bearer: Option<&str>,
-        body: Option<&str>,
-    ) -> (StatusCode, Value) {
-        let mut request = Request::builder().method(method).uri(uri);
-        if let Some(bearer) = bearer {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
-        }
-        let body = match body {
-            Some(body) => {
-                request = request.header(header::CONTENT_TYPE, "application/json");
-                Body::from(body.to_owned())
-            }
-            None => Body::empty(),
-        };
-        let response = app
-            .clone()
-            .oneshot(request.body(body).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
-    }
-
-    fn token_of(response: &(StatusCode, Value)) -> String {
-        assert!(response.0.is_success(), "{response:?}");
-        response.1["token"].as_str().expect("a token").to_owned()
-    }
+    use crate::test_support::Node;
 
     const OAUTH: &str = "/api/settings/oauth/google";
     const WIRE_TLS: &str = "/api/settings/wire-tls";
     const OAUTH_BODY: &str = r#"{"enabled":false,"client_id":"client.example"}"#;
     const WIRE_TLS_BODY: &str = r#"{"hostnames":"replica.example.com"}"#;
+    const OTHER_OAUTH_BODY: &str = r#"{"enabled":false,"client_id":"other.example"}"#;
+    const OTHER_WIRE_TLS_BODY: &str = r#"{"hostnames":"other.example.com"}"#;
+
+    /// What the node has stored for its two node-wide settings.
+    fn stored(node: &Node) -> (Option<String>, Option<String>) {
+        let metadata = node.metadata();
+        (
+            metadata.setting("oauth_google_client_id").expect("setting"),
+            metadata.setting("wire_tls_hostnames").expect("setting"),
+        )
+    }
+
+    /// Every way of reaching a node-wide setting is refused, and none of the
+    /// refused writes changed what is stored.
+    async fn assert_refused(node: &Node, bearer: Option<&str>, status: StatusCode, who: &str) {
+        let before = stored(node);
+        for (method, uri, body) in [
+            ("GET", OAUTH, None),
+            ("PUT", OAUTH, Some(OTHER_OAUTH_BODY)),
+            ("GET", WIRE_TLS, None),
+            ("PUT", WIRE_TLS, Some(OTHER_WIRE_TLS_BODY)),
+        ] {
+            let (answered, _) = node.call(method, uri, bearer, body).await;
+            assert_eq!(answered, status, "{who}: {method} {uri}");
+        }
+        assert_eq!(stored(node), before, "{who}: a refused write was stored");
+    }
+
+    /// A node whose administrator has saved both node-wide settings.
+    async fn configured_node() -> Node {
+        let node = Node::new().await;
+        for (uri, body) in [(OAUTH, OAUTH_BODY), (WIRE_TLS, WIRE_TLS_BODY)] {
+            let (status, _) = node.call("PUT", uri, Some(&node.admin), Some(body)).await;
+            assert_eq!(status, StatusCode::OK, "PUT {uri}");
+        }
+        assert_eq!(
+            stored(&node),
+            (
+                Some("client.example".to_owned()),
+                Some("replica.example.com".to_owned())
+            )
+        );
+        node
+    }
 
     /// Creating a workspace makes its creator that workspace's
     /// administrator, and nothing more. The node's own settings - the OAuth
@@ -338,111 +340,80 @@ mod tests {
     /// workspace, in whichever workspace their session happens to be.
     #[tokio::test]
     async fn a_workspace_creator_does_not_administer_the_node() {
-        let data = tempfile::tempdir().expect("API data directory");
-        let state = ApiState::new(
-            data.path(),
-            data.path().join("pintail-meta.db"),
-            b"test-jwt-secret-with-enough-entropy",
-            &"42".repeat(32),
-        )
-        .expect("configured API state");
-        let app = crate::router_with_state(state.clone());
-        let setup = call(
-            &app,
-            "POST",
-            "/api/auth/setup",
-            None,
-            Some(r#"{"email":"admin@example.com","password":"correct horse battery"}"#),
-        )
-        .await;
-        let admin = token_of(&setup);
-        let first_workspace = setup.1["user"]["workspace_id"]
-            .as_str()
-            .expect("first workspace")
-            .to_owned();
-
-        // A second account that only views the first workspace.
-        let metadata = state.metadata().expect("metadata");
-        metadata
-            .create_user(
-                "usr_viewer",
-                "viewer@example.com",
-                "unused",
-                "viewer",
-                "now",
-            )
-            .expect("viewer account");
-        metadata
-            .add_workspace_member(&first_workspace, "usr_viewer", "viewer", "now")
-            .expect("viewer membership");
-        let viewer =
-            issue_token(&state, "usr_viewer", "viewer", &first_workspace).expect("viewer session");
+        let node = configured_node().await;
+        let (_, viewer) = node.member(&node.first_workspace, "viewer");
 
         // The viewer creates a workspace and is its administrator...
-        let created = call(
-            &app,
-            "POST",
-            "/api/workspaces",
-            Some(&viewer),
-            Some(r#"{"name":"Side project"}"#),
-        )
-        .await;
-        let own = token_of(&created);
-        let (status, session) = call(&app, "GET", "/api/session", Some(&own), None).await;
+        let (_, own) = node.workspace(&viewer, "Side project").await;
+        let (status, session) = node.call("GET", "/api/session", Some(&own), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(session["role"], "admin");
         assert_eq!(session["node_admin"], false);
         // ...which lets them run that workspace,
-        let (status, _) = call(&app, "GET", "/api/workspaces/audit-log", Some(&own), None).await;
+        let (status, _) = node
+            .call("GET", "/api/workspaces/audit-log", Some(&own), None)
+            .await;
         assert_eq!(status, StatusCode::OK);
         // and reaches no node-wide setting, to read or to write.
-        for (method, uri, body) in [
-            ("GET", OAUTH, None),
-            ("PUT", OAUTH, Some(OAUTH_BODY)),
-            ("GET", WIRE_TLS, None),
-            ("PUT", WIRE_TLS, Some(WIRE_TLS_BODY)),
-        ] {
-            let (status, _) = call(&app, method, uri, Some(&own), body).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
-        }
-        let (_, settings) = call(&app, "GET", OAUTH, Some(&admin), None).await;
-        assert_eq!(
-            settings["client_id"], "",
-            "the refused write changed nothing"
-        );
+        assert_refused(&node, Some(&own), StatusCode::FORBIDDEN, "a workspace creator").await;
 
         // The first administrator keeps the node from their first workspace
         // and from one they create afterwards.
-        let elsewhere = token_of(
-            &call(
-                &app,
-                "POST",
-                "/api/workspaces",
-                Some(&admin),
-                Some(r#"{"name":"Second"}"#),
-            )
-            .await,
-        );
-        for session in [&admin, &elsewhere] {
-            let (status, principal) = call(&app, "GET", "/api/session", Some(session), None).await;
+        let (_, elsewhere) = node.workspace(&node.admin, "Second").await;
+        for session in [&node.admin, &elsewhere] {
+            let (status, principal) = node.call("GET", "/api/session", Some(session), None).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(principal["node_admin"], true);
             for (uri, body) in [(OAUTH, OAUTH_BODY), (WIRE_TLS, WIRE_TLS_BODY)] {
-                let (status, _) = call(&app, "PUT", uri, Some(session), Some(body)).await;
+                let (status, _) = node.call("PUT", uri, Some(session), Some(body)).await;
                 assert_eq!(status, StatusCode::OK, "PUT {uri}");
             }
         }
 
         // Node administration follows the first workspace's membership: a
         // demotion there ends it at once.
-        metadata
-            .update_workspace_member_role(
-                &first_workspace,
-                setup.1["user"]["id"].as_str().expect("admin id"),
-                "viewer",
-            )
+        node.metadata()
+            .update_workspace_member_role(&node.first_workspace, &node.admin_id, "viewer")
             .expect("demote");
-        let (status, _) = call(&app, "PUT", OAUTH, Some(&elsewhere), Some(OAUTH_BODY)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_refused(
+            &node,
+            Some(&elsewhere),
+            StatusCode::FORBIDDEN,
+            "a demoted administrator",
+        )
+        .await;
+    }
+
+    /// An administrator of a workspace that is not the first - one who was
+    /// made its administrator, not one who created it - is refused the same.
+    #[tokio::test]
+    async fn an_administrator_of_another_workspace_does_not_administer_the_node() {
+        let node = configured_node().await;
+        let (second_workspace, _) = node.workspace(&node.admin, "Second").await;
+        let (_, second_admin) = node.member(&second_workspace, "admin");
+        assert_refused(
+            &node,
+            Some(&second_admin),
+            StatusCode::FORBIDDEN,
+            "another workspace's administrator",
+        )
+        .await;
+    }
+
+    /// A database key administers nothing, and no credential reaches nothing.
+    #[tokio::test]
+    async fn keys_and_anonymous_callers_reach_no_node_wide_setting() {
+        let node = configured_node().await;
+        let database = node.database(&node.admin, "ledger").await;
+        let (_, key) = node.api_key(&node.admin, &database).await;
+        assert_refused(&node, Some(&key), StatusCode::FORBIDDEN, "a database key").await;
+        assert_refused(&node, None, StatusCode::UNAUTHORIZED, "no credential").await;
+        assert_refused(
+            &node,
+            Some("not-a-session"),
+            StatusCode::UNAUTHORIZED,
+            "a bad credential",
+        )
+        .await;
     }
 }
