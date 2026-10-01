@@ -261,10 +261,12 @@ const CASES: [(&str, bool); 10] = [
          WHERE e.id BETWEEN 20 AND 40 ORDER BY {key} LIMIT 30",
         true,
     ),
+    // Most of the join: looked up row by row it costs more than the whole
+    // hash join and its sort, so the sort stays.
     (
         "SELECT e.id, u.name FROM events AS e JOIN users AS u ON e.user_id = u.id \
          ORDER BY {key} LIMIT 60000",
-        true,
+        false,
     ),
     (
         "SELECT e.id FROM events AS e LEFT JOIN users AS u ON e.user_id = u.id \

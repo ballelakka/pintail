@@ -161,9 +161,24 @@ fn lookup_kind(kind: BoundJoinKind) -> BoundJoinKind {
     }
 }
 
+/// How many hash-join input rows one looked-up output row costs about as
+/// much as. A lookup joins row by row, so a limit large enough to approach
+/// the whole join reads as much and does more per row; measured on a
+/// hundred-thousand-row lookup side, sixty thousand looked-up rows took
+/// about eight times as long per row as the full hash join and its sort
+/// took per input row.
+const LOOKUP_ROW_COST: u64 = 8;
+
 /// Which input of the join under `plan` can drive a key lookup that yields
-/// the order of `keys`: `Some(true)` for the left.
-fn driving_side(plan: &PhysicalPlan, keys: &[BoundOrderKey], trim: usize) -> Option<bool> {
+/// the order of `keys`: `Some(true)` for the left. `None` too when the
+/// `limit` rows the lookup would join cost more than the whole hash join
+/// its estimates describe.
+fn driving_side(
+    plan: &PhysicalPlan,
+    keys: &[BoundOrderKey],
+    trim: usize,
+    limit: u64,
+) -> Option<bool> {
     let PhysicalPlan::Project { input, expressions } = plan else {
         return None;
     };
@@ -175,6 +190,8 @@ fn driving_side(plan: &PhysicalPlan, keys: &[BoundOrderKey], trim: usize) -> Opt
         extra_keys,
         null_safe,
         right_key,
+        probe_estimate,
+        build_estimate,
         ..
     } = input.as_ref()
     else {
@@ -182,6 +199,11 @@ fn driving_side(plan: &PhysicalPlan, keys: &[BoundOrderKey], trim: usize) -> Opt
     };
     // A lookup by key finds no row for NULL, which `<=>` matches.
     if !extra_keys.is_empty() || null_safe.contains(&true) {
+        return None;
+    }
+    if let (Some(probe), Some(build)) = (probe_estimate, build_estimate)
+        && limit.saturating_mul(LOOKUP_ROW_COST) > probe.saturating_add(*build)
+    {
         return None;
     }
     let columns = key_columns(expressions, keys, trim)?;
@@ -207,15 +229,17 @@ fn driving_side(plan: &PhysicalPlan, keys: &[BoundOrderKey], trim: usize) -> Opt
 
 /// The sort input as a plan already in the order of `keys`, and `true`,
 /// when it is a projection over a join whose driving side is a scan ordered
-/// by those keys and whose other side is found by its whole primary key.
-/// The projection drops the `trim` columns only the sort read. Any other
-/// input comes back unchanged, with `false`.
+/// by those keys and whose other side is found by its whole primary key,
+/// and the `limit` rows above it are few enough for lookups to pay. The
+/// projection drops the `trim` columns only the sort read. Any other input
+/// comes back unchanged, with `false`.
 pub(super) fn ordered_input(
     input: PhysicalPlan,
     keys: &[BoundOrderKey],
     trim: usize,
+    limit: u64,
 ) -> (PhysicalPlan, bool) {
-    let Some(driving_left) = driving_side(&input, keys, trim) else {
+    let Some(driving_left) = driving_side(&input, keys, trim, limit) else {
         return (input, false);
     };
     match input {

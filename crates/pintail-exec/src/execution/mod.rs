@@ -1029,7 +1029,7 @@ fn plan_limit(
             let (input, ordered) = if ordered {
                 (input, true)
             } else {
-                key_lookup::ordered_input(input, &keys, trim)
+                key_lookup::ordered_input(input, &keys, trim, offset.saturating_add(count))
             };
             let (input, ordered) = if ordered {
                 (input, true)
