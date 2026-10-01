@@ -236,6 +236,22 @@ pub fn cases() -> Vec<OracleCase> {
                 column("dt3")
             ),
         );
+        // A day past its month's end written as text is a date only
+        // under ALLOW_INVALID_DATES, where it counts as the day it runs
+        // into; a zero day is refused by these functions in either mode.
+        for sql_mode in [super::oracle_transport::DEFAULT_MODE, "ALLOW_INVALID_DATES"] {
+            push(
+                sql_mode,
+                "calendar edges week and day literals",
+                format!(
+                    "SELECT {}, {}, {}, {}",
+                    column("'2024-02-30'"),
+                    column("'2024-04-31 10:00:00'"),
+                    column("'2023-02-29'"),
+                    column("'2024-02-00'")
+                ),
+            );
+        }
     }
     cases
 }

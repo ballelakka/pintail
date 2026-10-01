@@ -2399,6 +2399,36 @@ pub(super) fn bind_scalar(
             )),
         });
     }
+    // The week, day and month functions read a date written as text under
+    // ALLOW_INVALID_DATES as they read a stored one: a day past its month's
+    // end counts as the day it runs into. Only that mode changes an answer
+    // and only for an argument that is not a stored temporal, so the policy
+    // is appended for nothing else, and a call over a date or datetime
+    // column keeps the argument list its column kernels and rewrites read.
+    // YEARWEEK's mode stays second.
+    if matches!(
+        function,
+        ScalarFunction::DatePart(_)
+            | ScalarFunction::DayName
+            | ScalarFunction::MonthName
+            | ScalarFunction::ToDays
+            | ScalarFunction::YearWeek
+    ) && crate::session_parse_mode().allow_invalid_dates
+        && !matches!(
+            args[0].data_type,
+            Some(DataType::Date32 | DataType::DateTime64 { .. } | DataType::Time64 { .. })
+        )
+    {
+        let literal = |value| BoundExpr {
+            data_type: Some(DataType::Int64),
+            nullable: false,
+            kind: BoundExprKind::Literal(Value::Int64(value)),
+        };
+        if function == ScalarFunction::YearWeek && args.len() == 1 {
+            args.push(literal(0));
+        }
+        args.push(literal(4));
+    }
     if function == ScalarFunction::StrToDate {
         let mode = crate::session_parse_mode();
         let policy = u64::from(mode.no_zero_date)

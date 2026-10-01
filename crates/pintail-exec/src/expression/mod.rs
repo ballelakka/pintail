@@ -3618,10 +3618,10 @@ fn evaluate_eager_scalar_inner(
         }
 
         ScalarFunction::DatePart(part) => {
-            if matches!(
-                argument_types.first().copied().flatten(),
-                Some(DataType::Date32 | DataType::DateTime64 { .. })
-            ) && let Value::Utf8(text) = &values[0]
+            let lenient =
+                stored_temporal(argument_types, 0) || allows_invalid_dates(values.get(1));
+            if lenient
+                && let Value::Utf8(text) = &values[0]
                 && let Some((date, _)) = canonical_temporal_parts_policy(text, true, true)
             {
                 let digits = match part {
@@ -3653,8 +3653,10 @@ fn evaluate_eager_scalar_inner(
                 )
             );
             let part_value = match temporal::date_part_of(&values[0], integer, part) {
-                Err(error) if stored_temporal(argument_types, 0) => {
-                    // A stored February 30th counts as the day it runs into.
+                Err(error) if lenient => {
+                    // A stored February 30th counts as the day it runs
+                    // into, and so does one written under
+                    // ALLOW_INVALID_DATES.
                     let text = scalar_string(&values[0])?;
                     let rolled = stored_datetime(&text).map_err(|_| error)?;
                     let rolled = Value::Utf8(rolled.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
@@ -3800,7 +3802,9 @@ fn evaluate_eager_scalar_inner(
         }
         ScalarFunction::DayName => {
             let text = scalar_string(&values[0])?;
-            let value = if stored_temporal(argument_types, 0) {
+            let value = if stored_temporal(argument_types, 0)
+                || values.iter().skip(1).any(|extra| allows_invalid_dates(Some(extra)))
+            {
                 stored_datetime(&text)?
             } else {
                 parse_mysql_datetime(&text)?
@@ -3816,10 +3820,8 @@ fn evaluate_eager_scalar_inner(
             let month = if let Some((date, _)) = canonical_temporal_parts_policy(
                 &text,
                 true,
-                matches!(
-                    argument_types.first().copied().flatten(),
-                    Some(DataType::Date32 | DataType::DateTime64 { .. })
-                ),
+                stored_temporal(argument_types, 0)
+                    || values.iter().skip(1).any(|extra| allows_invalid_dates(Some(extra))),
             ) {
                 date[5..7]
                     .parse::<usize>()
@@ -3868,7 +3870,7 @@ fn evaluate_eager_scalar_inner(
         }
         ScalarFunction::ToDays => {
             // MySQL's own day count, in which the year zero has no leap day.
-            let value = counted_date(values, argument_types)?;
+            let value = counted_date(values, argument_types, values.get(1))?;
             let days = temporal::calc_daynr(
                 u32::try_from(value.year()).map_err(|_| ExecError::InvalidDateTime)?,
                 value.month(),
@@ -3892,7 +3894,7 @@ fn evaluate_eager_scalar_inner(
             Ok(Value::Utf8(date.format("%Y-%m-%d").to_string()))
         }
         ScalarFunction::YearWeek => {
-            let value = counted_date(values, argument_types)?;
+            let value = counted_date(values, argument_types, values.get(2))?;
             // The binder keeps a written mode; YEARWEEK(date) is mode 0.
             let mode = match values.get(1) {
                 Some(mode) => u32::try_from(mysql_i64(mode)?.rem_euclid(8)).unwrap_or(0),
@@ -4680,19 +4682,32 @@ fn stored_datetime(text: &str) -> Result<NaiveDateTime, ExecError> {
 
 /// The date a day-counting function counts from: a stored date past its
 /// month's end counts as the day it runs into, as `MySQL` counts a stored
-/// February 30th.
+/// February 30th, and so does one written as text under
+/// `ALLOW_INVALID_DATES` (`policy`).
 fn counted_date(
     values: &[Value],
     argument_types: &[Option<DataType>],
+    policy: Option<&Value>,
 ) -> Result<chrono::NaiveDate, ExecError> {
     let text = scalar_string(&values[0])?;
     match parse_mysql_datetime(&text) {
         Ok(value) => Ok(value.date()),
-        Err(error) if stored_temporal(argument_types, 0) => stored_datetime(&text)
-            .map(|value| value.date())
-            .map_err(|_| error),
+        Err(error) if stored_temporal(argument_types, 0) || allows_invalid_dates(policy) => {
+            stored_datetime(&text)
+                .map(|value| value.date())
+                .map_err(|_| error)
+        }
         Err(error) => Err(error),
     }
+}
+
+/// Whether the binder marked a date argument written as text as read under
+/// `ALLOW_INVALID_DATES`: a signed policy literal with bit 2 set, appended
+/// only in that mode and only after an argument that is not a stored
+/// temporal. Such text may name a day past its month's end, which `MySQL`
+/// then counts as the day it runs into, as it counts a stored one.
+fn allows_invalid_dates(policy: Option<&Value>) -> bool {
+    matches!(policy, Some(Value::Int64(policy)) if policy & 4 != 0)
 }
 
 /// The calendar fields of a date no calendar holds, as `MySQL` keeps them

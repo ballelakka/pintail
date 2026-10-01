@@ -1744,11 +1744,11 @@ fn capture_scalar_session(function: ScalarFunction, args: &mut Vec<BoundExpr>) {
         ScalarFunction::DateFormat => Some(2),
         _ => None,
     };
-    // The binder leaves the session's zero-date policy after DATE_FORMAT's
-    // format (a signed literal); the locale goes before it.
-    let before_policy = function == ScalarFunction::DateFormat
-        && args.len() == 3
-        && args[2].data_type == Some(DataType::Int64);
+    // The binder may leave the session's date policy (a signed literal)
+    // after the written arguments; the locale goes before it.
+    let before_policy = locale_arity.is_some_and(|arity| {
+        args.len() == arity + 1 && args[arity].data_type == Some(DataType::Int64)
+    });
     if locale_arity == Some(args.len()) || before_policy {
         let at = locale_arity.unwrap_or(args.len());
         args.insert(
