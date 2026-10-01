@@ -3837,6 +3837,9 @@ fn decode_int_payload_into(
     }
     let normalized = unpack(&mut decoder, non_null_count)?;
     decoder.finish()?;
+    if non_null_count == row_count && extend_selected_ranges(builder, &ranges, base, &normalized) {
+        return Ok(true);
+    }
     let is_null = |row: usize| null_bitmap[row / 8] & (1 << (row % 8)) != 0;
     let mut next = 0_usize;
     for row in 0..row_count {
@@ -3861,6 +3864,64 @@ fn decode_int_payload_into(
         return Err("encoding produced too few values".to_owned());
     }
     Ok(true)
+}
+
+/// The selected ranges of a block with no nulls, copied range by range into
+/// a typed builder. A filtered scan hands most blocks a partial selection,
+/// and the row-at-a-time walk it replaces tested range membership, widened
+/// to `i128` and dispatched on the builder for every row - about as long as
+/// the decode itself on a range-filtered aggregate. Returns `false`, with
+/// the builder untouched, when the builder is not integer-typed or when the
+/// block's largest value could overflow the destination, so the per-row
+/// walk still raises the overflow for exactly the rows it would have.
+fn extend_selected_ranges(
+    builder: &mut ColumnBuilder,
+    ranges: &RangeCursor,
+    base: i128,
+    normalized: &[u64],
+) -> bool {
+    let rows = normalized.len();
+    let top = normalized.iter().copied().max().unwrap_or(0);
+    let selected = || {
+        ranges.ranges.iter().filter_map(move |&(lo, hi)| {
+            let (lo, hi) = (lo.min(rows), hi.min(rows));
+            (lo < hi).then_some(lo..hi)
+        })
+    };
+    match builder.int_bulk() {
+        Some(IntBulkDestination::Signed { values, validity })
+            if base >= i128::from(i64::MIN) && base + i128::from(top) <= i128::from(i64::MAX) =>
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            let base = base as i64;
+            for range in selected() {
+                validity.extend_valid(range.len());
+                #[allow(clippy::cast_possible_wrap)]
+                values.extend(
+                    normalized[range]
+                        .iter()
+                        .map(|value| base.wrapping_add(*value as i64)),
+                );
+            }
+            true
+        }
+        Some(IntBulkDestination::Unsigned { values, validity })
+            if base >= 0 && base + i128::from(top) <= i128::from(u64::MAX) =>
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let base = base as u64;
+            for range in selected() {
+                validity.extend_valid(range.len());
+                values.extend(
+                    normalized[range]
+                        .iter()
+                        .map(|value| base.wrapping_add(*value)),
+                );
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Delta blocks use the same typed destination as ordinary packed blocks,
@@ -6286,6 +6347,79 @@ mod framed_block_tests {
                 println!(
                     "{compression:?} v{version}: {size} bytes, sparse {} rows {sparse_ms:.2} ms, full column {full_ms:.2} ms",
                     sparse.len()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed_decode_tests {
+    use super::*;
+
+    fn bitmap_for(count: usize, nullable: bool) -> Vec<u8> {
+        let mut bitmap = vec![0_u8; count.div_ceil(8)];
+        if nullable {
+            for row in (0..count).filter(|row| row % 7 == 3) {
+                bitmap[row / 8] |= 1 << (row % 8);
+            }
+        }
+        bitmap
+    }
+
+    fn selected(ranges: &[(usize, usize)], row: usize) -> bool {
+        ranges.iter().any(|&(lo, hi)| (lo..hi).contains(&row))
+    }
+
+    #[test]
+    fn partial_ranges_of_packed_integers_match_the_general_decode() {
+        let count = 5_000_usize;
+        let bitmap = bitmap_for(count, false);
+        for logical_type in [LogicalType::Int64, LogicalType::UInt64] {
+            let cells = (0..count)
+                .map(|row| {
+                    let spread = u64::try_from(row * 7_919 % 2_000_003).expect("small");
+                    match logical_type {
+                        LogicalType::Int64 => {
+                            Cell::Int64(i64::try_from(spread).expect("small") - 900_000)
+                        }
+                        _ => Cell::UInt64(u64::MAX - 3_000_000 + spread),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let payload =
+                encode_payload(logical_type, Encoding::BitPacked, &cells).expect("encode");
+            for ranges in [
+                vec![(0, 1)],
+                vec![(3, 64), (64, 65), (700, 4_999)],
+                vec![(10, 20), (4_990, 6_000)],
+            ] {
+                let mut expected = ColumnBuilder::new_for_column(logical_type, None, count);
+                for (row, cell) in cells.iter().enumerate() {
+                    if selected(&ranges, row) {
+                        expected.push(cell.clone()).expect("push");
+                    }
+                }
+                let mut actual = ColumnBuilder::new_for_column(logical_type, None, count);
+                assert!(
+                    decode_int_payload_into(
+                        &payload,
+                        logical_type,
+                        Encoding::BitPacked,
+                        count,
+                        count,
+                        &bitmap,
+                        IntSink {
+                            builder: &mut actual,
+                            ranges: RangeCursor::new(ranges.clone()),
+                        },
+                    )
+                    .expect("direct decode")
+                );
+                assert_eq!(
+                    actual.finish().into_values(),
+                    expected.finish().into_values(),
+                    "{ranges:?}"
                 );
             }
         }

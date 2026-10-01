@@ -81,6 +81,7 @@ mod row_constructors;
 mod row_path_text_cost;
 mod runtime_join_filter;
 mod scalar_fallback_cost;
+mod scan_decode_bench;
 mod segment_subcube;
 mod selection_cost;
 mod semi_join_through_derived;

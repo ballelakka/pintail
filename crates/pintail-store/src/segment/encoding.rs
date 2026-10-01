@@ -865,6 +865,109 @@ const fn width_mask(width: u32) -> u64 {
     }
 }
 
+/// Values one unpack group decodes. Sixty-four values of `width` bits fill
+/// exactly `width` little-endian words, so every group starts on a word
+/// boundary and the bit position of each of its values is a constant of the
+/// width alone.
+const GROUP: usize = 64;
+
+/// Decodes `value_count` LSB-first packed values of `width` bits, handing
+/// them to `sink` in order, sixty-four at a time (the last call may be
+/// shorter).
+///
+/// Whole groups decode through a kernel specialised per width: the group's
+/// words load once, and each value is two shifts, an OR and a mask at
+/// offsets the compiler knows, with no branch and no bounds check in the
+/// loop. The value-at-a-time reader it replaces refilled a 128-bit
+/// accumulator behind a data-dependent loop and branch per value, which
+/// held a full-column decode to a few values per nanosecond. The tail after
+/// the last whole group goes through that reader. Same wire format, same
+/// order.
+fn for_each_unpacked_group<E>(
+    bytes: &[u8],
+    width: u32,
+    value_count: usize,
+    mut sink: impl FnMut(&[u64]) -> Result<(), E>,
+) -> Result<(), E> {
+    let whole_groups = value_count / GROUP;
+    let mut buffer = [0_u64; GROUP];
+    unpack_whole_groups(width, bytes, whole_groups, &mut buffer, &mut sink)?;
+    let rest = value_count - whole_groups * GROUP;
+    if rest > 0 {
+        let consumed = whole_groups * GROUP * width as usize / 8;
+        let mut reader = BitReader::new(&bytes[consumed..]);
+        let mask = width_mask(width);
+        for value in &mut buffer[..rest] {
+            *value = reader.read(width, mask);
+        }
+        sink(&buffer[..rest])?;
+    }
+    Ok(())
+}
+
+/// Routes a width to its specialised kernel.
+fn unpack_whole_groups<E>(
+    width: u32,
+    bytes: &[u8],
+    groups: usize,
+    buffer: &mut [u64; GROUP],
+    sink: &mut impl FnMut(&[u64]) -> Result<(), E>,
+) -> Result<(), E> {
+    macro_rules! dispatch {
+        ($($width:literal)*) => {
+            match width {
+                0 => {
+                    *buffer = [0; GROUP];
+                    for _ in 0..groups {
+                        sink(buffer)?;
+                    }
+                    Ok(())
+                }
+                $($width => unpack_groups::<$width, E>(bytes, groups, buffer, sink),)*
+                _ => unreachable!("bit widths are validated to at most 64"),
+            }
+        };
+    }
+    dispatch!(
+        1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
+        33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61
+        62 63 64
+    )
+}
+
+/// The whole groups of a `WIDTH`-bit payload. `words` keeps one zero word
+/// past the group so the high half of the last value reads a real index
+/// rather than needing a branch.
+#[inline]
+fn unpack_groups<const WIDTH: usize, E>(
+    bytes: &[u8],
+    groups: usize,
+    buffer: &mut [u64; GROUP],
+    sink: &mut impl FnMut(&[u64]) -> Result<(), E>,
+) -> Result<(), E> {
+    #[allow(clippy::cast_possible_truncation)]
+    let mask = width_mask(WIDTH as u32);
+    let mut words = [0_u64; GROUP + 1];
+    for chunk in bytes.chunks_exact(WIDTH * 8).take(groups) {
+        for (word, eight) in words[..WIDTH].iter_mut().zip(chunk.chunks_exact(8)) {
+            *word = u64::from_le_bytes([
+                eight[0], eight[1], eight[2], eight[3], eight[4], eight[5], eight[6], eight[7],
+            ]);
+        }
+        for (index, value) in buffer.iter_mut().enumerate() {
+            let bit = index * WIDTH;
+            let shift = bit % 64;
+            let low = words[bit / 64] >> shift;
+            // `<< 1 << (63 - shift)` is `<< (64 - shift)` without the
+            // undefined full-width shift when `shift` is zero.
+            let high = (words[bit / 64 + 1] << 1) << (63 - shift);
+            *value = (low | high) & mask;
+        }
+        sink(buffer)?;
+    }
+    Ok(())
+}
+
 /// Decodes a bit-packed payload, adds the block base, and appends signed
 /// values straight into the destination - one pass, no temporary vector.
 ///
@@ -880,7 +983,6 @@ pub(super) fn unpack_signed_into(
     let (width, bytes) = unpack_header(decoder, value_count)?;
     let mask = width_mask(width);
     out.reserve(value_count);
-    let mut reader = BitReader::new(bytes);
     let in_range = base >= i128::from(i64::MIN)
         && base
             .checked_add(i128::from(mask))
@@ -888,21 +990,21 @@ pub(super) fn unpack_signed_into(
     if in_range && width < 64 {
         #[allow(clippy::cast_possible_truncation)]
         let base = base as i64;
-        for _ in 0..value_count {
+        return for_each_unpacked_group(bytes, width, value_count, |group| {
             #[allow(clippy::cast_possible_wrap)]
-            let value = reader.read(width, mask) as i64;
-            out.push(base.wrapping_add(value));
+            out.extend(group.iter().map(|value| base.wrapping_add(*value as i64)));
+            Ok(())
+        });
+    }
+    for_each_unpacked_group(bytes, width, value_count, |group| {
+        for normalized in group {
+            let value = base
+                .checked_add(i128::from(*normalized))
+                .ok_or_else(|| "bit-packed integer overflow".to_owned())?;
+            out.push(i64::try_from(value).map_err(|_| "bit-packed signed integer overflow")?);
         }
-        return Ok(());
-    }
-    for _ in 0..value_count {
-        let normalized = reader.read(width, mask);
-        let value = base
-            .checked_add(i128::from(normalized))
-            .ok_or_else(|| "bit-packed integer overflow".to_owned())?;
-        out.push(i64::try_from(value).map_err(|_| "bit-packed signed integer overflow")?);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Reconstructs monotone integer values straight from packed deltas.
@@ -927,7 +1029,6 @@ pub(super) fn unpack_delta_each(
     };
     let mut current = first;
     emit(current)?;
-    let mut reader = BitReader::new(bytes);
     // Every delta is nonnegative and at most mask. If even that worst
     // cumulative endpoint fits, all intermediate additions fit as well.
     let bounded = i128::try_from(value_count - 1)
@@ -936,20 +1037,24 @@ pub(super) fn unpack_delta_each(
         .and_then(|span| first.checked_add(span))
         .is_some_and(|last| last <= maximum);
     if bounded {
-        for _ in 1..value_count {
-            current += i128::from(reader.read(width, mask));
+        return for_each_unpacked_group(bytes, width, value_count - 1, |group| {
+            for delta in group {
+                current += i128::from(*delta);
+                emit(current)?;
+            }
+            Ok(())
+        });
+    }
+    for_each_unpacked_group(bytes, width, value_count - 1, |group| {
+        for delta in group {
+            current = current
+                .checked_add(i128::from(*delta))
+                .filter(|value| *value <= maximum)
+                .ok_or_else(|| "integer delta overflow".to_owned())?;
             emit(current)?;
         }
-        return Ok(());
-    }
-    for _ in 1..value_count {
-        current = current
-            .checked_add(i128::from(reader.read(width, mask)))
-            .filter(|value| *value <= maximum)
-            .ok_or_else(|| "integer delta overflow".to_owned())?;
-        emit(current)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The unsigned twin of [`unpack_signed_into`].
@@ -962,7 +1067,6 @@ pub(super) fn unpack_unsigned_into(
     let (width, bytes) = unpack_header(decoder, value_count)?;
     let mask = width_mask(width);
     out.reserve(value_count);
-    let mut reader = BitReader::new(bytes);
     let in_range = base >= 0
         && base
             .checked_add(i128::from(mask))
@@ -970,61 +1074,29 @@ pub(super) fn unpack_unsigned_into(
     if in_range {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let base = base as u64;
-        for _ in 0..value_count {
-            out.push(base.wrapping_add(reader.read(width, mask)));
+        return for_each_unpacked_group(bytes, width, value_count, |group| {
+            out.extend(group.iter().map(|value| base.wrapping_add(*value)));
+            Ok(())
+        });
+    }
+    for_each_unpacked_group(bytes, width, value_count, |group| {
+        for normalized in group {
+            let value = base
+                .checked_add(i128::from(*normalized))
+                .ok_or_else(|| "bit-packed integer overflow".to_owned())?;
+            out.push(u64::try_from(value).map_err(|_| "bit-packed unsigned integer overflow")?);
         }
-        return Ok(());
-    }
-    for _ in 0..value_count {
-        let normalized = reader.read(width, mask);
-        let value = base
-            .checked_add(i128::from(normalized))
-            .ok_or_else(|| "bit-packed integer overflow".to_owned())?;
-        out.push(u64::try_from(value).map_err(|_| "bit-packed unsigned integer overflow")?);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(super) fn unpack(decoder: &mut Decoder<'_>, value_count: usize) -> Result<Vec<u64>, String> {
-    let width = decoder.u8()?;
-    if width > 64 {
-        return Err(format!("invalid bit width {width}"));
-    }
-    let bytes = decoder.bytes()?;
-    let expected_bits = value_count
-        .checked_mul(usize::from(width))
-        .ok_or_else(|| "bit-packed length overflow".to_owned())?;
-    if bytes.len() != expected_bits.div_ceil(8) {
-        return Err(format!(
-            "bit-packed payload has {} bytes, expected {}",
-            bytes.len(),
-            expected_bits.div_ceil(8)
-        ));
-    }
-    let mut values = vec![0_u64; value_count];
-    if width == 0 {
-        return Ok(values);
-    }
-    // LSB-first bitstream: value v's bits live at positions v*width.. in
-    // little-endian byte order. A 16-byte window covers the worst case of
-    // 64 bits starting at bit offset 7 within a byte.
-    let width = usize::from(width);
-    let mask = if width == 64 {
-        u64::MAX
-    } else {
-        (1_u64 << width) - 1
-    };
-    for (value_index, value) in values.iter_mut().enumerate() {
-        let bit = value_index * width;
-        let byte = bit / 8;
-        let mut window = [0_u8; 16];
-        let available = (bytes.len() - byte).min(16);
-        window[..available].copy_from_slice(&bytes[byte..byte + available]);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            *value = (u128::from_le_bytes(window) >> (bit % 8)) as u64 & mask;
-        }
-    }
+    let (width, bytes) = unpack_header(decoder, value_count)?;
+    let mut values = Vec::with_capacity(value_count);
+    for_each_unpacked_group(bytes, width, value_count, |group| {
+        values.extend_from_slice(group);
+        Ok::<(), String>(())
+    })?;
     Ok(values)
 }
 
@@ -1057,12 +1129,93 @@ mod bit_reader_tests {
         framed
     }
 
+    /// The original value-at-a-time windowed decode, kept as the reference
+    /// every faster path is checked against.
+    fn unpack_windowed(decoder: &mut Decoder<'_>, value_count: usize) -> Vec<u64> {
+        let (width, bytes) = unpack_header(decoder, value_count).expect("header");
+        let width = width as usize;
+        let mask = width_mask(u32::try_from(width).expect("width"));
+        (0..value_count)
+            .map(|value_index| {
+                if width == 0 {
+                    return 0;
+                }
+                let bit = value_index * width;
+                let byte = bit / 8;
+                let mut window = [0_u8; 16];
+                let available = (bytes.len() - byte).min(16);
+                window[..available].copy_from_slice(&bytes[byte..byte + available]);
+                #[allow(clippy::cast_possible_truncation)]
+                let value = (u128::from_le_bytes(window) >> (bit % 8)) as u64 & mask;
+                value
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_width_and_tail_length_matches_the_windowed_reference() {
+        for width in 0_u8..=64 {
+            for count in [0_usize, 1, 63, 64, 65, 127, 128, 129, 1_000, 16_384] {
+                let framed = payload(width, count, u64::from(width) * 977 + count as u64);
+                let expected = unpack_windowed(&mut Decoder::new(&framed), count);
+                let grouped = unpack(&mut Decoder::new(&framed), count).expect("grouped unpack");
+                assert_eq!(expected, grouped, "width {width} count {count}");
+                let mut unsigned = Vec::new();
+                unpack_unsigned_into(&mut Decoder::new(&framed), count, 0, &mut unsigned)
+                    .expect("unsigned unpack");
+                assert_eq!(expected, unsigned, "width {width} count {count}");
+            }
+        }
+    }
+
+    /// Kernel timing: the value-at-a-time reader against the grouped
+    /// kernel over 16K-value blocks (a segment block) at the widths a
+    /// fixed-point amount, a date, a key and a code column pack to.
+    /// `cargo test --release -p pintail-store unpack_kernel_timings -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement: run explicitly with --ignored --nocapture"]
+    fn unpack_kernel_timings() {
+        const BLOCK: usize = 16_384;
+        const ROUNDS: usize = 400;
+        for width in [3_u8, 11, 17, 21, 32, 47] {
+            let framed = payload(width, BLOCK, u64::from(width));
+            let mut out = Vec::with_capacity(BLOCK);
+            let clock = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                out.clear();
+                let mut decoder = Decoder::new(&framed);
+                let (width, bytes) = unpack_header(&mut decoder, BLOCK).expect("header");
+                let mask = width_mask(width);
+                let mut reader = BitReader::new(bytes);
+                for _ in 0..BLOCK {
+                    out.push(7_u64.wrapping_add(reader.read(width, mask)));
+                }
+                std::hint::black_box(&out);
+            }
+            let reader_ns = clock.elapsed().as_secs_f64() * 1e9
+                / f64::from(u32::try_from(ROUNDS * BLOCK).expect("fits"));
+            let clock = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                out.clear();
+                unpack_unsigned_into(&mut Decoder::new(&framed), BLOCK, 7, &mut out)
+                    .expect("grouped");
+                std::hint::black_box(&out);
+            }
+            let grouped_ns = clock.elapsed().as_secs_f64() * 1e9
+                / f64::from(u32::try_from(ROUNDS * BLOCK).expect("fits"));
+            eprintln!(
+                "width {width:2}: reader {reader_ns:.3} ns/value, grouped {grouped_ns:.3} ns/value ({:.1}x)",
+                reader_ns / grouped_ns
+            );
+        }
+    }
+
     #[test]
     fn streaming_reader_matches_the_windowed_unpack() {
         for &width in &[0_u8, 1, 3, 7, 8, 13, 24, 31, 32, 33, 63, 64] {
             for &count in &[0_usize, 1, 2, 63, 64, 65, 2_290] {
                 let framed = payload(width, count, u64::from(width) * 31 + count as u64);
-                let expected = unpack(&mut Decoder::new(&framed), count).expect("windowed unpack");
+                let expected = unpack_windowed(&mut Decoder::new(&framed), count);
                 let mut streamed = Vec::new();
                 unpack_unsigned_into(&mut Decoder::new(&framed), count, 0, &mut streamed)
                     .expect("streaming unpack");
@@ -1083,7 +1236,7 @@ mod bit_reader_tests {
             let width = 8_u8;
             let count = 200_usize;
             let framed = payload(width, count, 7);
-            let normalized = unpack(&mut Decoder::new(&framed), count).expect("unpack");
+            let normalized = unpack_windowed(&mut Decoder::new(&framed), count);
             let expected: Result<Vec<i64>, String> = normalized
                 .iter()
                 .map(|value| {
