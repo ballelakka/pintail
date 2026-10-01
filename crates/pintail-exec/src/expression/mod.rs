@@ -1,4 +1,5 @@
 mod selection;
+pub(crate) use selection::pair_column_ranges;
 mod spatial;
 mod sql_regex;
 mod str_to_date;

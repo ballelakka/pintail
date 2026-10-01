@@ -5385,7 +5385,7 @@ fn build_operator_inner(
                 stream,
                 expected_types,
             };
-            for predicate in predicates {
+            for predicate in crate::expression::pair_column_ranges(predicates) {
                 operator = PullOperator::Filter {
                     input: Box::new(operator),
                     predicate,

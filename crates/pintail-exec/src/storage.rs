@@ -399,6 +399,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
                 prefetched: VecDeque::new(),
                 stream: None,
                 prewhere: None,
+                adopt_filter: None,
                 key_position: None,
                 started: true,
                 types,
@@ -599,6 +600,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
                 prefetched: VecDeque::new(),
                 stream: Some(stream),
                 prewhere,
+                adopt_filter: build_adopt_filter(scan, self.collation),
                 key_position,
                 started: false,
                 types,
@@ -677,6 +679,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
             prefetched: VecDeque::new(),
             stream: None,
             prewhere: None,
+            adopt_filter: None,
             key_position: None,
             started: true,
             types,
@@ -1014,6 +1017,67 @@ struct RuntimeRange {
     upper: i128,
 }
 
+/// A scan's predicates compiled over its whole projection, exactly as the
+/// Filters above it compile them, and answered by the packed kernels alone.
+struct AdoptFilter {
+    predicates: Vec<crate::expression::CompiledExpr>,
+    collation: Collation,
+}
+
+impl AdoptFilter {
+    /// Narrows `batch` to the rows every predicate keeps and reports whether
+    /// it did. A predicate the kernels do not answer (or that fails) leaves
+    /// the batch untouched and unmarked, and the Filters above decide its
+    /// rows - and raise its error - as they always have.
+    fn apply(&self, batch: &mut RecordBatch) -> bool {
+        let mut combined: Option<crate::SelectionMask> = None;
+        for predicate in &self.predicates {
+            let Ok(Some(mask)) = predicate.evaluate_filter_mask(batch) else {
+                return false;
+            };
+            combined = match combined {
+                None => Some(mask),
+                Some(mut existing) => {
+                    if existing.intersect(&mask).is_err() {
+                        return false;
+                    }
+                    Some(existing)
+                }
+            };
+        }
+        combined.is_some_and(|mask| batch.selection_mut().intersect(&mask).is_ok())
+    }
+}
+
+/// The adopt-time filter for a scan with predicates, compiled over the
+/// projection the way the plan compiles the Filters it stacks on the scan.
+fn build_adopt_filter(scan: &Scan, collation: Collation) -> Option<AdoptFilter> {
+    if scan.predicates.is_empty() {
+        return None;
+    }
+    let columns = scan
+        .projected_column_ids
+        .iter()
+        .map(|id| {
+            scan.table
+                .columns
+                .iter()
+                .find(|column| column.column_id == *id)
+                .cloned()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let predicates = scan
+        .predicates
+        .iter()
+        .map(|predicate| crate::expression::CompiledExpr::compile(predicate, &columns, collation))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(AdoptFilter {
+        predicates: crate::expression::pair_column_ranges(predicates),
+        collation,
+    })
+}
+
 /// Column types whose values are wide enough that decoding them for every
 /// row costs more than the narrow predicates beside them: a test on one of
 /// these waits until the narrow tests have chosen rows.
@@ -1039,6 +1103,12 @@ struct SnapshotStream {
     columns: Vec<DecodedColumn>,
     column_rows: usize,
     prewhere: Option<PrewhereSpec>,
+    /// The scan's predicates over the full projection, tested on the
+    /// worker that adopts each chunk. A batch every one of them answered
+    /// leaves with its selection already narrowed and marked prefiltered,
+    /// so the Filters above pass it untested instead of testing it on the
+    /// single thread that pulls batches.
+    adopt_filter: Option<AdoptFilter>,
     /// Projected position of the table's single primary-key column, when
     /// projected — the only column a probe-side restriction can prune on.
     key_position: Option<usize>,
@@ -1255,7 +1325,10 @@ fn scan_signature(instance: u64, scan: &Scan) -> String {
 
 impl BatchStream for SnapshotStream {
     fn prefilter_collation(&self) -> Option<Collation> {
-        self.prewhere.as_ref().map(|spec| spec.collation)
+        self.prewhere
+            .as_ref()
+            .map(|spec| spec.collation)
+            .or_else(|| self.adopt_filter.as_ref().map(|filter| filter.collation))
     }
 
     fn last_batch_prefiltered(&self) -> bool {
@@ -1387,13 +1460,27 @@ impl BatchStream for SnapshotStream {
                     .into_par_iter()
                     .map(|chunk| {
                         let prefiltered = chunk.prefiltered();
-                        adopt_chunk(chunk, &self.types, &self.enum_labels, &self.set_members)
-                            .map(|(batches, bytes)| (batches, bytes, prefiltered))
+                        adopt_chunk(chunk, &self.types, &self.enum_labels, &self.set_members).map(
+                            |(batches, bytes)| {
+                                let batches = batches
+                                    .into_iter()
+                                    .map(|mut batch| {
+                                        let passed = prefiltered
+                                            || self
+                                                .adopt_filter
+                                                .as_ref()
+                                                .is_some_and(|filter| filter.apply(&mut batch));
+                                        (batch, passed)
+                                    })
+                                    .collect::<Vec<_>>();
+                                (batches, bytes)
+                            },
+                        )
                     })
                     .collect::<Result<Vec<_>, ExecError>>()?;
-                for (batches, chunk_bytes, prefiltered) in adopted {
+                for (batches, chunk_bytes) in adopted {
                     released = released.saturating_add(chunk_bytes);
-                    for batch in batches {
+                    for (batch, prefiltered) in batches {
                         self.retained_bytes =
                             self.retained_bytes.saturating_add(batch.estimated_bytes());
                         self.ready.push_back((batch, prefiltered));
@@ -2053,6 +2140,7 @@ fn build_prewhere_spec(
         .map(|predicate| crate::expression::CompiledExpr::compile(predicate, &layout, collation))
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
+    let predicates = crate::expression::pair_column_ranges(predicates);
     let wide_projection = scan.projected_column_ids.iter().any(|id| {
         snapshot
             .schema()

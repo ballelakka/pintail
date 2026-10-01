@@ -3,6 +3,7 @@
 //! each test in its own process, so the merge shares no state between them.
 
 mod admission;
+mod adopt_filter;
 mod binary_bit_aggregates;
 mod build_keys_through_joins;
 mod clustered_build_keys;
