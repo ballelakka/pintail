@@ -4,6 +4,7 @@
 
 mod admission;
 mod adopt_filter;
+mod aggregate_path_survey;
 mod binary_bit_aggregates;
 mod block_skip_bench;
 mod block_value_skipping;
