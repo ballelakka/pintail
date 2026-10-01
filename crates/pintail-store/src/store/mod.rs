@@ -7,7 +7,7 @@ mod statistics;
 
 pub use scan::{
     ColumnValidity, DecodedColumn, PrewhereRanges, PrewhereSelect, ProjectedColumnChunk,
-    ProjectedRow, ProjectedScan, ProjectedScanStream, ProjectedValueChunk, ScanStats,
+    ProjectedRow, ProjectedScan, ProjectedScanStream, ProjectedValueChunk, ScanStats, ValidityIter,
 };
 pub use side_index::{
     IndexKey, IndexLookup, IndexProbe, TextKeyFn, TextKeyer, override_side_index,

@@ -804,7 +804,7 @@ pub enum ColumnValidity {
 
 impl<'validity> IntoIterator for &'validity ColumnValidity {
     type Item = bool;
-    type IntoIter = Box<dyn Iterator<Item = bool> + 'validity>;
+    type IntoIter = ValidityIter<'validity>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -851,11 +851,12 @@ impl ColumnValidity {
         }
     }
 
+    /// Per-row validity, without a call through a trait object per row.
     #[must_use]
-    pub fn iter(&self) -> Box<dyn Iterator<Item = bool> + '_> {
+    pub fn iter(&self) -> ValidityIter<'_> {
         match self {
-            Self::AllValid(count) => Box::new(std::iter::repeat_n(true, *count)),
-            Self::Bytes(bytes) => Box::new(bytes.iter().copied()),
+            Self::AllValid(count) => ValidityIter::AllValid(std::iter::repeat_n(true, *count)),
+            Self::Bytes(bytes) => ValidityIter::Bytes(bytes.iter().copied()),
         }
     }
 
@@ -882,6 +883,36 @@ impl ColumnValidity {
         }
     }
 }
+
+/// Iterator over a [`ColumnValidity`]'s rows, `true` = non-null.
+#[derive(Clone, Debug)]
+pub enum ValidityIter<'validity> {
+    /// Every row valid.
+    AllValid(std::iter::RepeatN<bool>),
+    /// One byte per row.
+    Bytes(std::iter::Copied<std::slice::Iter<'validity, bool>>),
+}
+
+impl Iterator for ValidityIter<'_> {
+    type Item = bool;
+
+    #[inline]
+    fn next(&mut self) -> Option<bool> {
+        match self {
+            Self::AllValid(rows) => rows.next(),
+            Self::Bytes(rows) => rows.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::AllValid(rows) => rows.size_hint(),
+            Self::Bytes(rows) => rows.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for ValidityIter<'_> {}
 
 /// Moves the first `count` elements out of `values` into a vector sized to
 /// exactly `count`, leaving the tail in place.
