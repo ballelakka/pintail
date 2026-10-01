@@ -3904,10 +3904,20 @@ fn compact_decoded_column(
     selected: usize,
 ) {
     fn compact<T: Copy>(values: &mut Vec<T>, ranges: &[std::ops::Range<usize>]) {
+        // A scattered filter keeps runs of a row or two; a memmove call per
+        // run cost more than the copy, so short runs move value by value.
+        const SHORT_RUN: usize = 16;
         let mut written = 0;
         for range in ranges {
-            values.copy_within(range.clone(), written);
-            written += range.len();
+            if range.len() <= SHORT_RUN {
+                for row in range.clone() {
+                    values[written] = values[row];
+                    written += 1;
+                }
+            } else {
+                values.copy_within(range.clone(), written);
+                written += range.len();
+            }
         }
         values.truncate(written);
         values.shrink_to_fit();

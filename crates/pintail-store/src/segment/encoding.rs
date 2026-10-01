@@ -1225,6 +1225,78 @@ pub(super) fn unpack_into(
     })
 }
 
+/// The bit width of the packed payload `decoder` stands at, read from a
+/// copy so the payload is still there to decode.
+pub(super) fn packed_width(decoder: &Decoder<'_>) -> Result<u32, String> {
+    let width = decoder.clone().u8()?;
+    if width > 64 {
+        return Err(format!("invalid bit width {width}"));
+    }
+    Ok(u32::from(width))
+}
+
+/// The largest normalized value a payload of `width` bits can hold.
+pub(super) const fn packed_ceiling(width: u32) -> u64 {
+    width_mask(width)
+}
+
+/// Decodes the 64-value groups of a packed payload of `value_count` values
+/// whose word in `words` (bit `i` of word `g` standing for value
+/// `64 * g + i`) has any bit set, handing `sink` each such group's values
+/// with its word. Groups no bit selects are skipped undecoded; the whole
+/// payload is still consumed and its length checked.
+///
+/// Groups start on byte boundaries (64 values of `width` bits are `width`
+/// words), so a group decodes straight from its offset.
+pub(super) fn for_each_selected_group(
+    decoder: &mut Decoder<'_>,
+    value_count: usize,
+    words: &[u64],
+    mut sink: impl FnMut(&[u64], u64),
+) -> Result<(), String> {
+    let (width, bytes) = unpack_header(decoder, value_count)?;
+    if words.len() < value_count.div_ceil(GROUP) {
+        return Err("selection words are shorter than the payload".to_owned());
+    }
+    let whole_groups = value_count / GROUP;
+    let group_bytes = GROUP * width as usize / 8;
+    let mut buffer = [0_u64; GROUP];
+    let mut group = 0;
+    while group < whole_groups {
+        if words[group] == 0 {
+            group += 1;
+            continue;
+        }
+        // A run of selected groups decodes in one call.
+        let first = group;
+        while group < whole_groups && words[group] != 0 {
+            group += 1;
+        }
+        let mut at = first;
+        unpack_whole_groups(
+            width,
+            &bytes[first * group_bytes..],
+            group - first,
+            &mut buffer,
+            &mut |values: &[u64]| {
+                sink(values, words[at]);
+                at += 1;
+                Ok::<(), String>(())
+            },
+        )?;
+    }
+    let rest = value_count - whole_groups * GROUP;
+    if rest > 0 && words[whole_groups] != 0 {
+        let mut reader = BitReader::new(&bytes[whole_groups * group_bytes..]);
+        let mask = width_mask(width);
+        for value in &mut buffer[..rest] {
+            *value = reader.read(width, mask);
+        }
+        sink(&buffer[..rest], words[whole_groups]);
+    }
+    Ok(())
+}
+
 pub(super) fn unpack(decoder: &mut Decoder<'_>, value_count: usize) -> Result<Vec<u64>, String> {
     let (width, bytes) = unpack_header(decoder, value_count)?;
     let mut values = Vec::with_capacity(value_count);
@@ -1299,6 +1371,46 @@ mod bit_reader_tests {
                 unpack_unsigned_into(&mut Decoder::new(&framed), count, 0, &mut unsigned)
                     .expect("unsigned unpack");
                 assert_eq!(expected, unsigned, "width {width} count {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_groups_hand_over_exactly_their_values() {
+        for width in [0_u8, 1, 7, 11, 21, 32, 33, 63, 64] {
+            for count in [0_usize, 1, 63, 64, 65, 129, 1_000] {
+                let framed = payload(width, count, u64::from(width) * 31 + count as u64);
+                let expected = unpack_windowed(&mut Decoder::new(&framed), count);
+                let groups = count.div_ceil(64);
+                for pattern in 0..4_u64 {
+                    let words: Vec<u64> = (0..groups as u64)
+                        .map(|group| match pattern {
+                            0 => u64::MAX,
+                            1 => 0,
+                            2 => 0x8000_0000_0000_0001 * (group % 2),
+                            _ => 0x0101_0101_0101_0101 << (group % 8),
+                        })
+                        .collect();
+                    let mut picked = Vec::new();
+                    let mut decoder = Decoder::new(&framed);
+                    for_each_selected_group(&mut decoder, count, &words, |values, word| {
+                        for (index, value) in values.iter().enumerate() {
+                            if word >> index & 1 == 1 {
+                                picked.push(*value);
+                            }
+                        }
+                    })
+                    .expect("selected unpack");
+                    decoder.finish().expect("payload consumed");
+                    let want: Vec<u64> = (0..count)
+                        .filter(|row| words[row / 64] >> (row % 64) & 1 == 1)
+                        .map(|row| expected[row])
+                        .collect();
+                    assert_eq!(
+                        picked, want,
+                        "width {width} count {count} pattern {pattern}"
+                    );
+                }
             }
         }
     }

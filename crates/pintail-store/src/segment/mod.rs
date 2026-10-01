@@ -5,9 +5,10 @@ use encoding::decompress_block;
 use encoding::{
     FRAME_ENTRY_BYTES, FRAMED_MINIMUM_BYTES, compare_cells, compress_block_for_storage,
     compress_framed_for_storage, decode_integer_base, decode_payload, decoded_heap_upper_bound,
-    decompress_block_into, decompress_frame, encode_payload, framed_head_digest, hll_registers,
-    parse_frame_directory, select_encoding, unpack_delta_each, unpack_delta_into, unpack_into,
-    unpack_signed_into, unpack_unsigned_into,
+    decompress_block_into, decompress_frame, encode_payload, for_each_selected_group,
+    framed_head_digest, hll_registers, packed_ceiling, packed_width, parse_frame_directory,
+    select_encoding, unpack_delta_each, unpack_delta_into, unpack_into, unpack_signed_into,
+    unpack_unsigned_into,
 };
 
 use std::{
@@ -4133,6 +4134,12 @@ fn decode_int_payload_into(
         decoder.finish()?;
         return Ok(true);
     }
+    if non_null_count == row_count
+        && decode_selected_into(&mut decoder, builder, &ranges, base, row_count)?
+    {
+        decoder.finish()?;
+        return Ok(true);
+    }
     // Decoded into this thread's reused buffer: a fresh 128 KiB vector per
     // block faulted its pages in again on every block of a filtered scan.
     let mut normalized = UNPACK_SCRATCH.with(std::cell::RefCell::take);
@@ -4152,9 +4159,104 @@ fn decode_int_payload_into(
     placed
 }
 
+/// A partly selected block with no NULLs, straight into a typed builder:
+/// the selection becomes one bit per row, each 64-row group any bit selects
+/// is unpacked into a stack buffer, and its selected values append from
+/// there. Returns `false`, with nothing consumed or placed, when the builder
+/// is not integer-typed or when the payload's widest value could leave the
+/// destination type; the caller's row walk then raises the overflow for
+/// exactly the rows it would have.
+///
+/// A filter that keeps rows scattered through a block hands it thousands of
+/// one- and two-row ranges. Unpacking the whole block into a scratch vector
+/// and copying range by range paid a call and a validity update per range,
+/// and a max scan over every row to rule out overflow; the per-group loop
+/// reads each value once, while the group is in cache.
+fn decode_selected_into(
+    decoder: &mut Decoder<'_>,
+    builder: &mut ColumnBuilder,
+    ranges: &RangeCursor,
+    base: i128,
+    row_count: usize,
+) -> Result<bool, String> {
+    let ceiling = i128::from(packed_ceiling(packed_width(decoder)?));
+    let Some(destination) = builder.int_bulk() else {
+        return Ok(false);
+    };
+    let fits = match &destination {
+        IntBulkDestination::Signed { .. } => {
+            base >= i128::from(i64::MIN) && base + ceiling <= i128::from(i64::MAX)
+        }
+        IntBulkDestination::Unsigned { .. } => base >= 0 && base + ceiling <= i128::from(u64::MAX),
+    };
+    if !fits {
+        return Ok(false);
+    }
+    let mut words = SELECTION_SCRATCH.with(std::cell::RefCell::take);
+    words.clear();
+    words.resize(row_count.div_ceil(64), 0);
+    for &(lo, hi) in &ranges.ranges {
+        let hi = hi.min(row_count);
+        if lo >= hi {
+            continue;
+        }
+        let (mut row, end) = (lo, hi);
+        while row < end {
+            let word = row / 64;
+            let offset = row % 64;
+            let take = (64 - offset).min(end - row);
+            let bits = if take == 64 {
+                u64::MAX
+            } else {
+                ((1_u64 << take) - 1) << offset
+            };
+            words[word] |= bits;
+            row += take;
+        }
+    }
+    // Counted from the bits, so ranges that touch or overlap count once.
+    let selected = words.iter().map(|word| word.count_ones() as usize).sum();
+    let outcome = match destination {
+        IntBulkDestination::Signed { values, validity } => {
+            #[allow(clippy::cast_possible_truncation)]
+            let base = base as i64;
+            values.reserve(selected);
+            let placed = for_each_selected_group(decoder, row_count, &words, |group, word| {
+                let mut bits = word;
+                while bits != 0 {
+                    #[allow(clippy::cast_possible_wrap)]
+                    values.push(base.wrapping_add(group[bits.trailing_zeros() as usize] as i64));
+                    bits &= bits - 1;
+                }
+            });
+            validity.extend_valid(selected);
+            placed
+        }
+        IntBulkDestination::Unsigned { values, validity } => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let base = base as u64;
+            values.reserve(selected);
+            let placed = for_each_selected_group(decoder, row_count, &words, |group, word| {
+                let mut bits = word;
+                while bits != 0 {
+                    values.push(base.wrapping_add(group[bits.trailing_zeros() as usize]));
+                    bits &= bits - 1;
+                }
+            });
+            validity.extend_valid(selected);
+            placed
+        }
+    };
+    SELECTION_SCRATCH.with(|slot| *slot.borrow_mut() = words);
+    outcome.map(|()| true)
+}
+
 thread_local! {
     /// Normalized values of the integer block a scan thread is placing.
     static UNPACK_SCRATCH: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// One bit per row of the block a scan thread is placing selectively.
+    static SELECTION_SCRATCH: std::cell::RefCell<Vec<u64>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -6825,5 +6927,97 @@ mod packed_decode_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bit_packed_selection_tests {
+    use super::*;
+
+    /// A partly selected bit-packed block decodes into the builder exactly
+    /// as the general decode followed by the same selection does.
+    fn check(logical_type: LogicalType, nullable: bool, value: fn(usize) -> Cell) {
+        let count = 4_100_usize;
+        let scattered: Vec<(usize, usize)> = (0..count)
+            .filter(|row| (row * 7_919) % 5 == 0)
+            .map(|row| (row, row + 1))
+            .collect();
+        let selections = [
+            scattered,
+            vec![(0, 1), (63, 65), (130, 900), (4_095, count)],
+            vec![(1_000, 1_001)],
+            vec![(64, 128), (4_096, 4_200)],
+            Vec::new(),
+        ];
+        let mut bitmap = vec![0_u8; count.div_ceil(8)];
+        let cells: Vec<Cell> = (0..count)
+            .filter_map(|row| {
+                if nullable && row % 13 == 0 {
+                    bitmap[row / 8] |= 1 << (row % 8);
+                    return None;
+                }
+                Some(value(row))
+            })
+            .collect();
+        let payload = encode_payload(logical_type, Encoding::BitPacked, &cells).expect("encode");
+        let decoded = decode_payload(&payload, logical_type, Encoding::BitPacked, cells.len())
+            .expect("general decode");
+        for ranges in selections {
+            let mut expected = ColumnBuilder::new_for_column(logical_type, None, count);
+            let mut values = decoded.clone().into_iter();
+            for row in 0..count {
+                let cell = if bitmap[row / 8] & (1 << (row % 8)) != 0 {
+                    Cell::Null
+                } else {
+                    values.next().expect("value")
+                };
+                if ranges.iter().any(|&(lo, hi)| (lo..hi).contains(&row)) {
+                    expected.push(cell).expect("push");
+                }
+            }
+            let mut actual = ColumnBuilder::new_for_column(logical_type, None, count);
+            assert!(
+                decode_int_payload_into(
+                    &payload,
+                    logical_type,
+                    Encoding::BitPacked,
+                    count,
+                    cells.len(),
+                    &bitmap,
+                    IntSink {
+                        builder: &mut actual,
+                        ranges: RangeCursor::new(ranges.clone())
+                    }
+                )
+                .expect("direct decode")
+            );
+            assert_eq!(
+                actual.finish().into_values(),
+                expected.finish().into_values(),
+                "nullable {nullable} ranges {}",
+                ranges.len()
+            );
+        }
+    }
+
+    #[test]
+    fn signed_blocks_select_rows_exactly() {
+        let small = |row: usize| Cell::Int64(i64::try_from(row * 37 % 1_901).expect("small") - 900);
+        check(LogicalType::Int64, false, small);
+        check(LogicalType::Int64, true, small);
+        // The widest value the payload could hold leaves i64: the checked
+        // row walk places these instead.
+        let near_top =
+            |row: usize| Cell::Int64(i64::MAX - i64::try_from(row % 3_000).expect("small"));
+        check(LogicalType::Int64, false, near_top);
+    }
+
+    #[test]
+    fn unsigned_blocks_select_rows_exactly() {
+        let wide = |row: usize| Cell::UInt64((1_u64 << 63) + (row as u64 * 7_919) % 100_003);
+        check(LogicalType::UInt64, false, wide);
+        check(LogicalType::UInt64, true, wide);
+        let near_top = |row: usize| Cell::UInt64(u64::MAX - (row as u64 % 3_000));
+        check(LogicalType::UInt64, false, near_top);
     }
 }

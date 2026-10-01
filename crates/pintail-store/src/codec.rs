@@ -53,6 +53,7 @@ impl Encoder {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Decoder<'a> {
     bytes: &'a [u8],
     position: usize,
