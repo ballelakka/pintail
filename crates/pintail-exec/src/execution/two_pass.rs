@@ -2971,24 +2971,7 @@ fn dense_packed_chunk(
             }
         }
         if unpacked {
-            let readers = lane_readers(batch, lanes);
-            for (row, slot) in batch.selection().selected_rows().zip(&slots) {
-                let states = acc[*slot as usize]
-                    .get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
-                for (index, (((state, reader), lane), aggregate)) in states
-                    .iter_mut()
-                    .zip(&readers)
-                    .zip(lanes)
-                    .zip(aggregates)
-                    .enumerate()
-                {
-                    if packed[index].is_none()
-                        && let Some(bits) = reader.bits(row)
-                    {
-                        apply_two_pass_lane(state, lane, aggregate, bits, memory)?;
-                    }
-                }
-            }
+            apply_unpacked_lanes(batch, &slots, lanes, packed, aggregates, acc, memory)?;
         }
     }
     for (slot, entry) in acc.iter_mut().enumerate() {
@@ -3399,22 +3382,75 @@ fn dense_date_parts_packed_batch(
         }
     }
     if packed.iter().any(Option::is_none) {
-        let readers = lane_readers(batch, lanes);
-        for (row, slot) in batch.selection().selected_rows().zip(&slots) {
-            let states = acc[*slot as usize]
-                .get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
-            for (index, (((state, reader), lane), aggregate)) in states
-                .iter_mut()
-                .zip(&readers)
-                .zip(lanes)
-                .zip(aggregates)
-                .enumerate()
-            {
-                if packed[index].is_none()
-                    && let Some(bits) = reader.bits(row)
-                {
-                    apply_two_pass_lane(state, lane, aggregate, bits, memory)
-                        .map_err(DenseFold::Exec)?;
+        apply_unpacked_lanes(batch, &slots, lanes, packed, aggregates, acc, memory)
+            .map_err(DenseFold::Exec)?;
+    }
+    Ok(())
+}
+
+/// Applies the lanes that are not packed to the dense slots' states, one
+/// lane at a time: each lane's reader and kind resolve once per batch, and
+/// a COUNT(DISTINCT) over a packed integer column inserts straight from it.
+/// Every lane still sees its rows in row order, so each state ends exactly
+/// where the row-at-a-time loop left it.
+fn apply_unpacked_lanes(
+    batch: &RecordBatch,
+    slots: &[u32],
+    lanes: &[TwoPassLane],
+    packed: &[Option<PackedLane>],
+    aggregates: &[CompiledAggregate],
+    acc: &mut DenseGroupSlots,
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
+    for slot in slots {
+        acc[*slot as usize]
+            .get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
+    }
+    let readers = lane_readers(batch, lanes);
+    for (index, ((lane, aggregate), reader)) in
+        lanes.iter().zip(aggregates).zip(&readers).enumerate()
+    {
+        if packed[index].is_some() {
+            continue;
+        }
+        // The key a distinct lane dedups on, from its column's bits: the
+        // conversion `apply_two_pass_lane` makes.
+        let distinct_key = |bits: u64| -> Option<i128> {
+            match lane {
+                TwoPassLane::Distinct { data_type, .. } => Some(if *data_type == DataType::Int64 {
+                    i128::from(i64::from_ne_bytes(bits.to_ne_bytes()))
+                } else {
+                    i128::from(bits)
+                }),
+                _ => None,
+            }
+        };
+        macro_rules! distinct_from {
+            ($values:expr, $validity:expr, $bits:expr) => {
+                for (row, slot) in batch.selection().selected_rows().zip(slots) {
+                    if $validity.is_valid(row) {
+                        let key = distinct_key($bits($values[row])).expect("distinct lane");
+                        acc[*slot as usize].as_mut().expect("states made above")[index]
+                            .update_distinct_count_int(key, memory)?;
+                    }
+                }
+            };
+        }
+        match (lane, reader) {
+            (TwoPassLane::Distinct { .. }, LaneReader::Int64(values, validity)) => {
+                distinct_from!(values, validity, |value: i64| u64::from_ne_bytes(
+                    value.to_ne_bytes()
+                ));
+            }
+            (TwoPassLane::Distinct { .. }, LaneReader::UInt64(values, validity)) => {
+                distinct_from!(values, validity, |value: u64| value);
+            }
+            _ => {
+                for (row, slot) in batch.selection().selected_rows().zip(slots) {
+                    if let Some(bits) = reader.bits(row) {
+                        let states = acc[*slot as usize].as_mut().expect("states made above");
+                        apply_two_pass_lane(&mut states[index], lane, aggregate, bits, memory)?;
+                    }
                 }
             }
         }

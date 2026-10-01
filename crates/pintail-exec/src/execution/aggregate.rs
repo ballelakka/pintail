@@ -244,6 +244,25 @@ impl std::hash::Hasher for GroupKeyHasher {
 pub(super) type GroupKeyMap =
     HashMap<(u64, bool), Vec<AggregateState>, std::hash::BuildHasherDefault<GroupKeyHasher>>;
 
+/// A zeroed vector whose pages are written as it is made. Memory asked for
+/// zeroed can come back as fresh pages the kernel maps to its shared zero
+/// page, so the first read-modify-write of each page - a bitmap insert, a
+/// counter bump - faults twice, and the second fault copies the zero page
+/// and flushes the TLB of every core the process runs on. Writing the
+/// zeros first takes a single plain fault per page.
+pub(super) fn written_zeros<T: Copy + Default>(len: usize) -> Vec<T> {
+    let mut values = Vec::with_capacity(len);
+    // Hidden from the optimizer, which would otherwise fold the allocation
+    // and the fill back into one zeroed allocation.
+    std::hint::black_box(&mut values);
+    values.resize(len, T::default());
+    values
+}
+
+fn written_zero_words(len: usize) -> Vec<u64> {
+    written_zeros(len)
+}
+
 fn int_distinct_key(value: &Value) -> Option<i128> {
     match value {
         Value::Int64(value) => Some(i128::from(*value)),
@@ -389,7 +408,7 @@ impl DistinctSeen {
             usize::try_from(*max - base).expect("checked under DISTINCT_BITMAP_MAX_SPAN") + 1;
         let words = span.div_ceil(64);
         memory.reserve(words.saturating_mul(size_of::<u64>()))?;
-        let mut bits = vec![0_u64; words];
+        let mut bits = written_zero_words(words);
         let count = set.len();
         for key in set.iter() {
             let offset = usize::try_from(key - base).expect("within the span just computed");
@@ -426,7 +445,7 @@ impl DistinctSeen {
                 .saturating_sub(bits.len())
                 .saturating_mul(size_of::<u64>()),
         )?;
-        let mut new_bits = vec![0_u64; new_words];
+        let mut new_bits = written_zero_words(new_words);
         for key in bitmap_members(*min, bits) {
             let offset = usize::try_from(key - new_min).expect("within the new span");
             new_bits[offset / 64] |= 1_u64 << (offset % 64);
@@ -558,7 +577,7 @@ impl DistinctSeen {
                             .saturating_sub(mine.bits.len())
                             .saturating_mul(size_of::<u64>()),
                     )?;
-                    let mut bits = vec![0_u64; words];
+                    let mut bits = written_zero_words(words);
                     let shift = usize::try_from((mine.min - low) / 64).expect("aligned offset");
                     bits[shift..shift + mine.bits.len()].copy_from_slice(&mine.bits);
                     mine.bits = bits;

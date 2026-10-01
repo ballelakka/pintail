@@ -15,7 +15,7 @@
 
 use std::ops::Range;
 
-use super::aggregate::{AggregateState, CompiledAggregate};
+use super::aggregate::{AggregateState, CompiledAggregate, written_zeros};
 use super::two_pass::{LaneReader, PackedCell, PackedLane, TwoPassLane};
 use super::{ExecError, MemoryTracker};
 use crate::RecordBatch;
@@ -137,7 +137,7 @@ fn fold_units<const OP: u8>(
 
 fn lane_nulls(nulls: &mut Vec<u64>, slot_count: usize) -> &mut [u64] {
     if nulls.is_empty() {
-        nulls.resize(slot_count, 0);
+        *nulls = written_zeros(slot_count);
     }
     nulls
 }
@@ -181,12 +181,12 @@ impl PackedFold {
         Self {
             slot_count,
             lanes: lanes.to_vec(),
-            counts: vec![0; slot_count],
+            counts: written_zeros(slot_count),
             totals: lanes
                 .iter()
                 .map(|lane| {
                     if keeps_total(*lane) {
-                        vec![identity(*lane); slot_count]
+                        filled(slot_count, identity(*lane))
                     } else {
                         Vec::new()
                     }
@@ -381,4 +381,14 @@ pub(super) fn commit_merged(
         cell.commit(lane, state, aggregate, memory)?;
     }
     Ok(())
+}
+
+/// `len` copies of `value`, written as they are made (see [`written_zeros`]:
+/// a zero identity would otherwise come back as untouched zero pages).
+fn filled(len: usize, value: i128) -> Vec<i128> {
+    let mut values = written_zeros(len);
+    if value != 0 {
+        values.fill(value);
+    }
+    values
 }
