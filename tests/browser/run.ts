@@ -883,8 +883,14 @@ async function main() {
     const barDeadline = Date.now() + 30_000
     let observed: 'bar' | 'finished' | null = null
     while (observed === null) {
-      if ((await progress.count()) > 0) {
-        const label = (await progress.textContent()) ?? ''
+      // One read, no wait: a count() followed by textContent() raced the
+      // copy - the bar unmounted between the two calls and textContent()
+      // then waited out its 20s timeout for an element that was gone for
+      // good. allTextContents() returns what is rendered at this instant,
+      // so a bar is either seen with its label or not seen at all.
+      const labels = await progress.allTextContents()
+      if (labels.length > 0) {
+        const label = labels[0] ?? ''
         if (!/rows copied/.test(label)) {
           throw new Error(`progress rendered without its row count: ${JSON.stringify(label)}`)
         }
