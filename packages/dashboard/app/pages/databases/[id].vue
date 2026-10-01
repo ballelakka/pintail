@@ -7,7 +7,7 @@ import type { DlqRecord, QueryResponse, SnapshotStatus, TableSummary } from '@/t
 const route = useRoute()
 const router = useRouter()
 const { request } = usePintailApi()
-const { databases, statuses, deadLetters, error, loading, loadControlPlane, setMode, setReconcileInterval, forceSnapshot, resetDatabase, runTableAction, removeTable, discardDlq, retryDlq, tableProgress, seedTableProgress, sessionEpoch } = useControlPlane()
+const { databases, databasesLoaded, statuses, deadLetters, error, loading, loadControlPlane, setMode, setReconcileInterval, forceSnapshot, resetDatabase, runTableAction, removeTable, discardDlq, retryDlq, tableProgress, seedTableProgress, sessionEpoch } = useControlPlane()
 
 const databaseId = computed(() => String(route.params.id))
 const database = computed(() => databases.value.find((item) => item.id === databaseId.value) ?? null)
@@ -526,7 +526,7 @@ function describeTable(table: TableSummary) {
     </Tabs>
   </section>
   <section v-else class="mx-auto w-full max-w-[88rem] px-4 py-10 sm:px-6">
-    <Skeleton v-if="loading" class="h-96" />
+    <Skeleton v-if="loading || !databasesLoaded" class="h-96" />
     <div v-else class="text-muted-foreground grid min-h-80 place-content-center justify-items-center gap-2 text-center">
       <strong class="text-foreground">Database not found</strong>
       <Button variant="link" as-child><NuxtLink to="/databases">Back to databases</NuxtLink></Button>

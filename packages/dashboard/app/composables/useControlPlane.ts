@@ -81,6 +81,12 @@ export function useControlPlane() {
     () => ({}),
   )
   const loading = useState('cp-loading', () => false)
+  /// Whether the database list has been fetched for this session. `loading`
+  /// is shared with pages that run their own requests, so it can read false
+  /// while the list is still on its way - right after a restart, when the
+  /// list is the slow request - and a page that looked a database up in the
+  /// empty list then reported it missing. "Not found" needs this to be true.
+  const databasesLoaded = useState('cp-databases-loaded', () => false)
   /// Bumped whenever the session's identity changes (workspace switch,
   /// logout). Async loaders capture it when they start and refuse to write
   /// state once it has moved, so a late response from the previous workspace
@@ -131,6 +137,7 @@ export function useControlPlane() {
       ])
       if (epoch !== sessionEpoch.value) return
       databases.value = databaseRows
+      databasesLoaded.value = true
       activity.value = activityRows
       deadLetters.value = dlqRows
       nodeStorage.value = storage
@@ -227,6 +234,7 @@ export function useControlPlane() {
     session.value = null
     error.value = ''
     databases.value = []
+    databasesLoaded.value = false
     statuses.value = {}
     activity.value = []
     deadLetters.value = []
@@ -641,6 +649,7 @@ export function useControlPlane() {
     nodeStatus,
     nodeStorage,
     databases,
+    databasesLoaded,
     statuses,
     activity,
     deadLetters,
