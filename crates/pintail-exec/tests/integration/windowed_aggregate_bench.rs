@@ -2,8 +2,9 @@
 //! table whose event time rises with its key: the window selects a few
 //! hundred thousand to a little over a million rows out of twenty million,
 //! so the scan skips most blocks and the aggregate is what is left to pay
-//! for. Ungrouped, grouped by a low-cardinality text column and grouped by
-//! the day, over a seven-day and a thirty-day window. Every answer is
+//! for. Ungrouped, grouped by a low-cardinality text column, by the day (as
+//! `DATE()` and as `DATE_FORMAT()`), by the hour, and by year and month,
+//! over a seven-day and a thirty-day window. Every answer is
 //! checked against a direct computation over the generator.
 //!
 //! Ignored: a measurement, not a gate. Run with
@@ -167,6 +168,8 @@ enum Grouping {
     None,
     Channel,
     Day,
+    Hour,
+    YearMonth,
 }
 
 /// The window's ids: `occurred_at` between `from` and `to` seconds, both
@@ -182,6 +185,8 @@ fn expected(rows: u64, from: u64, to: u64, grouping: Grouping, shape: Shape) -> 
             Grouping::None => String::new(),
             Grouping::Channel => CHANNELS[channel(id)].to_owned(),
             Grouping::Day => timestamp(id * STEP_SECONDS)[..10].to_owned(),
+            Grouping::Hour => timestamp(id * STEP_SECONDS)[11..13].to_owned(),
+            Grouping::YearMonth => timestamp(id * STEP_SECONDS)[..7].to_owned(),
         };
         groups.entry(key).or_default().add(id);
     }
@@ -195,6 +200,17 @@ fn expected(rows: u64, from: u64, to: u64, grouping: Grouping, shape: Shape) -> 
         .iter()
         .map(|(key, totals)| match grouping {
             Grouping::None => totals.row(shape),
+            Grouping::YearMonth => format!(
+                "{}|{}|{}",
+                &key[..4],
+                key[5..].parse::<u32>().expect("month"),
+                totals.row(shape)
+            ),
+            Grouping::Hour => format!(
+                "{}|{}",
+                key.parse::<u32>().expect("hour"),
+                totals.row(shape)
+            ),
             _ => format!("{key}|{}", totals.row(shape)),
         })
         .collect()
@@ -287,7 +303,7 @@ fn aggregates_over_a_recent_window() {
 
     let span = (rows - 1) * STEP_SECONDS;
     let full = "COUNT(*), SUM(price), AVG(price), MIN(occurred_at), MAX(occurred_at)";
-    let cases: [(&str, Grouping, Shape, String); 6] = [
+    let cases: [(&str, Grouping, Shape, String); 8] = [
         (
             "count+sum",
             Grouping::None,
@@ -332,6 +348,23 @@ fn aggregates_over_a_recent_window() {
             Shape::Daily,
             "SELECT DATE_FORMAT(occurred_at, '%Y-%m-%d') AS d, COUNT(*), SUM(price) \
              FROM events WHERE {window} GROUP BY d ORDER BY d"
+                .to_owned(),
+        ),
+        (
+            "by hour, full",
+            Grouping::Hour,
+            Shape::Full,
+            format!(
+                "SELECT HOUR(occurred_at) AS h, {full} FROM events WHERE {{window}} \
+                 GROUP BY h ORDER BY h"
+            ),
+        ),
+        (
+            "by year, month (two-pass)",
+            Grouping::YearMonth,
+            Shape::Daily,
+            "SELECT YEAR(occurred_at) AS y, MONTH(occurred_at) AS m, COUNT(*), SUM(price) \
+             FROM events WHERE {window} GROUP BY y, m ORDER BY y, m"
                 .to_owned(),
         ),
     ];

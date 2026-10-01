@@ -472,6 +472,18 @@ pub(super) fn date_part_column(
 
 fn parts_of(input: &ColumnVector, part: DatePart, declared: DataType) -> Option<ColumnVector> {
     let input = temporal_column(input)?;
+    // The units within which the part cannot change: a clock part reads
+    // only its own unit of the day, every other part only the date. Rows
+    // of a window ordered by time repeat the previous row's step, so the
+    // calendar conversion runs once per step rather than once per row.
+    let step = match (input.fsp, part) {
+        (None, _) => 1,
+        (Some(_), DatePart::Hour) => 3_600_000_000,
+        (Some(_), DatePart::Minute) => 60_000_000,
+        (Some(_), DatePart::Second) => 1_000_000,
+        (Some(_), _) => MICROS_PER_DAY,
+    };
+    let mut last: Option<(i64, i64)> = None;
     let mut parts = Vec::with_capacity(input.units.len());
     let mut valid = Vec::with_capacity(input.units.len());
     for row in 0..input.units.len() {
@@ -480,8 +492,16 @@ fn parts_of(input: &ColumnVector, part: DatePart, declared: DataType) -> Option<
             valid.push(false);
             continue;
         }
-        let value = input.datetime(row)?;
-        parts.push(i64::try_from(date_part(value, part)).ok()?);
+        let bucket = input.units[row].div_euclid(step);
+        let value = match last {
+            Some((previous, value)) if previous == bucket => value,
+            _ => {
+                let value = i64::try_from(date_part(input.datetime(row)?, part)).ok()?;
+                last = Some((bucket, value));
+                value
+            }
+        };
+        parts.push(value);
         valid.push(true);
     }
     Some(ColumnVector::from_typed(
