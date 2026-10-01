@@ -1891,7 +1891,8 @@ fn replace_retained_value(
 /// makes the snapshot unsettled, so served rows are provably fresh —
 /// unlike TTL query caches. Persistent per-block SMAs remain follow-up.
 type SettledMemoKey = (std::path::PathBuf, u64, String);
-type SettledMemo = std::sync::Mutex<HashMap<SettledMemoKey, Vec<Vec<Value>>>>;
+type SettledMemo =
+    std::sync::Mutex<HashMap<SettledMemoKey, std::sync::Arc<super::two_pass::SettledRows>>>;
 static SETTLED_AGGREGATE_MEMO: std::sync::LazyLock<SettledMemo> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
@@ -2718,22 +2719,18 @@ pub(super) fn build_hash_aggregate(
         );
     }
     if let Some(key) = &memo_key
-        && let Some(rows) = SETTLED_AGGREGATE_MEMO
+        && let Some(entry) = SETTLED_AGGREGATE_MEMO
             .lock()
             .expect("settled memo lock")
             .get(key)
             .cloned()
     {
-        let payload: usize = rows
-            .iter()
-            .map(|row| estimated_row_payload_bytes(row))
-            .sum();
-        memory.reserve(payload)?;
+        memory.reserve(entry.payload())?;
         return Ok(MaterializedRows {
-            rows,
+            rows: Vec::new(),
             position: 0,
             spilled: None,
-            ready: None,
+            ready: Some(super::two_pass::ReadyColumns::settled(entry)),
         });
     }
     if memo_key.is_none()
@@ -2759,7 +2756,7 @@ pub(super) fn build_hash_aggregate(
             .lock()
             .expect("settled memo lock")
             .get(&key)
-            .cloned();
+            .map(|entry| entry.rows().to_vec());
         if let Some(base) = base {
             let row_count = delta.rows.len();
             let columns = (0..delta.types.len())
@@ -2817,7 +2814,10 @@ pub(super) fn build_hash_aggregate(
             if memo.len() >= SETTLED_MEMO_MAX_ENTRIES {
                 memo.clear();
             }
-            memo.insert(key.clone(), rows.clone());
+            memo.insert(
+                key.clone(),
+                std::sync::Arc::new(super::two_pass::SettledRows::new(rows.clone())),
+            );
         }
         return Ok(MaterializedRows {
             rows,
@@ -2842,7 +2842,10 @@ pub(super) fn build_hash_aggregate(
             if memo.len() >= SETTLED_MEMO_MAX_ENTRIES {
                 memo.clear();
             }
-            memo.insert(key.clone(), rows.clone());
+            memo.insert(
+                key.clone(),
+                std::sync::Arc::new(super::two_pass::SettledRows::new(rows.clone())),
+            );
         }
         return Ok(MaterializedRows {
             rows,
@@ -2889,7 +2892,10 @@ pub(super) fn build_hash_aggregate(
         if memo.len() >= SETTLED_MEMO_MAX_ENTRIES {
             memo.clear();
         }
-        memo.insert(key, result.rows.clone());
+        memo.insert(
+            key,
+            std::sync::Arc::new(super::two_pass::SettledRows::new(result.rows.clone())),
+        );
     }
     Ok(result)
 }

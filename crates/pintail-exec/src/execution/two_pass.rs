@@ -2176,15 +2176,30 @@ impl ReadyColumn {
 pub(super) struct ReadyColumns {
     len: usize,
     columns: Vec<ReadyColumn>,
+    /// A settled-memo answer served from the batches its entry keeps, in
+    /// place of `columns`.
+    settled: Option<std::sync::Arc<SettledRows>>,
 }
 
 impl ReadyColumns {
+    /// A settled-memo entry's rows, served as the batches it keeps.
+    pub(super) fn settled(entry: std::sync::Arc<SettledRows>) -> Self {
+        Self {
+            len: entry.rows.len(),
+            columns: Vec::new(),
+            settled: Some(entry),
+        }
+    }
+
     pub(super) fn len(&self) -> usize {
         self.len
     }
 
     /// Bytes a served row costs, for sizing and charging its batch.
     pub(super) fn row_bytes(&self) -> usize {
+        if let Some(entry) = &self.settled {
+            return entry.row_bytes;
+        }
         self.columns
             .iter()
             .map(ReadyColumn::row_bytes)
@@ -2198,6 +2213,9 @@ impl ReadyColumns {
         rows: std::ops::Range<usize>,
         column_types: &[DataType],
     ) -> Result<RecordBatch, ExecError> {
+        if let Some(entry) = &self.settled {
+            return entry.batch(rows, column_types);
+        }
         // As cells the rows would serve the layout's columns from their
         // front, so too short is the only mismatch.
         if self.columns.len() < column_types.len() {
@@ -2244,6 +2262,10 @@ impl ReadyColumns {
 
     /// Every row as cells, for a consumer that keeps rows.
     pub(super) fn into_rows(self) -> Vec<Vec<Value>> {
+        if let Some(entry) = self.settled {
+            return std::sync::Arc::try_unwrap(entry)
+                .map_or_else(|shared| shared.rows.clone(), |entry| entry.rows);
+        }
         (0..self.len)
             .map(|row| {
                 self.columns
@@ -2252,6 +2274,86 @@ impl ReadyColumns {
                     .collect()
             })
             .collect()
+    }
+}
+
+/// One settled-memo answer: the finished rows, and the batches a replay
+/// serves cut from them once.
+///
+/// A replay used to clone every row out of the memo and rebuild its columns
+/// from the cells, parsing each decimal back from its text, on every hit.
+/// The batches are built on the first replay and shared after it: a column
+/// clone shares its packed values, so a hit costs a handful of reference
+/// counts whatever the number of groups.
+pub(super) struct SettledRows {
+    rows: Vec<Vec<Value>>,
+    /// What a served row is charged, as the cells would be.
+    row_bytes: usize,
+    /// Every row's payload, reserved again by each replay.
+    payload: usize,
+    /// The column types and full-size batches of the first replay.
+    served: std::sync::OnceLock<(Vec<DataType>, Vec<RecordBatch>)>,
+}
+
+impl SettledRows {
+    pub(super) fn new(rows: Vec<Vec<Value>>) -> Self {
+        let payload = rows
+            .iter()
+            .map(|row| super::estimated_row_payload_bytes(row))
+            .sum();
+        let row_bytes = rows.first().map_or(1, |row| {
+            super::estimated_record_batch_bytes(std::slice::from_ref(row), row.len()).max(1)
+        });
+        Self {
+            rows,
+            row_bytes,
+            payload,
+            served: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(super) fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
+
+    pub(super) const fn payload(&self) -> usize {
+        self.payload
+    }
+
+    /// Rows `rows` as a batch: the kept batch when `rows` is one of the
+    /// full-size cuts and the types are the ones it was built with,
+    /// otherwise built from the cells as before.
+    fn batch(
+        &self,
+        rows: std::ops::Range<usize>,
+        column_types: &[DataType],
+    ) -> Result<RecordBatch, ExecError> {
+        let step = crate::batch::DEFAULT_BATCH_ROWS;
+        let full =
+            rows.start.is_multiple_of(step) && rows.end == (rows.start + step).min(self.rows.len());
+        if full {
+            let built = self.served.get_or_init(|| {
+                let batches = self
+                    .rows
+                    .chunks(step)
+                    .map(|chunk| {
+                        super::rows_to_columns(chunk, column_types).and_then(|columns| {
+                            RecordBatch::new(chunk.len(), columns).map_err(ExecError::from)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap_or_default();
+                (column_types.to_vec(), batches)
+            });
+            if built.0 == column_types
+                && let Some(batch) = built.1.get(rows.start / step)
+            {
+                return Ok(batch.clone());
+            }
+        }
+        let cells = &self.rows[rows.clone()];
+        let columns = super::rows_to_columns(cells, column_types)?;
+        RecordBatch::new(cells.len(), columns).map_err(ExecError::from)
     }
 }
 
@@ -2364,6 +2466,7 @@ fn finish_int_range(
     Ok(ReadyColumns {
         len,
         columns: columns.unwrap_or_default(),
+        settled: None,
     })
 }
 
