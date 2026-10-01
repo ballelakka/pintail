@@ -5,6 +5,7 @@
 mod admission;
 mod adopt_filter;
 mod binary_bit_aggregates;
+mod block_skip_bench;
 mod block_value_skipping;
 mod build_keys_through_joins;
 mod clustered_build_keys;
