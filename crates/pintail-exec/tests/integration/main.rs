@@ -110,6 +110,7 @@ mod text_grouping_scale;
 mod text_range_predicates;
 mod timestamp_session_zone;
 mod top_k_sort;
+mod ungrouped_column_fold;
 mod wide_decimal_parity;
 mod wide_integer_comparison_typing;
 mod window_frame_scaling;

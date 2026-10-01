@@ -17,6 +17,7 @@ mod packed_fold;
 mod points;
 mod sort;
 mod two_pass;
+mod ungrouped_fold;
 mod watchdog;
 mod window;
 mod window_moments;
@@ -1880,8 +1881,16 @@ impl ProfileSink {
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Notes from different sources (a scan's decode cost, the operator
+        // that consumed it) both stay; repeating one does not double it.
         if let Some(entry) = slots.get_mut(slot) {
-            entry.note = Some(note.to_owned());
+            entry.note = Some(match entry.note.take() {
+                Some(existing) if existing != note && !existing.contains(note) => {
+                    format!("{existing}; {note}")
+                }
+                Some(existing) => existing,
+                None => note.to_owned(),
+            });
         }
     }
 

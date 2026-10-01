@@ -3386,6 +3386,9 @@ fn build_hash_aggregate_scan(
             ready: None,
         });
     }
+    if group_by.is_empty() && super::ungrouped_fold::eligible(aggregates) {
+        return build_ungrouped_fold(input, aggregates, memory);
+    }
     if !group_by.is_empty() {
         let direct_columns = group_by
             .iter()
@@ -3588,6 +3591,47 @@ fn build_hash_aggregate_scan(
     }
     Ok(MaterializedRows {
         rows,
+        position: 0,
+        spilled: None,
+        ready: None,
+    })
+}
+
+/// An aggregate with no GROUP BY, folded a column at a time per batch (see
+/// `ungrouped_fold`). The profile records on the input how many aggregate
+/// passes folded by column and how many fell back to the per-row update.
+fn build_ungrouped_fold(
+    input: &mut PullOperator,
+    aggregates: &[CompiledAggregate],
+    memory: &MemoryTracker,
+) -> Result<MaterializedRows, ExecError> {
+    use super::ungrouped_fold::{FoldTally, fold_batch};
+    memory.reserve(aggregates.len().saturating_mul(size_of::<AggregateState>()))?;
+    let mut states: Vec<AggregateState> = aggregates.iter().map(AggregateState::new).collect();
+    let mut rows_buffer = Vec::new();
+    let mut tally = FoldTally::default();
+    while let Some(batch) = input.next_batch(memory)? {
+        memory.check_interruption()?;
+        fold_batch(
+            &batch,
+            aggregates,
+            &mut states,
+            &mut rows_buffer,
+            &mut tally,
+            memory,
+        )?;
+    }
+    super::ProfileNote::of(input).set(&format!(
+        "ungrouped column fold: {} aggregate-batches by column, {} per row",
+        tally.folded, tally.per_row
+    ));
+    let mut row = Vec::with_capacity(states.len());
+    for state in states {
+        row.push(state.finish(memory)?);
+    }
+    memory.reserve(estimated_row_payload_bytes(&row))?;
+    Ok(MaterializedRows {
+        rows: vec![row],
         position: 0,
         spilled: None,
         ready: None,
