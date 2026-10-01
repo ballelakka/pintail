@@ -15,6 +15,7 @@ mod morsel;
 mod order;
 mod packed_fold;
 mod points;
+mod small_group_fold;
 mod sort;
 mod two_pass;
 mod ungrouped_fold;

@@ -206,10 +206,11 @@ fn ungrouped_column_fold_matches_the_row_fold() {
             &fixture,
             &format!("SELECT {AGGREGATES} FROM visits {filter}"),
         );
-        // A constant expression key: one group, folded row by row.
+        // Two constant expression keys: one group, folded row by row by
+        // the general path (one key would take the small-group fold).
         let general = run(
             &fixture,
-            &format!("SELECT {AGGREGATES} FROM visits {filter} GROUP BY id * 0"),
+            &format!("SELECT {AGGREGATES} FROM visits {filter} GROUP BY id * 0, id * 0"),
         );
         assert_eq!(folded.len(), 1, "{filter}");
         if general.is_empty() {
@@ -225,5 +226,38 @@ fn ungrouped_column_fold_matches_the_row_fold() {
             continue;
         }
         assert_eq!(folded, general, "{filter}");
+    }
+}
+
+/// A one-key GROUP BY with few groups folds each group's rows a column at a
+/// time; a second, constant key sends the same query down the general row
+/// loop. Text keys (with NULLs), a date expression key, an integer
+/// expression key and a temporal column key, each with and without a
+/// filter that scatters the selection.
+#[test]
+fn small_group_column_fold_matches_the_row_fold() {
+    let fixture = fixture();
+    for key in ["tag", "DATE(seen_at)", "delta % 7", "seen_on", "units % 5"] {
+        for filter in [
+            "",
+            "WHERE id % 3 <> 1",
+            "WHERE seen_at BETWEEN '2025-02-01 00:00:00' AND '2025-03-15 12:00:00'",
+        ] {
+            let folded = run(
+                &fixture,
+                &format!(
+                    "SELECT {key} AS k, {AGGREGATES} FROM visits {filter} GROUP BY k ORDER BY k"
+                ),
+            );
+            let general = run(
+                &fixture,
+                &format!(
+                    "SELECT {key} AS k, {AGGREGATES} FROM visits {filter} \
+                     GROUP BY k, id * 0 ORDER BY k"
+                ),
+            );
+            assert!(folded.len() > 1, "{key} {filter}");
+            assert_eq!(folded, general, "{key} {filter}");
+        }
     }
 }

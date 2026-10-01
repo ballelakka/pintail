@@ -67,17 +67,30 @@ pub(super) fn fold_batch(
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
     let rows = fold_rows(batch, 0..batch.row_count(), rows_buffer);
+    fold_rows_into(batch, &rows, aggregates, states, tally, memory)
+}
+
+/// Folds the rows `rows` lists, in row order, into `states`: by column
+/// where a fold exists, per row otherwise.
+pub(super) fn fold_rows_into(
+    batch: &RecordBatch,
+    rows: &FoldRows<'_>,
+    aggregates: &[CompiledAggregate],
+    states: &mut [AggregateState],
+    tally: &mut FoldTally,
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
     if rows.len() == 0 {
         return Ok(());
     }
     let batch_bytes = batch.estimated_bytes();
     for (aggregate, state) in aggregates.iter().zip(states.iter_mut()) {
-        if fold_column(batch, &rows, aggregate, state, memory)? {
+        if fold_column(batch, rows, aggregate, state, memory)? {
             tally.folded += 1;
             continue;
         }
         tally.per_row += 1;
-        for row in batch.selection().selected_rows() {
+        let mut update = |row: usize| {
             update_aggregate_states(
                 batch,
                 row,
@@ -85,7 +98,11 @@ pub(super) fn fold_batch(
                 std::slice::from_ref(aggregate),
                 std::slice::from_mut(state),
                 memory,
-            )?;
+            )
+        };
+        match rows {
+            FoldRows::Span(span) => span.clone().try_for_each(&mut update)?,
+            FoldRows::Picked(picked) => picked.iter().try_for_each(|row| update(*row as usize))?,
         }
     }
     Ok(())

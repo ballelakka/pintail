@@ -3728,6 +3728,23 @@ fn build_buffered_hash_aggregate(
             collation,
         );
     }
+    // Few groups and no streaming two-pass for them: an expression key, or
+    // an aggregate without a lane (a temporal MIN/MAX). Their rows fold by
+    // column per group instead of through the general row loop.
+    // The lane check goes first: it is cheap, and a query the two-pass
+    // takes never pays for counting its first batch's keys.
+    if (direct_columns.is_none() || two_pass_lanes(aggregates, &first_batch).is_none())
+        && super::small_group_fold::suits(group_by, aggregates, &first_batch)
+    {
+        return super::small_group_fold::build_small_group_fold(
+            input,
+            first_batch,
+            &group_by[0],
+            aggregates,
+            memory,
+            key_collations.first().copied().unwrap_or(collation),
+        );
+    }
     let utf8_column = |column: &usize| {
         first_batch
             .column(*column)
