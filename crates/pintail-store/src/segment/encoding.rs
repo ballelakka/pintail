@@ -971,6 +971,47 @@ fn unpack_groups<const WIDTH: usize, E>(
 ) -> Result<(), E> {
     #[allow(clippy::cast_possible_truncation)]
     let mask = width_mask(WIDTH as u32);
+    if WIDTH <= 32 {
+        // A value of at most 32 bits (56 would fit), starting anywhere inside
+        // a byte, lies within the eight bytes from that byte: one unaligned load, a
+        // shift and a mask. Groups read straight from the payload while
+        // eight bytes of slack follow them; the last group or so copies
+        // into a zero-padded window instead.
+        let group_bytes = WIDTH * 8;
+        let mut padded = [0_u8; GROUP * 8 + 8];
+        for group in 0..groups {
+            let start = group * group_bytes;
+            let window = if let Some(window) = bytes.get(start..start + group_bytes + 8) {
+                window
+            } else {
+                padded[..group_bytes].copy_from_slice(&bytes[start..start + group_bytes]);
+                &padded[..group_bytes + 8]
+            };
+            // Eight values of WIDTH bits span exactly WIDTH bytes, so each
+            // run of eight starts on a byte and every shift below is a
+            // constant of the width.
+            for (eight, values) in buffer.chunks_exact_mut(8).enumerate() {
+                let first = eight * WIDTH;
+                for (index, value) in values.iter_mut().enumerate() {
+                    let bit = index * WIDTH;
+                    let at = first + bit / 8;
+                    let word = u64::from_le_bytes([
+                        window[at],
+                        window[at + 1],
+                        window[at + 2],
+                        window[at + 3],
+                        window[at + 4],
+                        window[at + 5],
+                        window[at + 6],
+                        window[at + 7],
+                    ]);
+                    *value = (word >> (bit % 8)) & mask;
+                }
+            }
+            sink(buffer)?;
+        }
+        return Ok(());
+    }
     let mut words = [0_u64; GROUP + 1];
     for chunk in bytes.chunks_exact(WIDTH * 8).take(groups) {
         for (word, eight) in words[..WIDTH].iter_mut().zip(chunk.chunks_exact(8)) {
