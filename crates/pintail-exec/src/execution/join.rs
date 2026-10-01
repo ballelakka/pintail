@@ -50,7 +50,7 @@ pub(super) const BUILD_PARTITIONS: usize = 64;
 /// references to its rows there; a grace partition read back from disk
 /// holds its rows as values.
 pub(super) struct PartitionedBuild<R = BuildRow> {
-    partitions: Vec<HashMap<JoinHashKey, Vec<R>>>,
+    partitions: Vec<JoinKeyMap<Vec<R>>>,
     /// Set once, after every build row was inserted, when the keys are a
     /// plain integer set spanning fewer than [`MAX_DENSE_SPAN`] values:
     /// (minimum key, per-offset index into `dense_buckets`). `get` and the
@@ -128,7 +128,7 @@ impl PartitionedBuild<BuildRow> {
 impl<R> PartitionedBuild<R> {
     fn with_partitions(count: usize) -> Self {
         Self {
-            partitions: (0..count.max(1)).map(|_| HashMap::new()).collect(),
+            partitions: (0..count.max(1)).map(|_| JoinKeyMap::default()).collect(),
             dense_index: None,
             dense_buckets: Vec::new(),
             batches: Vec::new(),
@@ -137,15 +137,17 @@ impl<R> PartitionedBuild<R> {
     }
 
     pub(super) fn slot(&self, key: &JoinHashKey) -> usize {
-        use std::hash::{Hash as _, Hasher as _};
+        use std::hash::BuildHasher as _;
         if self.partitions.len() == 1 {
             return 0;
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
+        // Remixed: the partition's own table indexes by the low bits of the
+        // same hash, and a partition chosen by those bits would leave every
+        // key in it on one sixty-fourth of its slots.
+        let hash = crate::batch::mix64(JoinKeyHashing::default().hash_one(key));
         #[allow(clippy::cast_possible_truncation)] // modulo the count keeps any width
         {
-            (hasher.finish() as usize) % self.partitions.len()
+            (hash as usize) % self.partitions.len()
         }
     }
 
@@ -263,7 +265,7 @@ impl<R> PartitionedBuild<R> {
         if self.dense_index.is_some() {
             return self.dense_buckets.is_empty();
         }
-        self.partitions.iter().all(HashMap::is_empty)
+        self.partitions.iter().all(JoinKeyMap::is_empty)
     }
 
     /// Distinct keys across every partition.
@@ -271,23 +273,23 @@ impl<R> PartitionedBuild<R> {
         if self.dense_index.is_some() {
             return self.dense_buckets.len();
         }
-        self.partitions.iter().map(HashMap::len).sum()
+        self.partitions.iter().map(JoinKeyMap::len).sum()
     }
 
     pub(super) fn values(&self) -> Box<dyn Iterator<Item = &Vec<R>> + '_> {
         if self.dense_index.is_some() {
             Box::new(self.dense_buckets.iter())
         } else {
-            Box::new(self.partitions.iter().flat_map(HashMap::values))
+            Box::new(self.partitions.iter().flat_map(JoinKeyMap::values))
         }
     }
 
     fn keys(&self) -> impl Iterator<Item = &JoinHashKey> {
-        self.partitions.iter().flat_map(HashMap::keys)
+        self.partitions.iter().flat_map(JoinKeyMap::keys)
     }
 
     fn drain(&mut self) -> impl Iterator<Item = (JoinHashKey, Vec<R>)> + '_ {
-        self.partitions.iter_mut().flat_map(HashMap::drain)
+        self.partitions.iter_mut().flat_map(JoinKeyMap::drain)
     }
 
     /// Reserves room for one more key in the partition it will land in.
@@ -326,6 +328,116 @@ impl<R> PartitionedBuild<R> {
         self.kept_row_bytes = std::sync::OnceLock::new();
     }
 }
+
+/// Hashes join keys for the build's partition tables.
+///
+/// Every build row hashed its key three to five times - partition choice,
+/// existence check, reservation, insert - and every probe row twice more,
+/// each through `SipHash`. These tables hold keys this query just read and
+/// live for one query, so resistance to attacker-chosen keys buys nothing,
+/// while the cost lands on the hottest loops of every hash join. Words fold
+/// in with a multiply and the result is finished with a full avalanche, so
+/// the table's index and tag bits both see every input bit.
+#[derive(Default)]
+pub(super) struct JoinKeyHasher(u64);
+
+impl JoinKeyHasher {
+    #[inline]
+    fn fold(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(26) ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+impl std::hash::Hasher for JoinKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        crate::batch::mix64(self.0)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in chunks.by_ref() {
+            self.fold(u64::from_le_bytes(chunk.try_into().expect("eight bytes")));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0_u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            // The length keeps "ab" and "ab\0" apart.
+            self.fold(u64::from_le_bytes(word) ^ ((rest.len() as u64) << 59));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.fold(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.fold(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.fold(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.fold(value);
+    }
+
+    #[inline]
+    fn write_u128(&mut self, value: u128) {
+        #[allow(clippy::cast_possible_truncation)] // the two halves, on purpose
+        {
+            self.fold(value as u64);
+            self.fold((value >> 64) as u64);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.fold(value as u64);
+    }
+
+    #[inline]
+    fn write_i8(&mut self, value: i8) {
+        self.write_u8(value.cast_unsigned());
+    }
+
+    #[inline]
+    fn write_i16(&mut self, value: i16) {
+        self.write_u16(value.cast_unsigned());
+    }
+
+    #[inline]
+    fn write_i32(&mut self, value: i32) {
+        self.write_u32(value.cast_unsigned());
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        self.write_u64(value.cast_unsigned());
+    }
+
+    #[inline]
+    fn write_i128(&mut self, value: i128) {
+        self.write_u128(value.cast_unsigned());
+    }
+
+    #[inline]
+    fn write_isize(&mut self, value: isize) {
+        self.write_usize(value.cast_unsigned());
+    }
+}
+
+pub(super) type JoinKeyHashing = std::hash::BuildHasherDefault<JoinKeyHasher>;
+
+/// One build partition's table: each key's bucket.
+pub(super) type JoinKeyMap<V> = HashMap<JoinHashKey, V, JoinKeyHashing>;
 
 /// Hashes the bucket addresses the probe loop looks up.
 ///
@@ -594,6 +706,9 @@ pub(super) fn resolve_join_group_plan(
     Ok(JoinGroupPlan { values, buckets })
 }
 
+/// Bytes of fixed-size binned keys a build charges at once.
+const BINNED_RESERVE_STEP: usize = 16 << 10;
+
 /// Widest key span the dense join table will materialize (~4M slots).
 pub(super) const MAX_DENSE_SPAN: i128 = 1 << 22;
 
@@ -777,7 +892,9 @@ fn insert_resident_row(
         batch_bytes,
         memory,
     )?;
-    memory.reserve(key_bytes)?;
+    if key_bytes > 0 {
+        memory.reserve(key_bytes)?;
+    }
     // A reference is small and most keys name one row, so a bucket grows
     // from a few slots rather than from a batch's worth.
     let bucket = build.entry_or_default(key);
@@ -916,6 +1033,21 @@ pub(super) fn build_hash_join_state(
             // text keys allocates every normalized key at once and passes the
             // query's ceiling before a single per-row check runs.
             let mut binned_bytes = 0_usize;
+            // Fixed-size keys are charged a step at a time rather than one
+            // by one: each charge is several atomic updates shared with
+            // every thread of the query, and per row they were the largest
+            // single cost of building a hundred-thousand-row side. A key
+            // that holds heap bytes still settles at once, with the step.
+            let mut pending = 0_usize;
+            let settle = |pending: &mut usize, binned_bytes: &mut usize| -> Result<(), ExecError> {
+                if *pending > 0 {
+                    memory.ensure_transient(batch_bytes.saturating_add(*pending))?;
+                    memory.reserve(*pending)?;
+                    *binned_bytes = binned_bytes.saturating_add(*pending);
+                    *pending = 0;
+                }
+                Ok(())
+            };
             for row in rows.by_ref().take(bin_rows) {
                 let value = right_key.evaluate(&batch, row)?;
                 if !matches!(value, Value::Null) {
@@ -945,16 +1077,17 @@ pub(super) fn build_hash_join_state(
                 else {
                     continue;
                 };
-                let retained = key
-                    .heap_bytes()
-                    .saturating_add(size_of::<(JoinHashKey, usize)>());
-                // Previously binned keys are already reserved. Only the incoming
-                // key and the live batch are additional to the tracker here.
-                memory.ensure_transient(batch_bytes.saturating_add(retained))?;
-                memory.reserve(retained)?;
-                binned_bytes = binned_bytes.saturating_add(retained);
+                let heap_bytes = key.heap_bytes();
+                // Previously binned keys are already reserved. Only the pending
+                // keys and the live batch are additional to the tracker here.
+                pending = pending
+                    .saturating_add(heap_bytes.saturating_add(size_of::<(JoinHashKey, usize)>()));
+                if heap_bytes > 0 || pending >= BINNED_RESERVE_STEP {
+                    settle(&mut pending, &mut binned_bytes)?;
+                }
                 binned[build.slot(&key)].push((key, row));
             }
+            settle(&mut pending, &mut binned_bytes)?;
             for (key, row) in binned.into_iter().flatten() {
                 if let Some(grace) = grace.as_mut() {
                     let values = batch_row(&batch, row)?;
