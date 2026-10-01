@@ -492,6 +492,26 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Returns the node's first workspace: the one created with the first
+    /// administrator, or the default one an upgraded install was given.
+    ///
+    /// Rows are never deleted from this table, so the lowest row is the
+    /// first one written for the life of the node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace table cannot be read.
+    pub fn first_workspace_id(&self) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT id FROM workspaces ORDER BY rowid LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read the first workspace")
+    }
+
     /// Returns one workspace by id.
     ///
     /// # Errors

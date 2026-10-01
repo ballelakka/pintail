@@ -108,6 +108,48 @@ impl AuthPrincipal {
     }
 }
 
+/// Whether this caller administers the node itself, not only a workspace.
+///
+/// Anyone may create a workspace and is its administrator, so a workspace
+/// role says nothing about the node. The node's administrators are the
+/// administrators of its first workspace - the one the first-boot setup
+/// created (or an upgraded install was given) - and whoever they have made an
+/// administrator there. It is read from the membership table on every call,
+/// so it follows a demotion or removal immediately, and it holds whichever
+/// workspace the session is currently in.
+pub(crate) fn is_node_admin(state: &ApiState, principal: &AuthPrincipal) -> Result<bool, ApiError> {
+    // An API key is scoped to one database and administers nothing.
+    if principal.workspace_id.is_none() {
+        return Ok(false);
+    }
+    let metadata = state.metadata()?;
+    let Some(first_workspace) = metadata.first_workspace_id().map_err(ApiError::internal)? else {
+        return Ok(false);
+    };
+    let role = metadata
+        .workspace_member_role(&first_workspace, &principal.subject)
+        .map_err(ApiError::internal)?;
+    Ok(role.as_deref() == Some("admin"))
+}
+
+/// Guards a setting that applies to the whole node.
+///
+/// # Errors
+///
+/// Returns an error when the caller is not a node administrator.
+pub(crate) fn require_node_admin(
+    state: &ApiState,
+    principal: &AuthPrincipal,
+) -> Result<(), ApiError> {
+    if is_node_admin(state, principal)? {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "node administrator access is required: this setting applies to every workspace",
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Claims {
     sub: String,
@@ -156,6 +198,8 @@ pub(crate) struct PrincipalResponse {
     database_id: Option<String>,
     workspace_id: Option<String>,
     scopes: Vec<String>,
+    /// Whether the caller may change node-wide settings.
+    node_admin: bool,
 }
 
 pub(crate) async fn setup_status(
@@ -283,12 +327,16 @@ pub(crate) fn default_workspace_for_user(
     Ok((workspace.id, role))
 }
 
-pub(crate) async fn session(request: Request) -> Result<Json<PrincipalResponse>, ApiError> {
+pub(crate) async fn session(
+    State(state): State<ApiState>,
+    request: Request,
+) -> Result<Json<PrincipalResponse>, ApiError> {
     let principal = request
         .extensions()
         .get::<AuthPrincipal>()
         .ok_or_else(|| ApiError::unauthorized("authentication is required"))?;
     Ok(Json(PrincipalResponse {
+        node_admin: is_node_admin(&state, principal)?,
         subject: principal.subject.clone(),
         role: principal.role.clone(),
         database_id: principal.database_id.clone(),

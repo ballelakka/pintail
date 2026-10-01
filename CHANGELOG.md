@@ -21,6 +21,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   session only the events of databases its own workspace owns. Every session
   used to receive every workspace's events: database identifiers, table names
   and replication messages.
+- Node-wide settings (the Google sign-in client and the wire certificate's
+  hostnames) now require a node administrator: an administrator of the node's
+  first workspace. Any account could create a workspace, become its
+  administrator, and change them. `/api/session` reports `node_admin`, and the
+  dashboard shows those settings only to a node administrator.
 
 ## [0.1.7-rc1] - 2026-10-01
 

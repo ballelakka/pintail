@@ -53,7 +53,7 @@ const server = createServer(async (request, response) => {
     return
   }
   if (path === '/status') return json({ status: 'ok', version: 'test', wire: { enabled: false } })
-  if (path === '/api/session') return json({ subject: 'test', role: 'admin', workspace_id: 'test', scopes: [] })
+  if (path === '/api/session') return json({ subject: 'test', role: 'admin', workspace_id: 'test', scopes: [], node_admin: true })
   if (path === '/api/workspaces') return json([{ id: 'test', name: 'Test', slug: 'test', role: 'admin' }])
   if (path === '/api/auth/setup/status') return json({ required: false })
   if (path === '/api/auth/google/status') return json({ enabled: false })

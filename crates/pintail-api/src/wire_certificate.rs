@@ -102,7 +102,7 @@ pub(crate) async fn get_settings(
     Extension(principal): Extension<AuthPrincipal>,
     State(state): State<ApiState>,
 ) -> Result<axum::Json<WireTlsSettings>, ApiError> {
-    principal.require_admin()?;
+    crate::auth::require_node_admin(&state, &principal)?;
     let metadata = state.metadata()?;
     let wanted = configured_hostnames(&metadata);
     // What the live certificate covers is recorded beside it at generation.
@@ -132,7 +132,8 @@ pub(crate) async fn put_settings(
     State(state): State<ApiState>,
     axum::Json(request): axum::Json<PutWireTlsRequest>,
 ) -> Result<axum::Json<WireTlsSettings>, ApiError> {
-    principal.require_admin()?;
+    // The certificate belongs to the node's one wire listener.
+    crate::auth::require_node_admin(&state, &principal)?;
     // Only names a certificate can carry. A value with a scheme, a port or a
     // path produces a certificate that silently fails to verify, which is
     // worse than refusing it here.

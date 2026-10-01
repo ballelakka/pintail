@@ -7,7 +7,9 @@ import type { GoogleOAuthSettings } from '@/types/pintail'
 const { session, dark, nodeStatus, toggleTheme, error } = useControlPlane()
 const { request } = usePintailApi()
 
-const isAdmin = computed(() => session.value?.role === 'admin')
+/// The settings on this page belong to the node, not to a workspace, so they
+/// follow the node-administrator flag rather than the workspace role.
+const isAdmin = computed(() => session.value?.node_admin === true)
 const googleLoaded = ref(false)
 const googleSaving = ref(false)
 const googleLinking = ref(false)

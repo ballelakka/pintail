@@ -4,6 +4,8 @@ export interface Session {
   database_id: string | null
   workspace_id: string | null
   scopes: string[]
+  /// May change node-wide settings; a workspace admin is not always one.
+  node_admin?: boolean
 }
 
 export interface Workspace {

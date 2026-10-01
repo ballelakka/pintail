@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     ApiState, audit,
-    auth::{AuthPrincipal, default_workspace_for_user, issue_token},
+    auth::{AuthPrincipal, default_workspace_for_user, issue_token, require_node_admin},
     error::ApiError,
     state::random_identifier,
 };
@@ -149,7 +149,7 @@ pub(crate) async fn get_settings(
     Extension(principal): Extension<AuthPrincipal>,
     State(state): State<ApiState>,
 ) -> Result<Json<GoogleSettingsResponse>, ApiError> {
-    principal.require_admin()?;
+    require_node_admin(&state, &principal)?;
     let config = load_config(&state)?;
     Ok(Json(GoogleSettingsResponse {
         enabled: config.enabled,
@@ -164,7 +164,10 @@ pub(crate) async fn put_settings(
     State(state): State<ApiState>,
     Json(request): Json<PutGoogleSettingsRequest>,
 ) -> Result<Json<GoogleSettingsResponse>, ApiError> {
-    principal.require_admin()?;
+    // One OAuth client signs users in to every workspace, so changing it is
+    // the node's business: a workspace administrator may be anyone who
+    // created a workspace.
+    require_node_admin(&state, &principal)?;
     let public_origin = if request.public_url.trim().is_empty() {
         if request.enabled {
             return Err(ApiError::bad_request(

@@ -185,6 +185,12 @@ the local DSN key. Database API keys are hash-only and shown once; a stored
 double-SHA-1 verifier supports `mysql_native_password` challenge
 authentication without retaining the key plaintext.
 
+Roles are per workspace, and anyone may create a workspace and administer
+it. Settings that apply to the whole node (the OAuth client, the wire
+certificate's hostnames) belong to node administrators: the administrators of
+the node's first workspace. Live event streams carry only the events of
+databases the caller's workspace owns.
+
 Pintail does not terminate TLS and its embedded dashboard is not a
 multi-tenant security boundary. Keep listeners private or place a
 TLS-capable ingress in front. S3 prefix validation is an accident guard, not
