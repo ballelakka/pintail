@@ -182,6 +182,14 @@ impl<R> PartitionedBuild<R> {
         Some((offset, &self.dense_buckets[offset]))
     }
 
+    /// The dense table's smallest key and its per-offset index into
+    /// [`Self::dense_buckets`], once [`Self::is_dense`].
+    pub(super) fn dense_layout(&self) -> Option<(i128, &[Option<usize>])> {
+        self.dense_index
+            .as_ref()
+            .map(|(minimum, index)| (*minimum, index.as_slice()))
+    }
+
     pub(super) const fn is_dense(&self) -> bool {
         self.dense_index.is_some()
     }

@@ -20,6 +20,7 @@ use rayon::prelude::*;
 // operator, so its trait method has to be in scope.
 use crate::BatchStream as _;
 
+use super::fused_join_fold::{Lane, UniqueKeyGroups, fold_morsel, plan_lanes};
 use super::join::{
     JoinGroupPlan, JoinHashKey, PartitionedBuild, build_hash_join_state, normalized_group_hash_key,
     normalized_group_value, normalized_hash_key, normalized_join_key, resolve_join_group_plan,
@@ -4888,6 +4889,14 @@ fn build_fused_inner_join_aggregate(
     } else {
         Vec::new()
     };
+    // A unique dense key with lane-shaped aggregates folds a column at a
+    // time; anything else keeps the row fold below.
+    let unique_keys = plan_lanes(aggregates, left_width).and_then(|lanes| {
+        let keys = UniqueKeyGroups::resolve(&join.build, &dense_group_indexes, plan.values.len())?;
+        Some((keys, lanes))
+    });
+    let unique_reserved = unique_keys.as_ref().map_or(0, |(keys, _)| keys.bytes());
+    memory.reserve(unique_reserved)?;
     let mut groups = HashMap::<Vec<Value>, AggregateGroup>::new();
     // What one morsel allocates: the plan's whole group set, cloned up
     // front, plus a state per aggregate per group. The groups are FIXED by
@@ -4974,6 +4983,7 @@ fn build_fused_inner_join_aggregate(
                     aggregates,
                     &join.build,
                     &dense_group_indexes,
+                    unique_keys.as_ref(),
                     &plan,
                     memory,
                 )
@@ -5030,7 +5040,7 @@ fn build_fused_inner_join_aggregate(
         );
     }
     drop(join);
-    memory.release(build_reserved);
+    memory.release(build_reserved.saturating_add(unique_reserved));
     Ok(Some(finish_aggregate_groups(groups.into_values(), memory)?))
 }
 
@@ -5044,6 +5054,7 @@ fn build_local_fused_join_groups(
     aggregates: &[CompiledAggregate],
     build: &PartitionedBuild,
     dense_group_indexes: &[Option<&[usize]>],
+    unique_keys: Option<&(UniqueKeyGroups, Vec<Lane>)>,
     plan: &JoinGroupPlan,
     parent_memory: &MemoryTracker,
 ) -> Result<HashMap<Vec<Value>, AggregateGroup>, ExecError> {
@@ -5076,7 +5087,20 @@ fn build_local_fused_join_groups(
                 crate::batch::TypedValues::Int64(_) | crate::batch::TypedValues::UInt64(_)
             )
         });
-    for (offset, row) in morsel.selected_rows().enumerate() {
+    let folded = match unique_keys {
+        Some((keys, lanes)) => fold_morsel(
+            morsel,
+            left_key,
+            keys,
+            lanes,
+            &mut groups,
+            &mut touched,
+            &memory,
+        )?,
+        None => false,
+    };
+    let rows = (!folded).then(|| morsel.selected_rows());
+    for (offset, row) in rows.into_iter().flatten().enumerate() {
         if offset % 1024 == 0 {
             memory.check_interruption()?;
         }

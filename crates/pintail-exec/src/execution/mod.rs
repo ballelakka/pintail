@@ -4,6 +4,7 @@ mod budget;
 mod columnar_sort;
 mod dependent_index;
 mod error;
+mod fused_join_fold;
 pub(crate) mod gather;
 mod join;
 pub(crate) use join::{PROBE_PREFETCH_BUILD_RATIO, PROBE_PREFETCH_ROWS};
