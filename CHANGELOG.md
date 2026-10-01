@@ -17,6 +17,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   certificate. A listener that requires TLS and has no certificate refuses to
   run, and a plaintext login on a required-TLS listener is closed whether or
   not a certificate is present.
+- The live event streams (`/api/events`, `/api/ws`) deliver a dashboard
+  session only the events of databases its own workspace owns. Every session
+  used to receive every workspace's events: database identifiers, table names
+  and replication messages.
 
 ## [0.1.7-rc1] - 2026-10-01
 
