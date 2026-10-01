@@ -1661,6 +1661,7 @@ impl CompiledExpr {
                     | ScalarFunction::EncodedOrd(_)
                     | ScalarFunction::Field
                     | ScalarFunction::ToDays
+                    | ScalarFunction::ToSeconds
                     | ScalarFunction::YearWeek
                     | ScalarFunction::TimeToSec
                     | ScalarFunction::RegexpLike { .. }
@@ -1894,6 +1895,7 @@ impl CompiledExpr {
                     | ScalarFunction::EncodedOrd(_)
                     | ScalarFunction::Field
                     | ScalarFunction::ToDays
+                    | ScalarFunction::ToSeconds
                     | ScalarFunction::YearWeek
                     | ScalarFunction::TimeToSec
                     | ScalarFunction::RegexpLike { .. }
@@ -3653,16 +3655,49 @@ fn evaluate_eager_scalar_inner(
                 )
             );
             let part_value = match temporal::date_part_of(&values[0], integer, part) {
-                Err(error) if lenient => {
-                    // A stored February 30th counts as the day it runs
-                    // into, and so does one written under
-                    // ALLOW_INVALID_DATES.
+                Ok(value) => value,
+                Err(error) => {
                     let text = scalar_string(&values[0])?;
-                    let rolled = stored_datetime(&text).map_err(|_| error)?;
-                    let rolled = Value::Utf8(rolled.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
-                    temporal::date_part_of(&rolled, integer, part)?
+                    let stored = stored_temporal(argument_types, 0);
+                    let policy = match values.get(1) {
+                        Some(Value::Int64(policy)) => u64::try_from(*policy).unwrap_or(0),
+                        _ => 0,
+                    };
+                    // The calendar parts of a date with a zero month or
+                    // day are its fields as written, and its quarter the
+                    // quarter of that month: zero for a zero month.
+                    let fields = matches!(
+                        part,
+                        DatePart::Year | DatePart::Month | DatePart::Day | DatePart::Quarter
+                    )
+                    .then(|| {
+                        partial_calendar(
+                            &text,
+                            stored,
+                            !stored && matches!(values[0], Value::Utf8(_)),
+                            policy,
+                        )
+                    })
+                    .flatten();
+                    if let Some([year, month, day, ..]) = fields {
+                        u64::from(match part {
+                            DatePart::Year => year,
+                            DatePart::Month => month,
+                            DatePart::Day => day,
+                            _ => month.div_ceil(3),
+                        })
+                    } else if lenient {
+                        // A stored February 30th counts as the day it runs
+                        // into, and so does one written under
+                        // ALLOW_INVALID_DATES.
+                        let rolled = stored_datetime(&text).map_err(|_| error)?;
+                        let rolled =
+                            Value::Utf8(rolled.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+                        temporal::date_part_of(&rolled, integer, part)?
+                    } else {
+                        return Err(error);
+                    }
                 }
-                other => other?,
             };
             Ok(Value::Int64(
                 i64::try_from(part_value).map_err(|_| ExecError::NumericOverflow)?,
@@ -3798,7 +3833,10 @@ fn evaluate_eager_scalar_inner(
                 &scalar_string(&values[1])?,
                 allow_invalid || stored_temporal(argument_types, 1),
             )?;
-            Ok(Value::Int64(left.signed_duration_since(right).num_days()))
+            // MySQL's own day count, in which the year zero has no leap day.
+            Ok(Value::Int64(
+                temporal::mysql_daynr(left) - temporal::mysql_daynr(right),
+            ))
         }
         ScalarFunction::DayName => {
             let text = scalar_string(&values[0])?;
@@ -3858,12 +3896,27 @@ fn evaluate_eager_scalar_inner(
                         .parse::<u32>()
                         .map_err(|_| ExecError::InvalidDateTime)?,
                 )
-            } else {
-                let date = parse_mysql_datetime(&text)?;
+            } else if let Ok(date) = parse_mysql_datetime(&text) {
                 (
                     u32::try_from(date.year()).map_err(|_| ExecError::InvalidDateTime)?,
                     date.month(),
                 )
+            } else {
+                // A packed number with a zero day, or a day past its
+                // month's end written under ALLOW_INVALID_DATES, still
+                // names its month.
+                let policy = match values.get(1) {
+                    Some(Value::Int64(policy)) => u64::try_from(*policy).unwrap_or(0),
+                    _ => 0,
+                };
+                let [year, month, ..] = partial_calendar(
+                    &text,
+                    false,
+                    matches!(values[0], Value::Utf8(_)),
+                    policy,
+                )
+                .ok_or(ExecError::InvalidDateTime)?;
+                (year, month)
             };
             let days = mysql_month_days(year, month).ok_or(ExecError::InvalidDateTime)?;
             return Ok(Value::Utf8(format!("{year:04}-{month:02}-{days:02}")));
@@ -3877,6 +3930,24 @@ fn evaluate_eager_scalar_inner(
                 value.day(),
             );
             Ok(Value::UInt64(u64::try_from(days).unwrap_or(0)))
+        }
+        ScalarFunction::ToSeconds => {
+            // Whole days as TO_DAYS counts them, then the clock. A zero
+            // month or day is refused, as it is for TO_DAYS.
+            let text = scalar_string(&values[0])?;
+            let value = match parse_mysql_datetime(&text) {
+                Ok(value) => value,
+                Err(error)
+                    if stored_temporal(argument_types, 0)
+                        || allows_invalid_dates(values.get(1)) =>
+                {
+                    stored_datetime(&text).map_err(|_| error)?
+                }
+                Err(error) => return Err(error),
+            };
+            let days = temporal::mysql_daynr(value.date());
+            let seconds = days * 86_400 + i64::from(value.num_seconds_from_midnight());
+            Ok(Value::UInt64(u64::try_from(seconds).unwrap_or(0)))
         }
         ScalarFunction::FromDays => {
             let number = mysql_i64(&values[0])?;
@@ -4809,8 +4880,13 @@ fn cast_partial_calendar(value: &Value, target: DataType, policy: Option<&Value>
     let year: u32 = date[..4].parse().ok()?;
     let month: u32 = date[5..7].parse().ok()?;
     let day: u32 = date[8..].parse().ok()?;
-    if (policy & 1 != 0 && year == 0 && month == 0 && day == 0)
-        || (policy & 2 != 0 && (year != 0 || month != 0 || day != 0) && (month == 0 || day == 0))
+    // A zero date with a clock is not the zero date NO_ZERO_DATE refuses.
+    let clockless =
+        clock.is_none_or(|clock| !clock.bytes().any(|byte| (b'1'..=b'9').contains(&byte)));
+    if (policy & 1 != 0 && year == 0 && month == 0 && day == 0 && clockless)
+        || (policy & 2 != 0
+            && (year != 0 || month != 0 || day != 0 || !clockless)
+            && (month == 0 || day == 0))
         || (policy & 4 == 0 && month != 0 && day > mysql_month_days(year, month)?)
     {
         return Some(Value::Null);

@@ -614,6 +614,7 @@ pub(super) fn bind_scalar_function(
         "MONTHNAME" if args.len() == 1 => ScalarFunction::MonthName,
         "LAST_DAY" if args.len() == 1 => ScalarFunction::LastDay,
         "TO_DAYS" if args.len() == 1 => ScalarFunction::ToDays,
+        "TO_SECONDS" if args.len() == 1 => ScalarFunction::ToSeconds,
         "FROM_DAYS" if args.len() == 1 => ScalarFunction::FromDays,
         "YEARWEEK" if args.len() == 1 => ScalarFunction::YearWeek,
         // A written mode stays an argument; only a constant one is taken.
@@ -2207,6 +2208,7 @@ pub(super) fn bind_scalar(
         | ScalarFunction::Ord
         | ScalarFunction::Field
         | ScalarFunction::ToDays
+        | ScalarFunction::ToSeconds
         | ScalarFunction::YearWeek => (
             Some(DataType::UInt64),
             args.iter().any(|argument| argument.nullable),
@@ -2399,12 +2401,13 @@ pub(super) fn bind_scalar(
             )),
         });
     }
-    // The week, day and month functions read a date written as text under
-    // ALLOW_INVALID_DATES as they read a stored one: a day past its month's
-    // end counts as the day it runs into. Only that mode changes an answer
-    // and only for an argument that is not a stored temporal, so the policy
-    // is appended for nothing else, and a call over a date or datetime
-    // column keeps the argument list its column kernels and rewrites read.
+    // The date-part, week, day and month functions read a date written as
+    // text under the session's policy: under ALLOW_INVALID_DATES a day past
+    // its month's end counts as the day it runs into, as a stored one does,
+    // and under NO_ZERO_DATE a zero date is refused. The policy changes an
+    // answer only for an argument that is not a stored temporal, so it is
+    // appended for nothing else, and a call over a date or datetime column
+    // keeps the argument list its column kernels and rewrites read.
     // YEARWEEK's mode stays second.
     if matches!(
         function,
@@ -2412,8 +2415,11 @@ pub(super) fn bind_scalar(
             | ScalarFunction::DayName
             | ScalarFunction::MonthName
             | ScalarFunction::ToDays
+            | ScalarFunction::ToSeconds
             | ScalarFunction::YearWeek
-    ) && crate::session_parse_mode().allow_invalid_dates
+            | ScalarFunction::LastDay
+    ) && (crate::session_parse_mode().allow_invalid_dates
+        || crate::session_parse_mode().no_zero_date)
         && !matches!(
             args[0].data_type,
             Some(DataType::Date32 | DataType::DateTime64 { .. } | DataType::Time64 { .. })
@@ -2427,7 +2433,10 @@ pub(super) fn bind_scalar(
         if function == ScalarFunction::YearWeek && args.len() == 1 {
             args.push(literal(0));
         }
-        args.push(literal(4));
+        let mode = crate::session_parse_mode();
+        args.push(literal(
+            i64::from(mode.no_zero_date) | (i64::from(mode.allow_invalid_dates) << 2),
+        ));
     }
     if function == ScalarFunction::StrToDate {
         let mode = crate::session_parse_mode();

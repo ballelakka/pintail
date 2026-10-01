@@ -607,6 +607,13 @@ pub(super) fn calc_daynr(year: u32, month: u32, day: u32) -> i64 {
     days + year / 4 - centuries
 }
 
+/// [`calc_daynr`] of a calendar date: what `TO_DAYS` answers, and what
+/// `DATEDIFF` subtracts.
+pub(super) fn mysql_daynr(date: NaiveDate) -> i64 {
+    let [year, month, day] = date_fields(date);
+    calc_daynr(year, month, day)
+}
+
 /// `MySQL`'s `calc_weekday`: 0 is Monday, or Sunday when `sunday_first`.
 fn calc_weekday(daynr: i64, sunday_first: bool) -> u32 {
     u32::try_from((daynr + 5 + i64::from(sunday_first)).rem_euclid(7)).unwrap_or(0)

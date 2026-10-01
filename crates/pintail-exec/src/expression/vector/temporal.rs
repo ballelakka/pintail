@@ -516,7 +516,10 @@ fn differences_of(
             ScalarFunction::TimestampDiff { unit } => {
                 crate::expression::temporal::timestamp_diff(from, to, unit)
             }
-            _ => from.date().signed_duration_since(to.date()).num_days(),
+            _ => {
+                crate::expression::temporal::mysql_daynr(from.date())
+                    - crate::expression::temporal::mysql_daynr(to.date())
+            }
         });
         valid.push(true);
     }

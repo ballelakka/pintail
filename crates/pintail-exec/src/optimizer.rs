@@ -1640,6 +1640,7 @@ fn capture_timestamp_offsets(function: ScalarFunction, args: &mut [BoundExpr]) {
         | ScalarFunction::MonthName
         | ScalarFunction::LastDay
         | ScalarFunction::ToDays
+        | ScalarFunction::ToSeconds
         | ScalarFunction::YearWeek
         | ScalarFunction::TimeToSec
         | ScalarFunction::UnixTimestamp

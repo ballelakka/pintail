@@ -160,6 +160,7 @@ pub fn row_count() -> u64 {
     u64::try_from(ROWS.len()).expect("few rows")
 }
 
+#[allow(clippy::too_many_lines)] // one table of shapes
 pub fn cases() -> Vec<OracleCase> {
     let mut cases = Vec::new();
     let mut push = |sql_mode: &'static str, family: &'static str, sql: String| {
@@ -249,6 +250,49 @@ pub fn cases() -> Vec<OracleCase> {
                     column("'2024-04-31 10:00:00'"),
                     column("'2023-02-29'"),
                     column("'2024-02-00'")
+                ),
+            );
+        }
+    }
+    // The calendar parts of a date with a zero month or day are its fields
+    // as written, in a column, as text or as a packed number; a zero date
+    // written as text is refused under NO_ZERO_DATE. LAST_DAY needs only
+    // the month, TO_SECONDS and DATEDIFF count days as TO_DAYS does.
+    for function in [
+        "YEAR(@)",
+        "MONTH(@)",
+        "DAY(@)",
+        "DAYOFMONTH(@)",
+        "QUARTER(@)",
+        "LAST_DAY(@)",
+        "TO_SECONDS(@)",
+        "DATEDIFF(@, '2024-01-01')",
+        "DATEDIFF('2024-03-05', @)",
+    ] {
+        let of = |argument: &str| function.replace('@', argument);
+        push(
+            "",
+            "calendar edges date parts",
+            format!(
+                "SELECT id, {}, {}, {} FROM {TABLE} ORDER BY id",
+                of("d"),
+                of("dt"),
+                of("dt3")
+            ),
+        );
+        for sql_mode in [super::oracle_transport::DEFAULT_MODE, "ALLOW_INVALID_DATES"] {
+            push(
+                sql_mode,
+                "calendar edges date part literals",
+                format!(
+                    "SELECT {}, {}, {}, {}, {}, {}, {}",
+                    of("'2024-02-00'"),
+                    of("'2024-00-15 10:11:12.5'"),
+                    of("'0000-00-00'"),
+                    of("'0000-01-00'"),
+                    of("20240200"),
+                    of("0"),
+                    of("'2024-02-30'")
                 ),
             );
         }

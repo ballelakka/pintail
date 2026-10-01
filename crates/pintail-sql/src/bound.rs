@@ -1348,6 +1348,8 @@ pub enum ScalarFunction {
     LastDay,
     /// `TO_DAYS(date)`: days since year 0.
     ToDays,
+    /// `TO_SECONDS(date)`: seconds since year 0.
+    ToSeconds,
     /// `FROM_DAYS(n)`: inverse of `TO_DAYS`.
     FromDays,
     /// `YEARWEEK(date)` default mode 0.
