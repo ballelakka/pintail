@@ -424,6 +424,58 @@ fn canonical_temporal_text(
     }
 }
 
+/// Whether `text` is exactly what its value formats to at `scale`:
+/// an optional `-`, a whole part with no leading zero (a lone `0` below
+/// one), and, when `scale` is non-zero, a point and exactly `scale`
+/// fraction digits. A negative zero is not canonical, since zero formats
+/// unsigned.
+fn canonical_decimal_text(text: &str, scale: u8) -> bool {
+    let bytes = text.as_bytes();
+    let (negative, unsigned) = match bytes.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, bytes),
+    };
+    let fraction_len = usize::from(scale);
+    let (whole, fraction) = if fraction_len == 0 {
+        (unsigned, &[][..])
+    } else {
+        let Some(point) = unsigned.len().checked_sub(fraction_len + 1) else {
+            return false;
+        };
+        if unsigned[point] != b'.' {
+            return false;
+        }
+        (&unsigned[..point], &unsigned[point + 1..])
+    };
+    let digits = |part: &[u8]| part.iter().all(u8::is_ascii_digit);
+    if whole.is_empty() || !digits(whole) || !digits(fraction) {
+        return false;
+    }
+    if whole.len() > 1 && whole[0] == b'0' {
+        return false;
+    }
+    let zero = whole == b"0" && fraction.iter().all(|digit| *digit == b'0');
+    !(negative && zero)
+}
+
+/// The text carrier of a decimal column built from row values: derived from
+/// its units when every value was written canonically at the column's scale,
+/// as an aggregate's finished rows carry them, so sorting, rounding and
+/// gathering take the column as packed units instead of reading its values
+/// row by row. Text written any other way is kept as it was.
+fn canonical_decimal_column(values: &[Value], scale: u8, text: StrColumn) -> LazyText {
+    let canonical = values.iter().all(|value| match value {
+        Value::Utf8(written) => canonical_decimal_text(written, scale),
+        Value::Null => true,
+        _ => false,
+    });
+    if canonical {
+        LazyText::decimal(scale).prebuilt(text)
+    } else {
+        LazyText::ready(text)
+    }
+}
+
 /// Builds the packed projection for a homogeneous column: one builder chosen
 /// by the declared type's physical carrier, `None` when values defeat packing
 /// (mixed variants, unparseable decimal text, empty column).
@@ -576,7 +628,7 @@ fn build_typed(data_type: DataType, values: &[Value]) -> Option<(TypedValues, Va
         utf8.take().map(|text| TypedValues::Decimal128 {
             values: DecimalUnits::Wide(packed),
             scale,
-            text: LazyText::ready(text),
+            text: canonical_decimal_column(values, scale, text),
         })
     } else if let Some(units) = temporal.take() {
         // temporal is only alive for Date32/DateTime64 columns whose every
@@ -1447,6 +1499,43 @@ mod tests {
     use pintail_types::{DataType, Value};
 
     use super::{BatchError, ColumnVector, RecordBatch, SelectionMask};
+
+    #[test]
+    fn decimal_text_is_canonical_only_as_its_units_format() {
+        for (text, scale) in [
+            ("0.00", 2),
+            ("-0.50", 2),
+            ("12.30", 2),
+            ("-987654321.01", 2),
+            ("7", 0),
+            ("-7", 0),
+            ("0", 0),
+            ("123456789012345678901234567.123", 3),
+        ] {
+            let units = pintail_types::parse_decimal_scaled(text, scale).expect("parses");
+            assert!(super::canonical_decimal_text(text, scale), "{text}");
+            assert_eq!(pintail_types::format_decimal_scaled(units, scale), text);
+        }
+        for (text, scale) in [
+            ("-0.00", 2),
+            ("-0", 0),
+            ("00.10", 2),
+            ("012", 0),
+            ("1.5", 2),
+            ("1.500", 2),
+            (".50", 2),
+            ("+1.00", 2),
+            (" 1.00", 2),
+            ("1.00 ", 2),
+            ("1", 2),
+            ("1.", 0),
+            ("1e2", 0),
+            ("", 0),
+            ("-", 0),
+        ] {
+            assert!(!super::canonical_decimal_text(text, scale), "{text:?}");
+        }
+    }
 
     #[test]
     fn temporal_columns_from_canonical_values_derive_their_text() {
