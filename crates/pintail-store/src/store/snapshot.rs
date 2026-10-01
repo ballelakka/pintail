@@ -915,6 +915,7 @@ impl TableSnapshot {
             overlay: None,
             pending: std::collections::VecDeque::new(),
             index_lookup: None,
+            value_bounds: bounds.to_vec(),
         }))
     }
 

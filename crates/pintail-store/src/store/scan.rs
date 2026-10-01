@@ -83,6 +83,7 @@ pub struct ScanStats {
     pub(super) blocks_decoded: usize,
     pub(super) bytes_decompressed: u64,
     pub(super) values_decoded: u64,
+    pub(super) blocks_value_skipped: usize,
 }
 
 impl ScanStats {
@@ -108,6 +109,15 @@ impl ScanStats {
             self.values_decoded = self.values_decoded.saturating_add(column.values_decoded);
         }
         self
+    }
+
+    /// Returns row blocks of direct segments skipped because their stored
+    /// minimum and maximum prove no row satisfies a range predicate. Each
+    /// such block is skipped in every projected column, so it also shows in
+    /// [`Self::blocks_pruned`] once per column.
+    #[must_use]
+    pub fn blocks_value_skipped(self) -> usize {
+        self.blocks_value_skipped
     }
 
     /// Returns segments rejected from manifest key bounds.
@@ -150,6 +160,7 @@ impl ScanStats {
             .bytes_decompressed
             .saturating_add(other.bytes_decompressed);
         self.values_decoded = self.values_decoded.saturating_add(other.values_decoded);
+        self.blocks_value_skipped += other.blocks_value_skipped;
     }
 }
 
@@ -737,6 +748,9 @@ pub struct ProjectedScanStream {
     /// The side-index request the scan's predicates or a join
     /// gave it; consulted only while the index is switched on.
     pub(super) index_lookup: Option<super::side_index::IndexLookup>,
+    /// The scan predicates' value bounds, consulted against each direct
+    /// block's stored extremes on the filter-first path.
+    pub(super) value_bounds: Vec<segment::ColumnBounds>,
 }
 
 pub(super) struct MergedProjectedStream {
@@ -2413,6 +2427,18 @@ impl ProjectedScanStream {
         let row_count = end.saturating_sub(start);
         let scan_memory = AtomicUsize::new(0);
         let scan_budget = segment::ScanMemoryBudget::new(&scan_memory, memory_limit);
+        if let Some((candidates, skipped)) = self.value_candidate_ranges(segment, start, end)? {
+            return self.decode_value_candidates(
+                segment,
+                &candidates,
+                skipped,
+                predicate_ids,
+                &map_projection(predicate_ids)?,
+                select,
+                usize::from(start_row == 0),
+                &scan_budget,
+            );
+        }
         let fetch = segment::read_projected_columns(
             &self.snapshot.directory,
             segment,
@@ -2460,6 +2486,167 @@ impl ProjectedScanStream {
             usize::from(start_row == 0),
             &scan_budget,
         )
+    }
+
+    /// The rows of `start..end` of a direct segment that lie in blocks the
+    /// scan's value bounds cannot rule out, and how many blocks they rule
+    /// out; `None` when no bound applies or none is ruled out.
+    ///
+    /// A block is ruled out when, for some bound, its stored extremes lie
+    /// wholly outside the bound or every row of it is NULL (a NULL satisfies
+    /// no range or equality comparison). Every bound comes from a top-level
+    /// conjunct of the scan's predicates, so a row in such a block fails the
+    /// filter the executor would apply to it anyway.
+    ///
+    /// Only the direct filter-first path asks: its rows are the segment's
+    /// own, unshadowed by any other segment. An overlay's memtable rows are
+    /// interleaved after the segment rows are chosen, whatever this skips.
+    fn value_candidate_ranges(
+        &self,
+        segment: &segment::SegmentMeta,
+        start: usize,
+        end: usize,
+    ) -> Result<Option<ValueCandidates>, StoreError> {
+        if self.value_bounds.is_empty() || start >= end {
+            return Ok(None);
+        }
+        let mut blocks: Option<std::sync::Arc<Vec<segment::BlockExtremes>>> = None;
+        let mut keep: Vec<bool> = Vec::new();
+        for bound in &self.value_bounds {
+            if bound.lower.is_none() && bound.upper.is_none() {
+                continue;
+            }
+            let Some(extremes) = segment::block_extremes(
+                &self.snapshot.directory,
+                segment,
+                &self.snapshot.schema,
+                bound.column_id,
+                bound.domain,
+            )?
+            else {
+                continue;
+            };
+            if let Some(first) = &blocks {
+                // Every column of a segment is cut at the same rows; a
+                // directory that disagrees proves nothing.
+                if first.len() != extremes.len()
+                    || first
+                        .iter()
+                        .zip(extremes.iter())
+                        .any(|(left, right)| (left.start, left.end) != (right.start, right.end))
+                {
+                    return Ok(None);
+                }
+            } else {
+                keep = vec![true; extremes.len()];
+            }
+            for (flag, block) in keep.iter_mut().zip(extremes.iter()) {
+                let ruled_out = match block.range {
+                    None => true,
+                    Some((least, greatest)) => {
+                        bound.lower.is_some_and(|lower| greatest < lower)
+                            || bound.upper.is_some_and(|upper| least > upper)
+                    }
+                };
+                if ruled_out {
+                    *flag = false;
+                }
+            }
+            if blocks.is_none() {
+                blocks = Some(extremes);
+            }
+        }
+        let Some(blocks) = blocks else {
+            return Ok(None);
+        };
+        let mut candidates: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut skipped = 0_usize;
+        for (block, kept) in blocks.iter().zip(&keep) {
+            let lo = block.start.max(start);
+            let hi = block.end.min(end);
+            if lo >= hi {
+                continue;
+            }
+            if !kept {
+                skipped += 1;
+                continue;
+            }
+            match candidates.last_mut() {
+                Some(last) if last.end == lo => last.end = hi,
+                _ => candidates.push(lo..hi),
+            }
+        }
+        if skipped == 0 {
+            return Ok(None);
+        }
+        Ok(Some((candidates, skipped)))
+    }
+
+    /// The filter-first read of a direct segment restricted to the
+    /// `candidates` rows (absolute, ascending, disjoint) that block value
+    /// skipping left: the predicate columns decode for those rows alone,
+    /// the selector judges them as one run, and its choice maps back to
+    /// segment positions for the rest of the projection.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_value_candidates(
+        &self,
+        segment: &segment::SegmentMeta,
+        candidates: &[std::ops::Range<usize>],
+        skipped: usize,
+        predicate_ids: &[u32],
+        predicate_projection: &[usize],
+        select: PrewhereSelect<'_>,
+        segments_read: usize,
+        scan_budget: &segment::ScanMemoryBudget<'_>,
+    ) -> Result<ProjectedColumnChunk, StoreError> {
+        let fetch = segment::read_projected_column_ranges(
+            &self.snapshot.directory,
+            segment,
+            &self.snapshot.schema,
+            predicate_projection,
+            candidates,
+            scan_budget,
+        )?;
+        let row_count = candidates
+            .iter()
+            .map(std::iter::ExactSizeIterator::len)
+            .sum::<usize>();
+        let ranges = select(&fetch.columns, row_count).map_err(StoreError::FormatLimit)?;
+        let mut chunk = if predicate_ids == self.column_ids {
+            retain_predicate_fetch(
+                fetch,
+                ranges.as_ref(),
+                row_count,
+                segments_read,
+                scan_budget,
+            )?
+        } else if let Some(PrewhereRanges { ranges, exact }) = ranges {
+            check_selected_ranges(&ranges, row_count)?;
+            let absolute = candidate_positions(&ranges, candidates);
+            self.project_after_predicates(
+                segment,
+                predicate_ids,
+                fetch,
+                Some(&ranges),
+                KeptRows::Ranges(&absolute),
+                exact,
+                segments_read,
+                scan_budget,
+            )?
+        } else {
+            self.project_after_predicates(
+                segment,
+                predicate_ids,
+                fetch,
+                None,
+                KeptRows::Ranges(candidates),
+                false,
+                segments_read,
+                scan_budget,
+            )?
+        };
+        chunk.stats.blocks_value_skipped += skipped;
+        Ok(chunk)
     }
 
     /// Finishes a filter-first read once the selector has judged the
@@ -2860,6 +3047,20 @@ impl ProjectedScanStream {
                 .map_err(|_| StoreError::FormatLimit("segment row count exceeds usize".into()))?;
             let scan_memory = AtomicUsize::new(0);
             let scan_budget = segment::ScanMemoryBudget::new(&scan_memory, memory_limit);
+            if let Some((candidates, skipped)) =
+                self.value_candidate_ranges(&segment, 0, row_count)?
+            {
+                return self.decode_value_candidates(
+                    &segment,
+                    &candidates,
+                    skipped,
+                    predicate_ids,
+                    &predicate_projection,
+                    select,
+                    1,
+                    &scan_budget,
+                );
+            }
             let fetch = segment::read_projected_columns(
                 &self.snapshot.directory,
                 &segment,
@@ -3229,18 +3430,61 @@ impl ProjectedScanStream {
             .map_err(|_| StoreError::FormatLimit("range start exceeds usize".into()))?;
         let end = usize::try_from(end_row)
             .map_err(|_| StoreError::FormatLimit("range end exceeds usize".into()))?;
-        let row_count = end.saturating_sub(start);
         let scan_memory = AtomicUsize::new(0);
         let scan_budget = segment::ScanMemoryBudget::new(&scan_memory, memory_limit);
-        let fetch = segment::read_projected_columns(
-            &self.snapshot.directory,
+        // A segment read in ranges is still one segment read.
+        self.decode_projected_rows(
             segment,
-            &self.snapshot.schema,
+            start..end,
             &projection,
-            start,
-            end,
+            usize::from(start_row == 0),
             &scan_budget,
-        )?;
+        )
+    }
+
+    /// Decodes `rows` of a direct segment in every projected column, less
+    /// the blocks the scan's value bounds rule out (see
+    /// [`Self::value_candidate_ranges`]): their rows fail the scan's filter,
+    /// which the executor applies to whatever is returned.
+    fn decode_projected_rows(
+        &self,
+        segment: &segment::SegmentMeta,
+        rows: std::ops::Range<usize>,
+        projection: &[usize],
+        segments_read: usize,
+        scan_budget: &segment::ScanMemoryBudget<'_>,
+    ) -> Result<ProjectedColumnChunk, StoreError> {
+        let (fetch, row_count, value_skipped) =
+            match self.value_candidate_ranges(segment, rows.start, rows.end)? {
+                Some((candidates, skipped)) => (
+                    segment::read_projected_column_ranges(
+                        &self.snapshot.directory,
+                        segment,
+                        &self.snapshot.schema,
+                        projection,
+                        &candidates,
+                        scan_budget,
+                    )?,
+                    candidates
+                        .iter()
+                        .map(std::iter::ExactSizeIterator::len)
+                        .sum::<usize>(),
+                    skipped,
+                ),
+                None => (
+                    segment::read_projected_columns(
+                        &self.snapshot.directory,
+                        segment,
+                        &self.snapshot.schema,
+                        projection,
+                        rows.start,
+                        rows.end,
+                        scan_budget,
+                    )?,
+                    rows.len(),
+                    0,
+                ),
+            };
         let retained_bytes = size_of::<ProjectedColumnChunk>()
             .saturating_add(
                 fetch
@@ -3262,11 +3506,11 @@ impl ProjectedScanStream {
             columns: fetch.columns,
             row_count,
             stats: ScanStats {
-                // A segment read in ranges is still one segment read.
-                segments_read: usize::from(start_row == 0),
+                segments_read,
                 blocks_decoded: fetch.blocks_decoded,
                 blocks_read: fetch.blocks_read,
                 blocks_pruned: fetch.blocks_pruned,
+                blocks_value_skipped: value_skipped,
                 ..ScanStats::default()
             }
             .with_decode(&fetch.column_decode),
@@ -3440,47 +3684,7 @@ impl ProjectedScanStream {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let row_count = rows.len();
-        let fetch = segment::read_projected_columns(
-            &self.snapshot.directory,
-            segment,
-            &self.snapshot.schema,
-            &projection,
-            rows.start,
-            rows.end,
-            scan_budget,
-        )?;
-        let retained_bytes = size_of::<ProjectedColumnChunk>()
-            .saturating_add(
-                fetch
-                    .columns
-                    .capacity()
-                    .saturating_mul(size_of::<DecodedColumn>()),
-            )
-            .saturating_add(
-                fetch
-                    .columns
-                    .iter()
-                    .map(DecodedColumn::retained_bytes)
-                    .sum(),
-            );
-        scan_budget.release(fetch.reserved_bytes);
-        scan_budget.reserve(retained_bytes)?;
-        Ok(ProjectedColumnChunk {
-            prefiltered: false,
-            columns: fetch.columns,
-            row_count,
-            stats: ScanStats {
-                segments_read: 1,
-                blocks_decoded: fetch.blocks_decoded,
-                blocks_read: fetch.blocks_read,
-                blocks_pruned: fetch.blocks_pruned,
-                ..ScanStats::default()
-            }
-            .with_decode(&fetch.column_decode),
-            retained_bytes,
-            column_decode: fetch.column_decode,
-        })
+        self.decode_projected_rows(segment, rows, &projection, 1, scan_budget)
     }
 
     fn decode_column_chunk(
@@ -3792,6 +3996,41 @@ fn check_selected_ranges(ranges: &[std::ops::Range<usize>], rows: usize) -> Resu
     Ok(())
 }
 
+/// Rows of a direct segment that block value skipping leaves to decode
+/// (absolute, ascending, disjoint), and how many blocks it skipped.
+type ValueCandidates = (Vec<std::ops::Range<usize>>, usize);
+
+/// Maps `ranges` over the rows of `candidates` laid end to end (as a fetch
+/// of those row ranges returns them) back to the segment positions they
+/// name. `ranges` must be checked against the candidates' row total.
+fn candidate_positions(
+    ranges: &[std::ops::Range<usize>],
+    candidates: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut positions: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    let mut candidate = 0_usize;
+    // Packed offset of `candidates[candidate].start`.
+    let mut base = 0_usize;
+    for range in ranges {
+        let mut at = range.start;
+        while at < range.end {
+            while base + candidates[candidate].len() <= at {
+                base += candidates[candidate].len();
+                candidate += 1;
+            }
+            let span = &candidates[candidate];
+            let until = range.end.min(base + span.len());
+            let mapped = span.start + (at - base)..span.start + (until - base);
+            match positions.last_mut() {
+                Some(last) if last.end == mapped.start => last.end = mapped.end,
+                _ => positions.push(mapped),
+            }
+            at = until;
+        }
+    }
+    positions
+}
+
 /// The predicate projection already decoded every output column. Compact
 /// those buffers before the prefetch round retains them, preserving native
 /// values, text arenas and dictionary codes instead of decoding them again.
@@ -4004,6 +4243,31 @@ mod overlay_primitive_tests {
                 .interleave(&[(0, &a), (2, &b), (4, &c)])
                 .into_values(),
             [1_u64, 2, 3, 4, 5].map(Value::UInt64).to_vec()
+        );
+    }
+}
+
+#[cfg(test)]
+mod candidate_position_tests {
+    use super::candidate_positions;
+
+    #[test]
+    fn packed_ranges_map_back_across_candidate_gaps() {
+        // Candidates 10..20 and 40..45 pack as rows 0..10 and 10..15.
+        let candidates = [10..20, 40..45];
+        assert_eq!(
+            candidate_positions(&[0..3, 8..12, 14..15], &candidates),
+            vec![10..13, 18..20, 40..42, 44..45]
+        );
+        // Candidates that touch map to one range.
+        assert_eq!(
+            candidate_positions(std::slice::from_ref(&(0..15)), &[0..5, 5..15]),
+            std::iter::once(0..15).collect::<Vec<_>>()
+        );
+        assert_eq!(candidate_positions(&[], &candidates), Vec::new());
+        assert_eq!(
+            candidate_positions(std::slice::from_ref(&(4..4)), &candidates),
+            Vec::new()
         );
     }
 }

@@ -91,6 +91,10 @@ pub struct PhysicalScanStats {
     pub bytes_decompressed: u64,
     /// Column values the reads delivered, predicate columns included.
     pub values_decoded: u64,
+    /// Row blocks skipped because their stored minimum and maximum rule
+    /// out every row for a range or equality predicate (each also counts in
+    /// `blocks_pruned` once per projected column).
+    pub blocks_value_skipped: usize,
 }
 
 impl PhysicalScanStats {
@@ -116,6 +120,7 @@ impl PhysicalScanStats {
             .bytes_decompressed
             .saturating_add(other.bytes_decompressed);
         self.values_decoded = self.values_decoded.saturating_add(other.values_decoded);
+        self.blocks_value_skipped += other.blocks_value_skipped;
     }
 }
 
@@ -129,6 +134,7 @@ impl From<ScanStats> for PhysicalScanStats {
             blocks_decoded: stats.blocks_decoded(),
             bytes_decompressed: stats.bytes_decompressed(),
             values_decoded: stats.values_decoded(),
+            blocks_value_skipped: stats.blocks_value_skipped(),
         }
     }
 }
@@ -407,6 +413,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
                 ready: VecDeque::new(),
                 last_prefiltered: false,
                 column_decode: BTreeMap::new(),
+                value_skipped_blocks: 0,
                 prefetched: VecDeque::new(),
                 stream: None,
                 prewhere: None,
@@ -609,6 +616,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
                 ready: VecDeque::new(),
                 last_prefiltered: false,
                 column_decode: BTreeMap::new(),
+                value_skipped_blocks: 0,
                 prefetched: VecDeque::new(),
                 stream: Some(stream),
                 prewhere,
@@ -689,6 +697,7 @@ impl ScanProvider for SnapshotScanProvider<'_> {
             ready: VecDeque::new(),
             last_prefiltered: false,
             column_decode: BTreeMap::new(),
+            value_skipped_blocks: 0,
             prefetched: VecDeque::new(),
             stream: None,
             prewhere: None,
@@ -1112,6 +1121,9 @@ struct SnapshotStream {
     /// Per column id, the bytes this scan's blocks decompressed to and the
     /// values its reads delivered, for the profile.
     column_decode: BTreeMap<u32, (u64, u64)>,
+    /// Row blocks this scan left undecoded because their stored extremes
+    /// rule out the scan's range predicates.
+    value_skipped_blocks: usize,
     columns: Vec<DecodedColumn>,
     column_rows: usize,
     prewhere: Option<PrewhereSpec>,
@@ -1271,6 +1283,7 @@ impl SnapshotStream {
     /// and its per-column decode cost into this scan's own tally.
     fn accumulate(&mut self, chunk: &ProjectedColumnChunk) {
         let stats = chunk.stats();
+        self.value_skipped_blocks += stats.blocks_value_skipped();
         for column in chunk.column_decode() {
             let tally = self.column_decode.entry(column.column_id).or_default();
             tally.0 = tally.0.saturating_add(column.bytes_decompressed);
@@ -1288,6 +1301,7 @@ impl SnapshotStream {
                 blocks_decoded: stats.blocks_decoded(),
                 bytes_decompressed: stats.bytes_decompressed(),
                 values_decoded: stats.values_decoded(),
+                blocks_value_skipped: stats.blocks_value_skipped(),
                 ..PhysicalScanStats::default()
             });
     }
@@ -1356,7 +1370,7 @@ impl BatchStream for SnapshotStream {
 
     fn decode_note(&self) -> Option<String> {
         use std::fmt::Write as _;
-        if self.column_decode.is_empty() {
+        if self.column_decode.is_empty() && self.value_skipped_blocks == 0 {
             return None;
         }
         let (bytes, values) = self
@@ -1368,6 +1382,9 @@ impl BatchStream for SnapshotStream {
         let mut note = format!("decompressed={bytes}B values={values}");
         for (id, (bytes, values)) in &self.column_decode {
             let _ = write!(note, " c{id}={bytes}B/{values}");
+        }
+        if self.value_skipped_blocks > 0 {
+            let _ = write!(note, " value_skipped_blocks={}", self.value_skipped_blocks);
         }
         Some(note)
     }

@@ -191,6 +191,13 @@ fn write_plan(
                         stats.bytes_decompressed, stats.values_decoded
                     )?;
                 }
+                if stats.blocks_value_skipped > 0 {
+                    write!(
+                        output,
+                        " value_skipped_blocks={}",
+                        stats.blocks_value_skipped
+                    )?;
+                }
             }
             writeln!(output)
         }

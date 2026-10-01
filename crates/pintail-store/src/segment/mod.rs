@@ -382,7 +382,7 @@ pub struct ColumnBounds {
 
 /// The extremes family a [`ColumnBounds`] compares against. A mismatched
 /// family never prunes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BoundDomain {
     Int,
     UInt,
@@ -631,7 +631,7 @@ enum LogicalType {
 /// A fixed-width unit representation for a text-carried column, eligible
 /// only when every stored value round-trips text -> units -> identical text
 /// (PTSEG v2; docs/decisions.md "PTSEG v2 approved").
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NativeUnits {
     /// Days since 1970-01-01 for `Date32` columns.
     Date,
@@ -2665,6 +2665,188 @@ fn projected_layout(
         }
     }
     Ok(layout)
+}
+
+/// One block's stored value range for a column, in a bound domain's
+/// integer units, as the block's own minimum and maximum record it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockExtremes {
+    /// First segment row of the block.
+    pub(crate) start: usize,
+    /// One past the block's last segment row.
+    pub(crate) end: usize,
+    /// Least and greatest non-NULL value; `None` when every row is NULL.
+    pub(crate) range: Option<(i128, i128)>,
+}
+
+type ExtremesKey = (VerifiedKey, u32, BoundDomain);
+
+/// One cached answer. The slot is filled under its own lock, so the scan
+/// threads that reach a segment's slices together read its blocks once
+/// rather than once each.
+type ExtremesSlot =
+    std::sync::Arc<std::sync::Mutex<Option<Option<std::sync::Arc<Vec<BlockExtremes>>>>>>;
+
+#[derive(Default)]
+struct BlockExtremesCache {
+    entries: HashMap<ExtremesKey, ExtremesSlot>,
+    bytes: usize,
+}
+
+fn block_extremes_cache() -> &'static std::sync::Mutex<BlockExtremesCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BlockExtremesCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(BlockExtremesCache::default()))
+}
+
+/// The per-block value ranges of one column of a segment, read from the
+/// minimum and maximum every block stores beside its payload, so a scan can
+/// skip blocks whose values cannot satisfy a range predicate.
+///
+/// `None` when the segment cannot answer in `domain`: the column is absent
+/// from it (added after the segment was written), or it is stored in a
+/// carrier other than the one `domain` compares (text, a different unit
+/// family). Each block's checksum is verified before its extremes are
+/// trusted; the payload is never decompressed. Answers are cached per
+/// segment identity and schema generation, as the block directory is.
+pub(crate) fn block_extremes(
+    directory: &Path,
+    meta: &SegmentMeta,
+    schema: &TableSchema,
+    column_id: u32,
+    domain: BoundDomain,
+) -> Result<Option<std::sync::Arc<Vec<BlockExtremes>>>, StoreError> {
+    const CACHE_BYTES: usize = 16 * 1024 * 1024;
+    let path = directory.join(&meta.file_name);
+    let Some(key) = verified_key(&path, meta, schema).map(|key| (key, column_id, domain)) else {
+        return Ok(
+            read_block_extremes(directory, meta, schema, column_id, domain)?
+                .map(std::sync::Arc::new),
+        );
+    };
+    let slot = block_extremes_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .entry(key.clone())
+        .or_default()
+        .clone();
+    let mut answer = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(found) = answer.as_ref() {
+        return Ok(found.clone());
+    }
+    // A failed read leaves the slot empty for the next scan to retry.
+    let extremes =
+        read_block_extremes(directory, meta, schema, column_id, domain)?.map(std::sync::Arc::new);
+    *answer = Some(extremes.clone());
+    drop(answer);
+    let bytes = extremes
+        .as_ref()
+        .map_or(0, |blocks| blocks.capacity() * size_of::<BlockExtremes>())
+        + size_of::<ExtremesKey>()
+        + key.0.0.as_os_str().len();
+    let mut cache = block_extremes_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.bytes.saturating_add(bytes) > CACHE_BYTES || cache.entries.len() > 16_384 {
+        // Readers holding a slot keep it; the map starts over.
+        cache.entries.clear();
+        cache.bytes = 0;
+    }
+    cache.bytes += bytes;
+    Ok(extremes)
+}
+
+fn read_block_extremes(
+    directory: &Path,
+    meta: &SegmentMeta,
+    schema: &TableSchema,
+    column_id: u32,
+    domain: BoundDomain,
+) -> Result<Option<Vec<BlockExtremes>>, StoreError> {
+    let path = directory.join(&meta.file_name);
+    verify(directory, meta, schema)?;
+    let Some(schema_column) = schema
+        .columns()
+        .iter()
+        .find(|column| column.id() == column_id)
+    else {
+        return Ok(None);
+    };
+    let mut decoder = FileDecoder::open(&path)?;
+    let header = read_segment_columns_header(&path, &mut decoder, meta, schema)?;
+    let layout = projected_layout(&path, meta, schema, &mut decoder, &header)?;
+    let Some(column) = layout.iter().find(|column| column.id == column_id) else {
+        return Ok(None);
+    };
+    // The scan interprets a stored column through the schema's type, so the
+    // extremes are read the same way: wire Int64 is units for a native type
+    // and a plain integer otherwise.
+    let native = NativeUnits::for_data_type(schema_column.data_type());
+    let comparable = match (domain, column.logical_type) {
+        (BoundDomain::Int, LogicalType::Int64) => native.is_none(),
+        (BoundDomain::UInt, LogicalType::UInt64) => true,
+        (BoundDomain::Temporal(units), LogicalType::Int64) => native == Some(units),
+        _ => false,
+    };
+    if !comparable {
+        return Ok(None);
+    }
+    let unsigned = column.logical_type == LogicalType::UInt64;
+    let read_units = |bytes: &[u8]| -> Option<i128> {
+        let bytes: [u8; 8] = bytes.try_into().ok()?;
+        Some(if unsigned {
+            i128::from(u64::from_le_bytes(bytes))
+        } else {
+            i128::from(i64::from_le_bytes(bytes))
+        })
+    };
+    let used = AtomicUsize::new(0);
+    let budget = ScanMemoryBudget::new(&used, usize::MAX);
+    let mut blocks = Vec::with_capacity(column.blocks.len());
+    for block in &column.blocks {
+        decoder
+            .seek_to(block.offset)
+            .map_err(|reason| corrupt_here(&path, &decoder, reason))?;
+        let mut stored: Option<(Vec<u8>, Vec<u8>)> = None;
+        let read = read_file_block_if_bounded(
+            &path,
+            &mut decoder,
+            column.logical_type,
+            &budget,
+            |minimum, maximum| {
+                stored = Some((minimum.to_vec(), maximum.to_vec()));
+                Ok(false)
+            },
+        )?;
+        if read.row_count != block.end - block.start {
+            return Err(corrupt_here(
+                &path,
+                &decoder,
+                "column block row count mismatch",
+            ));
+        }
+        let Some((minimum, maximum)) = stored else {
+            return Ok(None);
+        };
+        let range = if minimum.is_empty() && maximum.is_empty() {
+            None
+        } else {
+            match (read_units(&minimum), read_units(&maximum)) {
+                (Some(least), Some(greatest)) if least <= greatest => Some((least, greatest)),
+                // Extremes this reader does not understand prove nothing.
+                _ => return Ok(None),
+            }
+        };
+        blocks.push(BlockExtremes {
+            start: block.start,
+            end: block.end,
+            range,
+        });
+    }
+    Ok(Some(blocks))
 }
 
 /// Packed columns produced by [`read_projected_columns`].
