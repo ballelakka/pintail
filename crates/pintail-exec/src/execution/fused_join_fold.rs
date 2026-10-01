@@ -38,12 +38,13 @@ const AVERAGE_MAX_DIGITS: u8 = 19;
 /// exactly one row.
 ///
 /// A slot without a key - and any probe row that matches nothing - resolves
-/// to the discard group one past the real ones, so the fold adds every row
-/// somewhere and needs no branch to skip the misses.
+/// to the miss group one past the real ones, so the fold adds every row
+/// somewhere and needs no branch to skip the misses. An inner join discards
+/// that group; an outer join's unmatched rows are exactly it.
 pub(super) struct UniqueKeyGroups {
     minimum: i128,
     groups: Vec<u32>,
-    discard: u32,
+    miss: u32,
 }
 
 impl UniqueKeyGroups {
@@ -56,16 +57,16 @@ impl UniqueKeyGroups {
         group_count: usize,
     ) -> Option<Self> {
         let (minimum, index) = build.dense_layout()?;
-        let discard = u32::try_from(group_count)
+        let miss = u32::try_from(group_count)
             .ok()
-            .filter(|discard| *discard < u32::MAX)?;
+            .filter(|miss| *miss < u32::MAX - 1)?;
         let mut groups = Vec::with_capacity(index.len());
         for slot in index {
             let group = match slot {
-                None => discard,
+                None => miss,
                 Some(flat) => match dense_group_indexes.get(*flat).copied().flatten() {
-                    None | Some([]) => discard,
-                    Some([group]) => u32::try_from(*group).ok().filter(|g| *g < discard)?,
+                    None | Some([]) => miss,
+                    Some([group]) => u32::try_from(*group).ok().filter(|g| *g < miss)?,
                     Some(_) => return None,
                 },
             };
@@ -74,7 +75,7 @@ impl UniqueKeyGroups {
         Some(Self {
             minimum,
             groups,
-            discard,
+            miss,
         })
     }
 
@@ -88,10 +89,10 @@ impl UniqueKeyGroups {
         usize::try_from(key.wrapping_sub(self.minimum))
             .ok()
             .and_then(|offset| self.groups.get(offset).copied())
-            .unwrap_or(self.discard)
+            .unwrap_or(self.miss)
     }
 
-    /// Each value's group into `out`, NULL keys to the discard group.
+    /// Each value's group into `out`, NULL keys to the miss group.
     #[inline]
     fn resolve_into<T: Copy>(&self, values: &[T], valid: Option<&[bool]>, out: &mut Vec<u32>)
     where
@@ -102,7 +103,7 @@ impl UniqueKeyGroups {
         if let Some(valid) = valid {
             for (group, valid) in out.iter_mut().zip(valid) {
                 if !valid {
-                    *group = self.discard;
+                    *group = self.miss;
                 }
             }
         }
@@ -241,15 +242,18 @@ fn add_units(totals: &mut [i128], groups: &[u32], units: &[i64], rows: &Rows<'_>
 }
 
 /// Folds `morsel` into `groups` through the unique-key table, marking each
-/// group a probe row reached in `touched`. `false`, with nothing folded,
+/// group a probe row reached in `touched`. Under `outer`, `groups` holds the
+/// miss group last and the rows that match nothing fold into it. `false`,
+/// with nothing folded,
 /// when a column of this batch is not in a representation a lane reads -
 /// the row fold then takes the morsel.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn fold_morsel(
     morsel: &Morsel<'_>,
     left_key: &CompiledExpr,
     keys: &UniqueKeyGroups,
     lanes: &[Lane],
+    outer: bool,
     groups: &mut [AggregateGroup],
     touched: &mut [bool],
     memory: &MemoryTracker,
@@ -307,9 +311,17 @@ pub(super) fn fold_morsel(
         inputs.push(input);
     }
 
-    let group_count = groups.len();
-    // One slot more than the groups: the discard group the misses land in.
-    let slots = group_count + 1;
+    // The build-side groups, then the miss group, then a sink for the rows
+    // a lane's NULL argument leaves out of that lane.
+    let miss = keys.miss as usize;
+    let sink = keys.miss + 1;
+    let slots = miss + 2;
+    let folded_groups = if outer { miss + 1 } else { miss };
+    if groups.len() < folded_groups {
+        return Err(ExecError::InvalidPhysicalPlan(
+            "a fused join fold has fewer groups than its key table",
+        ));
+    }
     let mut hits = vec![0_u64; slots];
     let mut totals = vec![0_i128; slots.saturating_mul(lanes.len())];
     let mut null_rows = vec![0_u64; slots.saturating_mul(lanes.len())];
@@ -363,9 +375,9 @@ pub(super) fn fold_morsel(
                     units, validity, ..
                 } => (*validity, Some(*units)),
             };
-            // A NULL argument's row moves to the discard group for this
-            // lane alone, and is counted against its group's valid rows;
-            // the other lanes still see it.
+            // A NULL argument's row moves to the sink for this lane alone,
+            // and is counted against its group's valid rows; the other
+            // lanes still see it.
             let groups = if rows.validity(validity, &mut valid) {
                 let nulls = &mut null_rows[lane_slots.clone()];
                 lane_groups.clear();
@@ -374,7 +386,7 @@ pub(super) fn fold_morsel(
                         lane_groups.push(*group);
                     } else {
                         nulls[*group as usize] += 1;
-                        lane_groups.push(keys.discard);
+                        lane_groups.push(sink);
                     }
                 }
                 &lane_groups
@@ -387,7 +399,7 @@ pub(super) fn fold_morsel(
         }
     }
 
-    for (group_index, rows) in hits.iter().take(group_count).enumerate() {
+    for (group_index, rows) in hits.iter().take(folded_groups).enumerate() {
         if *rows == 0 {
             continue;
         }

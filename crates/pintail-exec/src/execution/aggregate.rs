@@ -22,8 +22,9 @@ use crate::BatchStream as _;
 
 use super::fused_join_fold::{Lane, UniqueKeyGroups, fold_morsel, plan_lanes};
 use super::join::{
-    JoinGroupPlan, JoinHashKey, PartitionedBuild, build_hash_join_state, normalized_group_hash_key,
-    normalized_group_value, normalized_hash_key, normalized_join_key, resolve_join_group_plan,
+    BuildRow, JoinGroupPlan, JoinHashKey, PartitionedBuild, build_hash_join_state,
+    normalized_group_hash_key, normalized_group_value, normalized_hash_key, normalized_join_key,
+    resolve_join_group_plan,
 };
 use super::morsel::{Morsel, default_morsel_limit, split_into_morsels, split_into_morsels_bounded};
 use super::two_pass::{
@@ -4809,7 +4810,7 @@ fn build_fused_inner_join_aggregate(
     // The fused spine probes on the primary key alone; composite-key joins
     // stay on the general operator.
     if !extra_keys.is_empty()
-        || *kind != BoundJoinKind::Inner
+        || !matches!(kind, BoundJoinKind::Inner | BoundJoinKind::Left)
         || state.is_some()
         || *right_width > column_types.len()
         || group_columns
@@ -4836,6 +4837,9 @@ fn build_fused_inner_join_aggregate(
         .iter()
         .map(|column| column - left_width)
         .collect::<Vec<_>>();
+    // A LEFT join keeps every probe row: one that finds no build row folds
+    // into a group whose build-side columns are all NULL.
+    let outer = *kind == BoundJoinKind::Left;
     let build_clock = std::time::Instant::now();
     let build_start = memory.used();
     let join = build_hash_join_state(
@@ -4910,7 +4914,7 @@ fn build_fused_inner_join_aggregate(
         .map(|values| estimated_row_payload_bytes(values))
         .sum::<usize>()
         .saturating_add(
-            plan.values.len().saturating_mul(
+            plan.values.len().saturating_add(1).saturating_mul(
                 size_of::<AggregateGroup>()
                     .saturating_add(aggregates.len().saturating_mul(size_of::<AggregateState>()))
                     .saturating_add(HASH_ENTRY_OVERHEAD)
@@ -4976,6 +4980,7 @@ fn build_fused_inner_join_aggregate(
             .map(|morsel| {
                 build_local_fused_join_groups(
                     morsel,
+                    outer.then_some(group_columns.len()),
                     left_key,
                     *key_mode,
                     group_collation,
@@ -5044,9 +5049,58 @@ fn build_fused_inner_join_aggregate(
     Ok(Some(finish_aggregate_groups(groups.into_values(), memory)?))
 }
 
+/// Folds one joined row into `states`: probe-side arguments from `row` of
+/// `batch`, build-side ones from `right` - NULL where an outer join found no
+/// build row.
+#[allow(clippy::too_many_arguments)]
+fn fold_joined_row(
+    states: &mut [AggregateState],
+    aggregates: &[CompiledAggregate],
+    batch: &RecordBatch,
+    row: usize,
+    right: Option<BuildRow>,
+    build: &PartitionedBuild,
+    left_width: usize,
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
+    for (aggregate, state) in aggregates.iter().zip(states) {
+        let value = match aggregate.expr.as_ref() {
+            None => &Value::Boolean(true),
+            Some(expression) => {
+                let column = expression
+                    .column_index()
+                    .ok_or(ExecError::InvalidPhysicalPlan(
+                        "fused join aggregate expression is not a column",
+                    ))?;
+                if column < left_width {
+                    // Probe-side columns update typed-first: the Q8 profile
+                    // showed per-row decimal text parse/format dominating
+                    // this loop.
+                    if update_state_from_typed_column(state, aggregate, batch, column, row, memory)?
+                    {
+                        continue;
+                    }
+                    direct_group_value(batch, row, column)?
+                } else if let Some(right) = right {
+                    build.value(right, column - left_width).ok_or(
+                        ExecError::InvalidPhysicalPlan(
+                            "join aggregate column is outside the joined layout",
+                        ),
+                    )?
+                } else {
+                    &Value::Null
+                }
+            }
+        };
+        state.update(aggregate, value, memory)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_local_fused_join_groups(
     morsel: &Morsel<'_>,
+    outer_group_width: Option<usize>,
     left_key: &CompiledExpr,
     key_mode: JoinKeyMode,
     group_collation: Collation,
@@ -5069,6 +5123,15 @@ fn build_local_fused_join_groups(
             states: aggregates.iter().map(AggregateState::new).collect(),
         })
         .collect::<Vec<_>>();
+    // An outer join's unmatched rows fold into one more group, past the
+    // build-side ones, whose group columns are NULL.
+    let null_group = outer_group_width.map(|width| {
+        groups.push(AggregateGroup {
+            values: vec![Value::Null; width],
+            states: aggregates.iter().map(AggregateState::new).collect(),
+        });
+        groups.len() - 1
+    });
     let mut touched = vec![false; groups.len()];
     let memory = parent_memory.unbounded_worker();
     let batch = morsel.batch;
@@ -5093,6 +5156,7 @@ fn build_local_fused_join_groups(
             left_key,
             keys,
             lanes,
+            null_group.is_some(),
             &mut groups,
             &mut touched,
             &memory,
@@ -5104,82 +5168,76 @@ fn build_local_fused_join_groups(
         if offset % 1024 == 0 {
             memory.check_interruption()?;
         }
-        let (matches, indexes) = if let Some((typed, validity)) = left_typed {
-            if !validity.is_valid(row) {
-                continue;
-            }
-            let key = match typed {
-                crate::batch::TypedValues::Int64(values) => {
-                    let candidate = values[row];
-                    if candidate < 0 {
-                        JoinHashKey::NegativeInteger(candidate)
-                    } else {
-                        JoinHashKey::NonNegativeInteger(
-                            u64::try_from(candidate).expect("non-negative i64 fits u64"),
-                        )
-                    }
-                }
-                crate::batch::TypedValues::UInt64(values) => {
-                    JoinHashKey::NonNegativeInteger(values[row])
-                }
-                _ => unreachable!("filtered to integer projections"),
-            };
-            let Some((flat_index, matches)) = build.dense_get(&key) else {
-                continue;
-            };
-            let Some(indexes) = dense_group_indexes[flat_index] else {
-                continue;
-            };
-            (matches, indexes)
-        } else {
-            let Some(key) = normalized_join_key(left_key.evaluate(batch, row)?, key_mode)? else {
-                continue;
-            };
-            let Some(matches) = build.get(&key) else {
-                continue;
-            };
-            let indexes = plan
-                .buckets
-                .get(&(std::ptr::from_ref(matches) as usize))
-                .ok_or(ExecError::InvalidPhysicalPlan(
-                    "probe matched a bucket outside the resolved group plan",
-                ))?;
-            (matches, indexes.as_slice())
-        };
-        for (right_values, group_index) in matches.iter().zip(indexes) {
-            let group_index = *group_index;
-            touched[group_index] = true;
-            for (aggregate, state) in aggregates.iter().zip(&mut groups[group_index].states) {
-                let value = match aggregate.expr.as_ref() {
-                    None => &Value::Boolean(true),
-                    Some(expression) => {
-                        let column =
-                            expression
-                                .column_index()
-                                .ok_or(ExecError::InvalidPhysicalPlan(
-                                    "fused join aggregate expression is not a column",
-                                ))?;
-                        if column < left_width {
-                            // Probe-side columns update typed-first: the
-                            // Q8 profile showed per-row decimal text
-                            // parse/format dominating this loop.
-                            if update_state_from_typed_column(
-                                state, aggregate, batch, column, row, &memory,
-                            )? {
-                                continue;
-                            }
-                            direct_group_value(batch, row, column)?
+        let found = if let Some((typed, validity)) = left_typed {
+            if validity.is_valid(row) {
+                let key = match typed {
+                    crate::batch::TypedValues::Int64(values) => {
+                        let candidate = values[row];
+                        if candidate < 0 {
+                            JoinHashKey::NegativeInteger(candidate)
                         } else {
-                            build.value(*right_values, column - left_width).ok_or(
-                                ExecError::InvalidPhysicalPlan(
-                                    "join aggregate column is outside the joined layout",
-                                ),
-                            )?
+                            JoinHashKey::NonNegativeInteger(
+                                u64::try_from(candidate).expect("non-negative i64 fits u64"),
+                            )
                         }
                     }
+                    crate::batch::TypedValues::UInt64(values) => {
+                        JoinHashKey::NonNegativeInteger(values[row])
+                    }
+                    _ => unreachable!("filtered to integer projections"),
                 };
-                state.update(aggregate, value, &memory)?;
+                build.dense_get(&key).and_then(|(flat_index, matches)| {
+                    dense_group_indexes[flat_index].map(|indexes| (matches, indexes))
+                })
+            } else {
+                None
             }
+        } else {
+            match normalized_join_key(left_key.evaluate(batch, row)?, key_mode)?
+                .and_then(|key| build.get(&key))
+            {
+                Some(matches) => {
+                    let indexes = plan
+                        .buckets
+                        .get(&(std::ptr::from_ref(matches) as usize))
+                        .ok_or(ExecError::InvalidPhysicalPlan(
+                            "probe matched a bucket outside the resolved group plan",
+                        ))?;
+                    Some((matches, indexes.as_slice()))
+                }
+                None => None,
+            }
+        };
+        match (found, null_group) {
+            (Some((matches, indexes)), _) => {
+                for (right, group_index) in matches.iter().zip(indexes) {
+                    touched[*group_index] = true;
+                    fold_joined_row(
+                        &mut groups[*group_index].states,
+                        aggregates,
+                        batch,
+                        row,
+                        Some(*right),
+                        build,
+                        left_width,
+                        &memory,
+                    )?;
+                }
+            }
+            (None, Some(null_group)) => {
+                touched[null_group] = true;
+                fold_joined_row(
+                    &mut groups[null_group].states,
+                    aggregates,
+                    batch,
+                    row,
+                    None,
+                    build,
+                    left_width,
+                    &memory,
+                )?;
+            }
+            (None, None) => {}
         }
     }
     // Uniform by construction: the fused path is gated to keys that share

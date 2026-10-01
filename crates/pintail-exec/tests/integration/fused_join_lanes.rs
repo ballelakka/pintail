@@ -89,6 +89,7 @@ fn table(
 }
 
 impl Fixture {
+    #[allow(clippy::too_many_lines)]
     fn new() -> Self {
         let directory = tempfile::tempdir().expect("directory");
         let optional = |value: Option<Value>| value.unwrap_or(Value::Null);
@@ -143,12 +144,39 @@ impl Fixture {
                 })
                 .collect(),
         );
+        // A dimension whose group column is sometimes NULL: under a LEFT
+        // join those rows share a group with the unmatched probe rows.
+        let spots = table(
+            directory.path(),
+            "spots",
+            vec![
+                Column::new(1, "id", DataType::Int64, false),
+                Column::new(2, "zone", DataType::Utf8, true),
+            ],
+            (1..=DIMS)
+                .filter(|id| dim_present(*id))
+                .map(|id| {
+                    vec![
+                        Value::Int64(id),
+                        if id % 4 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Utf8(zone(id).to_owned())
+                        },
+                    ]
+                })
+                .collect(),
+        );
         let mut stores = Vec::new();
         let mut entries = Vec::new();
-        for (index, (name, (store, schema, count))) in
-            [("facts", facts), ("dims", dims), ("pairs", pairs)]
-                .into_iter()
-                .enumerate()
+        for (index, (name, (store, schema, count))) in [
+            ("facts", facts),
+            ("dims", dims),
+            ("pairs", pairs),
+            ("spots", spots),
+        ]
+        .into_iter()
+        .enumerate()
         {
             entries.push(
                 TableEntry::new(
@@ -323,4 +351,90 @@ fn aggregates_without_a_lane_keep_the_row_fold() {
         "JOIN dims d ON f.dim_id = d.id",
         "GROUP BY d.zone ORDER BY d.zone",
     );
+}
+
+/// A LEFT join keeps the probe rows that match nothing - NULL keys, gaps,
+/// keys past either end - in one group whose build columns are NULL.
+#[test]
+fn a_left_join_folds_unmatched_rows_into_the_null_group() {
+    let fixture = Fixture::new();
+    let rows = agree(
+        &fixture,
+        "SELECT d.zone, COUNT(*), COUNT(f.amount), SUM(f.amount), AVG(f.amount) FROM facts f",
+        "LEFT JOIN dims d ON f.dim_id = d.id",
+        "GROUP BY d.zone ORDER BY d.zone",
+    );
+    let unmatched = (1..=FACTS)
+        .filter(|id| {
+            fact_key(*id).is_none_or(|key| !(1..=DIMS).contains(&key) || !dim_present(key))
+        })
+        .count();
+    assert!(
+        rows[0].starts_with(&format!("Null|UInt64({unmatched})|")),
+        "{rows:?}"
+    );
+}
+
+/// The same with the row fold: build-side arguments are NULL for the
+/// unmatched rows, a filtered probe and a repeated build key.
+#[test]
+fn a_left_join_row_fold_reads_null_build_columns() {
+    let fixture = Fixture::new();
+    agree(
+        &fixture,
+        "SELECT d.zone, COUNT(*), COUNT(d.id), SUM(d.id), MIN(f.amount) FROM facts f",
+        "LEFT JOIN dims d ON f.dim_id = d.id",
+        "WHERE f.flag = 2 GROUP BY d.zone ORDER BY d.zone",
+    );
+    agree(
+        &fixture,
+        "SELECT d.zone, COUNT(*), SUM(f.amount), MAX(d.id) FROM facts f",
+        "LEFT JOIN pairs d ON f.dim_id = d.k",
+        "GROUP BY d.zone ORDER BY d.zone",
+    );
+}
+
+/// A build group whose column is NULL merges with the unmatched rows.
+#[test]
+fn a_left_join_merges_a_null_build_group_with_the_unmatched_rows() {
+    let fixture = Fixture::new();
+    agree(
+        &fixture,
+        "SELECT d.zone, COUNT(*), SUM(f.amount) FROM facts f",
+        "LEFT JOIN spots d ON f.dim_id = d.id",
+        "GROUP BY d.zone ORDER BY d.zone",
+    );
+}
+
+/// Semi and anti joins on a key with NULLs, gaps and out-of-range values,
+/// against counts taken here.
+#[test]
+fn semi_and_anti_joins_count_what_the_keys_say() {
+    let fixture = Fixture::new();
+    let matched =
+        |id: &i64| fact_key(*id).is_some_and(|key| (1..=DIMS).contains(&key) && dim_present(key));
+    let semi = (1..=FACTS).filter(matched).count();
+    let keyed = (1..=FACTS).filter(|id| fact_key(*id).is_some()).count();
+    for (sql, expected) in [
+        (
+            "SELECT COUNT(*) FROM facts f WHERE f.dim_id IN (SELECT id FROM dims)",
+            semi,
+        ),
+        (
+            "SELECT COUNT(*) FROM facts f WHERE EXISTS (SELECT 1 FROM dims d WHERE d.id = f.dim_id)",
+            semi,
+        ),
+        (
+            "SELECT COUNT(*) FROM facts f WHERE f.dim_id NOT IN (SELECT id FROM dims)",
+            keyed - semi,
+        ),
+        (
+            "SELECT COUNT(*) FROM facts f WHERE NOT EXISTS \
+             (SELECT 1 FROM dims d WHERE d.id = f.dim_id)",
+            usize::try_from(FACTS).expect("rows") - semi,
+        ),
+    ] {
+        let (rows, _) = fixture.run(sql);
+        assert_eq!(rows, vec![format!("UInt64({expected})")], "{sql}");
+    }
 }
