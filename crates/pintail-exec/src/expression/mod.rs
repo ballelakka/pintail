@@ -90,7 +90,9 @@ fn typed_comparison_mask(
     }
     use pintail_types::Value;
     match (typed, literal) {
-        (TypedValues::Int64(values), Value::Int64(lit)) => ordered(values, validity, op, *lit),
+        (TypedValues::Int64(values), Value::Int64(lit)) => {
+            selection::select_i64(values, validity, op, *lit)
+        }
         (TypedValues::UInt64(values), Value::UInt64(lit)) => ordered(values, validity, op, *lit),
         // A signed literal against an unsigned column, and the reverse. The
         // binder types a small integer literal as signed, so `id >= 1` on an
@@ -102,7 +104,7 @@ fn typed_comparison_mask(
             Err(_) => constant(values, validity, op, Ordering::Greater),
         },
         (TypedValues::Int64(values), Value::UInt64(lit)) => match i64::try_from(*lit) {
-            Ok(lit) => ordered(values, validity, op, lit),
+            Ok(lit) => selection::select_i64(values, validity, op, lit),
             Err(_) => constant(values, validity, op, Ordering::Less),
         },
         (TypedValues::Float64(values), Value::Float64(lit)) => {
@@ -123,7 +125,7 @@ fn typed_comparison_mask(
                 }
                 _ => None,
             }?;
-            ordered(units, validity, op, literal)
+            selection::select_i64(units, validity, op, literal)
         }
         // Temporal types ride the Utf8 carrier in canonical fixed-width form,
         // where byte order IS chronological order and collation cannot apply

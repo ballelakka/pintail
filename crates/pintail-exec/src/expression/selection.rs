@@ -3,8 +3,11 @@
 //! A predicate over a packed column becomes a bitmask one 64-row word at a
 //! time: the test runs over a fixed run of 64 values with no branch and no
 //! early exit, so the compiler turns it into vector compares, and validity
-//! joins the answer as one AND per word instead of one test per row. Words
-//! are filled by spans in parallel; each word has exactly one writer.
+//! joins the answer as one AND per word instead of one test per row. The
+//! common shapes - a signed column against a constant or a range, a code
+//! against one dictionary entry - go to the runtime-dispatched vector
+//! kernels instead. Large inputs fill spans of words in parallel; each word
+//! has exactly one writer.
 
 use rayon::prelude::*;
 
@@ -67,6 +70,54 @@ pub(super) fn select_words<T: Copy + Sync>(
     SelectionMask::from_words(values.len(), words)
 }
 
+/// The rows of `values` that are valid and that `kernel` sets, where
+/// `kernel` writes one mask word per 64 values the way the vector kernels
+/// do. Large inputs fill whole spans of words in parallel.
+fn select_with<T: Sync>(
+    values: &[T],
+    validity: &ValidityMask,
+    kernel: impl Fn(&[T], &mut [u64]) + Sync,
+) -> SelectionMask {
+    let word_count = values.len().div_ceil(64);
+    let mut words = vec![0_u64; word_count];
+    if word_count <= SERIAL_WORDS {
+        kernel(values, &mut words);
+    } else {
+        words
+            .par_chunks_mut(WORDS_PER_SPAN)
+            .zip(values.par_chunks(WORDS_PER_SPAN * 64))
+            .for_each(|(out, values)| kernel(values, out));
+    }
+    if !validity.no_nulls() {
+        for (index, word) in words.iter_mut().enumerate() {
+            *word &= validity.word(index);
+        }
+    }
+    SelectionMask::from_words(values.len(), words)
+}
+
+/// `value op literal` over packed signed values, through the vector
+/// compare kernel; `None` for an operator it does not take.
+pub(super) fn select_i64(
+    values: &[i64],
+    validity: &ValidityMask,
+    op: BinaryOp,
+    literal: i64,
+) -> Option<SelectionMask> {
+    let op = match op {
+        BinaryOp::Equal => pintail_simd::CmpOp::Eq,
+        BinaryOp::NotEqual => pintail_simd::CmpOp::Ne,
+        BinaryOp::Less => pintail_simd::CmpOp::Lt,
+        BinaryOp::LessOrEqual => pintail_simd::CmpOp::Le,
+        BinaryOp::Greater => pintail_simd::CmpOp::Gt,
+        BinaryOp::GreaterOrEqual => pintail_simd::CmpOp::Ge,
+        _ => return None,
+    };
+    Some(select_with(values, validity, |values, out| {
+        pintail_simd::compare_i64(values, op, literal, out);
+    }))
+}
+
 /// The rows of a dictionary-coded column whose entry `matching` accepts.
 /// A single accepted entry - the shape of `column = 'literal'` - compares
 /// codes directly; otherwise each code looks its entry up.
@@ -83,7 +134,9 @@ pub(super) fn select_codes(
     match (accepted.next(), accepted.next()) {
         (None, _) => SelectionMask::none(codes.len()),
         (Some(code), None) => match u32::try_from(code) {
-            Ok(code) => select_words(codes, validity, move |value| value == code),
+            Ok(code) => select_with(codes, validity, |codes, out| {
+                pintail_simd::compare_u32(codes, pintail_simd::CmpOp::Eq, code, out);
+            }),
             Err(_) => SelectionMask::none(codes.len()),
         },
         _ => select_words(codes, validity, |value| {
@@ -168,11 +221,8 @@ fn packed_range_mask(
             if low > high {
                 return Some(SelectionMask::none(rows));
             }
-            // `low <= value <= high` as one unsigned comparison: a value below
-            // `low` wraps past the span.
-            let span = high.wrapping_sub(low).cast_unsigned();
-            Some(select_words(values, validity, move |value: i64| {
-                value.wrapping_sub(low).cast_unsigned() <= span
+            Some(select_with(values, validity, |values, out| {
+                pintail_simd::between_i64(values, low, high, out);
             }))
         }
         (TypedValues::UInt64(values), PackedBound::Unsigned(low), PackedBound::Unsigned(high)) => {

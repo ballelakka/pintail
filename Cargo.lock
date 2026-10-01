@@ -2563,6 +2563,7 @@ dependencies = [
  "icu_collator",
  "md-5 0.10.6",
  "pintail-catalog",
+ "pintail-simd",
  "pintail-sql",
  "pintail-store",
  "pintail-types",
