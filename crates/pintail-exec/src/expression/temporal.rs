@@ -363,6 +363,16 @@ fn timezone_spec(text: &str) -> Option<ZoneSpec> {
         .map(ZoneSpec::Named)
 }
 
+/// The seconds east of UTC of a zone written as a fixed offset (`+05:30`),
+/// as a session-zone reading parses it; `None` for a named zone, whose
+/// offset can change within a column, and for text that is no zone.
+pub(super) fn fixed_zone_seconds(text: &str) -> Option<i32> {
+    match timezone_spec(text)? {
+        ZoneSpec::Fixed(offset) => Some(offset.local_minus_utc()),
+        ZoneSpec::Named(_) => None,
+    }
+}
+
 /// A datetime offset is a signed two-digit hour and minute suffix.
 pub(crate) fn has_timestamp_offset(text: &str) -> bool {
     let text = text.trim_end();

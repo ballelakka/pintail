@@ -133,7 +133,11 @@ pub(super) fn suits(
             .map(KeyColumn::Owned),
     };
     let Some(column) = column else {
-        return Err("the key has no packed kernel");
+        return Err(if key.reads_named_session_zone() {
+            "the key reads a TIMESTAMP in a named session time zone"
+        } else {
+            "the key has no packed kernel"
+        });
     };
     let column = column.get();
     let rows = first.visible_row_count();

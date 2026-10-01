@@ -106,6 +106,12 @@ impl CompiledExpr {
         Some(column)
     }
 
+    /// Whether this reads a source `TIMESTAMP` in a named session zone, which
+    /// no packed kernel takes: a key over one declines for that reason.
+    pub(crate) fn reads_named_session_zone(&self) -> bool {
+        temporal::reads_named_session_zone(self)
+    }
+
     /// [`Self::evaluate_column`] for a pass that decides only which rows to
     /// read, and whose rows another pass evaluates again.
     ///
@@ -276,6 +282,9 @@ fn specific_scalar(
             temporal::date_interval_column(batch, args, unit, subtract, data_type, effects)
         }
         ScalarFunction::DateFormat => temporal::date_format_column(batch, args, data_type, effects),
+        ScalarFunction::SessionTimestamp => {
+            temporal::session_timestamp_column(batch, args, data_type, effects)
+        }
         ScalarFunction::Date | ScalarFunction::LastDay => {
             temporal::date_of_column(batch, args, function, data_type, effects)
         }

@@ -4,7 +4,8 @@
 //! so the scan skips most blocks and the aggregate is what is left to pay
 //! for. Ungrouped, grouped by a low-cardinality text column, by the day (as
 //! `DATE()` and as `DATE_FORMAT()`), by the hour, and by year and month,
-//! over a seven-day and a thirty-day window. Every answer is
+//! over a seven-day and a thirty-day window; then by the day and the hour
+//! of a source `TIMESTAMP` read in a session zone of fixed offset. Every answer is
 //! checked against a direct computation over the generator.
 //!
 //! Ignored: a measurement, not a gate. Run with
@@ -50,6 +51,9 @@ fn schema() -> TableSchema {
             ),
             Column::new(4, "channel", DataType::Utf8, false),
             Column::new(5, "amount", DataType::Int64, false),
+            // The same instant as a source TIMESTAMP, stored UTC: a session
+            // time zone moves what it reads as.
+            Column::new(6, "stamp", DataType::DateTime64 { fsp: 0 }, false).with_timestamp(true),
         ],
     )
     .expect("schema")
@@ -106,6 +110,7 @@ fn row(id: u64) -> StoredRow {
             Value::Utf8(cents(price(id))),
             Value::Utf8(CHANNELS[channel(id)].to_owned()),
             Value::Int64(amount(id)),
+            Value::Utf8(timestamp(id * STEP_SECONDS)),
         ],
         1,
         false,
@@ -178,15 +183,30 @@ fn ids(rows: u64, from: u64, to: u64) -> std::ops::RangeInclusive<u64> {
     from.div_ceil(STEP_SECONDS)..=(to / STEP_SECONDS).min(rows - 1)
 }
 
-fn expected(rows: u64, from: u64, to: u64, grouping: Grouping, shape: Shape) -> Vec<String> {
+/// `from` and `to` are seconds as the session reads them, `offset` the
+/// session zone's seconds east of UTC (zero for a DATETIME column).
+fn expected(
+    rows: u64,
+    (from, to, offset): (u64, u64, i64),
+    grouping: Grouping,
+    shape: Shape,
+) -> Vec<String> {
     let mut groups = BTreeMap::<String, Totals>::new();
-    for id in ids(rows, from, to) {
+    let utc = |seconds: u64| seconds.checked_add_signed(-offset).expect("in range");
+    let local = |id: u64| {
+        timestamp(
+            (id * STEP_SECONDS)
+                .checked_add_signed(offset)
+                .expect("in range"),
+        )
+    };
+    for id in ids(rows, utc(from), utc(to)) {
         let key = match grouping {
             Grouping::None => String::new(),
             Grouping::Channel => CHANNELS[channel(id)].to_owned(),
-            Grouping::Day => timestamp(id * STEP_SECONDS)[..10].to_owned(),
-            Grouping::Hour => timestamp(id * STEP_SECONDS)[11..13].to_owned(),
-            Grouping::YearMonth => timestamp(id * STEP_SECONDS)[..7].to_owned(),
+            Grouping::Day => local(id)[..10].to_owned(),
+            Grouping::Hour => local(id)[11..13].to_owned(),
+            Grouping::YearMonth => local(id)[..7].to_owned(),
         };
         groups.entry(key).or_default().add(id);
     }
@@ -220,11 +240,13 @@ fn run(
     catalog: &CatalogSnapshot,
     store: &TableStore,
     sql: &str,
+    zone: Option<&str>,
     profile: bool,
 ) -> (Vec<String>, f64) {
     let snapshot = store.snapshot();
     let provider = SnapshotScanProvider::new([(DatabaseId::new(1), TableId::new(1), &snapshot)])
         .expect("provider");
+    assert!(pintail_exec::set_session_time_zone(zone), "zone {zone:?}");
     let clock = Instant::now();
     let bound = Binder::new(catalog, Some("app"))
         .bind(&parse_statement(sql).expect("parse"))
@@ -258,6 +280,7 @@ fn run(
     if profile && let Some(profile) = execution.profile() {
         eprintln!("{sql}\n{}", profile.render());
     }
+    assert!(pintail_exec::set_session_time_zone(None));
     (rows, elapsed)
 }
 
@@ -303,7 +326,7 @@ fn aggregates_over_a_recent_window() {
 
     let span = (rows - 1) * STEP_SECONDS;
     let full = "COUNT(*), SUM(price), AVG(price), MIN(occurred_at), MAX(occurred_at)";
-    let cases: [(&str, Grouping, Shape, String); 8] = [
+    let mut cases: Vec<(String, Grouping, Shape, String, Option<&str>)> = [
         (
             "count+sum",
             Grouping::None,
@@ -367,10 +390,47 @@ fn aggregates_over_a_recent_window() {
              FROM events WHERE {window} GROUP BY y, m ORDER BY y, m"
                 .to_owned(),
         ),
-    ];
+    ]
+    .into_iter()
+    .map(|(name, grouping, shape, sql)| (name.to_owned(), grouping, shape, sql, None))
+    .collect();
+    // A source TIMESTAMP read in a session zone of fixed offset: the key
+    // and the window are both the session's reading of the UTC instant.
+    for zone in ["+05:30", "-08:00"] {
+        for (name, grouping, select) in [
+            ("by day", Grouping::Day, "DATE(stamp)"),
+            (
+                "by formatted day",
+                Grouping::Day,
+                "DATE_FORMAT(stamp, '%Y-%m-%d')",
+            ),
+            ("by hour", Grouping::Hour, "HOUR(stamp)"),
+        ] {
+            cases.push((
+                format!("{name} at {zone}"),
+                grouping,
+                Shape::Daily,
+                format!(
+                    "SELECT {select} AS k, COUNT(*), SUM(price) FROM events \
+                     WHERE {{window}} GROUP BY k ORDER BY k"
+                ),
+                Some(zone),
+            ));
+        }
+    }
     let mut mismatches = 0;
     for (window_name, window) in [("7 days", 7 * DAY), ("30 days", 30 * DAY)] {
-        for (name, grouping, shape, template) in &cases {
+        for (name, grouping, shape, template, zone) in &cases {
+            let column = if zone.is_some() {
+                "stamp"
+            } else {
+                "occurred_at"
+            };
+            let offset = match *zone {
+                Some("+05:30") => 19_800,
+                Some("-08:00") => -28_800,
+                _ => 0,
+            };
             let label = format!("{window_name}, {name}");
             if only
                 .as_ref()
@@ -385,7 +445,12 @@ fn aggregates_over_a_recent_window() {
                 // open-ended ("since"), the month is a closed BETWEEN.
                 let (from, to, predicate) = if window == 7 * DAY {
                     let from = span - window - run_index * 3_600;
-                    (from, span, format!("occurred_at >= '{}'", timestamp(from)))
+                    // Open-ended: past the last row in any session zone.
+                    (
+                        from,
+                        span + DAY,
+                        format!("{column} >= '{}'", timestamp(from)),
+                    )
                 } else {
                     let from = span / 2 + run_index * 3_600;
                     let to = from + window;
@@ -393,16 +458,17 @@ fn aggregates_over_a_recent_window() {
                         from,
                         to,
                         format!(
-                            "occurred_at BETWEEN '{}' AND '{}'",
+                            "{column} BETWEEN '{}' AND '{}'",
                             timestamp(from),
                             timestamp(to)
                         ),
                     )
                 };
                 let sql = template.replace("{window}", &predicate);
-                let (answer, elapsed) = run(&catalog, &store, &sql, profile && run_index == 0);
+                let (answer, elapsed) =
+                    run(&catalog, &store, &sql, *zone, profile && run_index == 0);
                 if run_index == 0 || run_index == 8 {
-                    let want = expected(rows, from, to, *grouping, *shape);
+                    let want = expected(rows, (from, to, offset), *grouping, *shape);
                     if answer != want {
                         mismatches += 1;
                         eprintln!(

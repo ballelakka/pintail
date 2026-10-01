@@ -201,6 +201,78 @@ pub(super) fn date_format_column(
     ))
 }
 
+/// A source `TIMESTAMP` read in a session zone of fixed offset,
+/// `SessionTimestamp(column, '+05:30')`, over packed units.
+///
+/// The stored units are UTC and the session reads each one shifted by the
+/// same number of seconds, so the reading is the units plus the offset:
+/// what row evaluation reaches by spelling each row, converting the text
+/// and spelling it again. With a column form here, `DATE()`, `HOUR()` or
+/// `DATE_FORMAT()` of the reading keep their own packed kernels instead of
+/// declining a whole key to row evaluation. A named zone has no single
+/// offset (a daylight-saving change gives it two), so it declines; so
+/// does a reading whose year canonical text cannot spell.
+pub(super) fn session_timestamp_column(
+    batch: &RecordBatch,
+    args: &[CompiledExpr],
+    data_type: Option<DataType>,
+    effects: &mut Effects,
+) -> Option<ColumnVector> {
+    let [argument, CompiledExpr::Literal(Value::Utf8(zone))] = args else {
+        return None;
+    };
+    let offset = i64::from(crate::expression::temporal::fixed_zone_seconds(zone)?) * 1_000_000;
+    let input = operand(batch, argument, effects)?;
+    let Operand::Column(column) = &input else {
+        return None;
+    };
+    let units = temporal_column(column)?;
+    let fsp = units.fsp?;
+    if data_type.is_some_and(|declared| declared != DataType::DateTime64 { fsp }) {
+        return None;
+    }
+    let spellable = units.four_digit_years();
+    let mut shifted = Vec::with_capacity(units.units.len());
+    for row in 0..units.units.len() {
+        if !units.validity.is_valid(row) {
+            shifted.push(0);
+            continue;
+        }
+        let reading = units.spelled(row).checked_add(offset)?;
+        if !spellable.contains(&reading) {
+            return None;
+        }
+        shifted.push(reading);
+    }
+    Some(ColumnVector::from_typed(
+        DataType::DateTime64 { fsp },
+        TypedValues::Temporal {
+            units: shifted,
+            text: LazyText::datetime(fsp),
+        },
+        units.validity.clone(),
+    ))
+}
+
+/// Whether `expr` reads a source `TIMESTAMP` in a named session zone,
+/// which no packed kernel takes: the reason a key over it declines.
+pub(super) fn reads_named_session_zone(expr: &CompiledExpr) -> bool {
+    match expr {
+        CompiledExpr::Scalar {
+            function: ScalarFunction::SessionTimestamp,
+            args,
+            ..
+        } => match args.as_slice() {
+            [_, CompiledExpr::Literal(Value::Utf8(zone))] => {
+                crate::expression::temporal::fixed_zone_seconds(zone).is_none()
+            }
+            _ => false,
+        },
+        CompiledExpr::Scalar { args, .. } => args.iter().any(reads_named_session_zone),
+        _ => false,
+    }
+}
+
 /// The units a constant `DATE_FORMAT` pattern cannot see within: a day
 /// when it names only calendar fields, an hour when it adds hour fields,
 /// `None` when it reads minutes or finer. Unknown directives print their
@@ -972,6 +1044,57 @@ mod tests {
                 .is_none(),
                 "a per-row format declines"
             );
+        }
+    }
+
+    /// A session-zone reading of a fixed offset is the units shifted by
+    /// it, as row evaluation converts each row's text; a named zone, whose
+    /// offset can change within the column, has no packed kernel.
+    #[test]
+    fn session_zone_readings_of_packed_temporals_match_row_evaluation() {
+        let reading = |zone: &str, fsp: u8| {
+            scalar(
+                ScalarFunction::SessionTimestamp,
+                vec![
+                    CompiledExpr::Column(0),
+                    CompiledExpr::Literal(Value::Utf8(zone.to_owned())),
+                ],
+                DataType::DateTime64 { fsp },
+            )
+        };
+        for fsp in [0_u8, 3, 6] {
+            // Ordinary dates: every offset has a kernel. Calendar edges:
+            // one that shifts a row out of four-digit years declines, and
+            // any that answers still agrees.
+            for (dates, every) in [(&ORDINARY[..], true), (&DATES[..], false)] {
+                let batch = batch(temporal_from(dates, Some(fsp)));
+                for zone in ["+05:30", "-08:00", "+00:00", "+14:00", "-13:59", "+5:45"] {
+                    let declared = DataType::DateTime64 { fsp };
+                    let answered = agrees_with_rows(&reading(zone, fsp), &batch, declared);
+                    assert!(answered || !every, "{zone} over {fsp} has a kernel");
+                    // What reads the reading keeps its own kernel.
+                    let date = scalar(
+                        ScalarFunction::Date,
+                        vec![reading(zone, fsp)],
+                        DataType::Date32,
+                    );
+                    let answered = agrees_with_rows(&date, &batch, DataType::Date32);
+                    assert!(answered || !every, "DATE at {zone} over {fsp} has a kernel");
+                }
+                for zone in ["America/New_York", "Europe/London"] {
+                    let expression = reading(zone, fsp);
+                    assert!(
+                        expression
+                            .evaluate_vector_column_quietly(
+                                &batch,
+                                Some(DataType::DateTime64 { fsp })
+                            )
+                            .is_none(),
+                        "{zone} declines"
+                    );
+                    assert!(expression.reads_named_session_zone());
+                }
+            }
         }
     }
 
