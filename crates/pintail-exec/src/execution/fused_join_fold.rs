@@ -167,10 +167,19 @@ enum LaneInput<'a> {
     Rows,
     Valid(&'a ValidityMask),
     Units {
-        units: &'a [i64],
+        units: Units<'a>,
         validity: &'a ValidityMask,
         scale: u8,
     },
+}
+
+/// A decimal column's scaled units: 64-bit as the store decodes them, or
+/// 128-bit as a batch rebuilt from row values (memtable rows, a small
+/// materialized range) parses them.
+#[derive(Clone, Copy)]
+enum Units<'a> {
+    Narrow(&'a [i64]),
+    Wide(&'a [i128]),
 }
 
 /// The probe key column as integers, when it is one.
@@ -233,7 +242,18 @@ impl Rows<'_> {
 
 /// Adds each row's units into its group's total.
 #[inline]
-fn add_units(totals: &mut [i128], groups: &[u32], units: &[i64], rows: &Rows<'_>) {
+fn add_units(totals: &mut [i128], groups: &[u32], units: Units<'_>, rows: &Rows<'_>) {
+    match units {
+        Units::Narrow(units) => add_unit_values(totals, groups, units, rows),
+        Units::Wide(units) => add_unit_values(totals, groups, units, rows),
+    }
+}
+
+#[inline]
+fn add_unit_values<T: Copy>(totals: &mut [i128], groups: &[u32], units: &[T], rows: &Rows<'_>)
+where
+    i128: From<T>,
+{
     match rows {
         Rows::Range(range) => {
             for (group, units) in groups.iter().zip(&units[range.clone()]) {
@@ -290,7 +310,17 @@ pub(super) fn fold_morsel(
                 LaneInput::Valid(validity)
             }
             Lane::DecimalSum { column, .. } | Lane::DecimalAverage { column, .. } => {
-                match batch.column(column).and_then(crate::ColumnVector::typed) {
+                let Some(vector) = batch.column(column) else {
+                    return Ok(false);
+                };
+                // Wide units of a column declared with at most eighteen
+                // digits each fit 64 bits, so their totals stay exactly as
+                // far from overflow as the narrow units' do.
+                let narrow_digits = matches!(
+                    vector.data_type(),
+                    pintail_types::DataType::Decimal { precision, .. } if precision <= 18
+                );
+                match vector.typed() {
                     Some((
                         TypedValues::Decimal128 {
                             values: DecimalUnits::Narrow(units),
@@ -299,7 +329,19 @@ pub(super) fn fold_morsel(
                         },
                         validity,
                     )) => LaneInput::Units {
-                        units,
+                        units: Units::Narrow(units),
+                        validity,
+                        scale: *scale,
+                    },
+                    Some((
+                        TypedValues::Decimal128 {
+                            values: DecimalUnits::Wide(units),
+                            scale,
+                            ..
+                        },
+                        validity,
+                    )) if narrow_digits => LaneInput::Units {
+                        units: Units::Wide(units),
                         validity,
                         scale: *scale,
                     },

@@ -19,6 +19,7 @@ const BUYERS: u64 = 2_000;
 /// Past the size below which a range with memtable rows is materialized
 /// whole rather than streamed.
 const STREAMED_PURCHASES: u64 = 80_000;
+const SMALL_PURCHASES: u64 = 20_000;
 const MEMTABLE_PURCHASES: u64 = 700;
 const REGIONS: [&str; 8] = [
     "north", "south", "east", "west", "inner", "outer", "upper", "lower",
@@ -253,11 +254,67 @@ fn join_line(profile: &str) -> &str {
         .unwrap_or_else(|| panic!("no join line:\n{profile}"))
 }
 
+/// Region, count and sum of the purchases, computed without the engine.
+fn expected_by_region(segment_purchases: u64) -> Vec<(&'static str, u64, i64)> {
+    let mut totals = std::collections::BTreeMap::<&str, (u64, i64)>::new();
+    for id in 1..=segment_purchases + MEMTABLE_PURCHASES {
+        let entry = totals.entry(buyer_region(purchase_buyer(id))).or_default();
+        entry.0 += 1;
+        entry.1 += purchase_cents(id);
+    }
+    totals
+        .into_iter()
+        .map(|(region, (count, cents))| (region, count, cents))
+        .collect()
+}
+
+/// The benchmark's join shape over segments with memtable rows past their
+/// keys: the segments stream decoded and the memtable rows arrive as row
+/// values, and every morsel of both takes the column fold.
+#[test]
+fn the_benchmark_join_shape_takes_the_column_fold() {
+    assert_column_fold(STREAMED_PURCHASES);
+}
+
+/// A table small enough that a scan with memtable rows materializes it
+/// whole: every batch is rebuilt from row values, whose decimals parse to
+/// wide units, and the column fold still takes them.
+#[test]
+fn a_materialized_small_table_takes_the_column_fold() {
+    assert_column_fold(SMALL_PURCHASES);
+}
+
+fn assert_column_fold(segment_purchases: u64) {
+    let fixture = Fixture::new(segment_purchases);
+    let (rows, profile) = fixture.run(
+        "SELECT b.region, COUNT(*) AS cnt, ROUND(SUM(p.total_amount), 2) AS total \
+         FROM purchases p JOIN buyers b ON p.buyer_id = b.id GROUP BY b.region ORDER BY b.region",
+    );
+    let expected: Vec<String> = expected_by_region(segment_purchases)
+        .into_iter()
+        .map(|(region, count, cents)| format!("{region}|UInt64({count})|{}", cents_text(cents)))
+        .collect();
+    assert_eq!(rows, expected, "{profile}");
+    let line = join_line(&profile);
+    let morsels = line
+        .split("column fold on ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no column fold:\n{profile}"));
+    let mut counts = morsels
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty());
+    let (folded, total) = (counts.next(), counts.next());
+    assert!(
+        folded.is_some() && folded == total && folded != Some("0"),
+        "not every morsel took the column fold:\n{profile}"
+    );
+}
+
 /// An aggregate the column fold has no lane for keeps the fused join and
 /// says why it took the row fold.
 #[test]
 fn an_aggregate_without_a_lane_names_the_row_fold() {
-    let fixture = Fixture::new(STREAMED_PURCHASES);
+    let fixture = Fixture::new(SMALL_PURCHASES);
     let (rows, profile) = fixture.run(
         "SELECT b.region, COUNT(*), MAX(p.total_amount) \
          FROM purchases p JOIN buyers b ON p.buyer_id = b.id GROUP BY b.region ORDER BY b.region",
@@ -272,7 +329,7 @@ fn an_aggregate_without_a_lane_names_the_row_fold() {
 /// A shape the fused join declines says so on the join's own line.
 #[test]
 fn a_declined_fusion_names_its_reason() {
-    let fixture = Fixture::new(STREAMED_PURCHASES);
+    let fixture = Fixture::new(SMALL_PURCHASES);
     let (rows, profile) = fixture.run(
         "SELECT b.region, COUNT(DISTINCT p.item_id) \
          FROM purchases p JOIN buyers b ON p.buyer_id = b.id GROUP BY b.region ORDER BY b.region",
