@@ -13,7 +13,9 @@ use super::aggregate::{
 };
 use super::join::{normalized_group_hash_key, normalized_group_text};
 use super::morsel::{Morsel, default_morsel_limit, morsel_plan};
-use super::packed_fold::{FoldRows, PackedFold, commit_merged, fold_rows, occupied_in};
+use super::packed_fold::{
+    FoldRows, PackedFold, commit_merged, fold_rows, merged_cell, occupied_in,
+};
 use super::{
     ExecError, HASH_ENTRY_OVERHEAD, MaterializedRows, MemoryTracker, PullOperator,
     estimated_row_payload_bytes,
@@ -1041,7 +1043,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         {
             // Every group is in the range fold: finish them straight from
             // its slots, in key order, without building a map entry each.
-            let rows = finish_int_range(&active, group_type, aggregates, memory);
+            let ready = finish_int_range(&active, group_type, aggregates, memory);
             memory.release(active.reserved);
             memory.release(group_reserved);
             if std::env::var_os("PINTAIL_AGG_DEBUG").is_some() {
@@ -1052,9 +1054,10 @@ pub(super) fn build_streaming_two_pass_aggregate(
                 );
             }
             return Ok(MaterializedRows {
-                rows: rows?,
+                rows: Vec::new(),
                 position: 0,
                 spilled: None,
+                ready: Some(ready?),
             });
         }
         fold_int_range_into_maps(
@@ -1137,6 +1140,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         rows,
         position: 0,
         spilled: None,
+        ready: None,
     })
 }
 
@@ -2116,50 +2120,225 @@ fn fold_int_range_into_maps(
     outcome
 }
 
-/// Finishes every group of a range fold into rows, in key order, when no
-/// other path holds groups of the same query.
+/// One finished column of a grouped aggregate's result.
+pub(super) enum ReadyColumn {
+    /// Finished values, built into a column of the plan's type.
+    Values(Vec<Value>),
+    /// An exact decimal SUM's totals as scaled units, `None` where a group
+    /// summed no value. Served as a packed decimal column whose text is
+    /// rendered from the units - the text the finished value spells - so
+    /// what reads it next (a rounding, a sort) works on the units instead
+    /// of formatting every total only to parse it back.
+    Decimal { units: Vec<Option<i128>>, scale: u8 },
+}
+
+impl ReadyColumn {
+    fn value(&self, row: usize) -> Value {
+        match self {
+            Self::Values(values) => values[row].clone(),
+            Self::Decimal { units, scale } => units[row].map_or(Value::Null, |units| {
+                Value::Utf8(pintail_types::format_decimal_scaled(units, *scale))
+            }),
+        }
+    }
+
+    fn row_bytes(&self) -> usize {
+        match self {
+            Self::Values(values) => values.first().map_or(0, |value| {
+                size_of::<Value>().saturating_add(value.heap_bytes())
+            }),
+            Self::Decimal { .. } => size_of::<Option<i128>>() + 1,
+        }
+    }
+}
+
+/// A grouped aggregate's finished groups held as columns: the batches the
+/// operator serves are cut straight from them, with no row of cells built.
+pub(super) struct ReadyColumns {
+    len: usize,
+    columns: Vec<ReadyColumn>,
+}
+
+impl ReadyColumns {
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Bytes a served row costs, for sizing and charging its batch.
+    pub(super) fn row_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(ReadyColumn::row_bytes)
+            .sum::<usize>()
+            .max(1)
+    }
+
+    /// Rows `rows` as a batch of the plan's column types.
+    pub(super) fn batch(
+        &self,
+        rows: std::ops::Range<usize>,
+        column_types: &[DataType],
+    ) -> Result<RecordBatch, ExecError> {
+        let columns = self
+            .columns
+            .iter()
+            .zip(column_types)
+            .map(|(column, data_type)| match column {
+                ReadyColumn::Decimal { units, scale }
+                    if matches!(
+                        data_type,
+                        DataType::Decimal { scale: declared, .. } if declared == scale
+                    ) =>
+                {
+                    let units = &units[rows.clone()];
+                    let validity = crate::array::ValidityMask::from_bools(
+                        &units.iter().map(Option::is_some).collect::<Vec<_>>(),
+                    );
+                    Ok(crate::ColumnVector::from_typed(
+                        *data_type,
+                        crate::batch::TypedValues::Decimal128 {
+                            values: crate::batch::DecimalUnits::Wide(
+                                units.iter().map(|units| units.unwrap_or(0)).collect(),
+                            ),
+                            scale: *scale,
+                            text: crate::batch::LazyText::decimal(*scale),
+                        },
+                        validity,
+                    ))
+                }
+                _ => crate::ColumnVector::new(
+                    *data_type,
+                    rows.clone().map(|row| column.value(row)).collect(),
+                )
+                .map_err(ExecError::from),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        RecordBatch::new(rows.len(), columns).map_err(ExecError::from)
+    }
+
+    /// Every row as cells, for a consumer that keeps rows.
+    pub(super) fn into_rows(self) -> Vec<Vec<Value>> {
+        (0..self.len)
+            .map(|row| {
+                self.columns
+                    .iter()
+                    .map(|column| column.value(row))
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// Finishes every group of a range fold, in key order, when no other path
+/// holds groups of the same query. An exact decimal SUM keeps its totals as
+/// units; every other lane finishes through its state, as the maps would.
 fn finish_int_range(
     range: &IntRangeFold,
     group_type: DataType,
     aggregates: &[CompiledAggregate],
     memory: &MemoryTracker,
-) -> Result<Vec<Vec<Value>>, ExecError> {
+) -> Result<ReadyColumns, ExecError> {
     let slot_count = range.slot_count;
     let chunk = slot_count
         .div_ceil(rayon::current_num_threads().saturating_mul(4))
         .max(1_024);
-    let finished = (0..slot_count.div_ceil(chunk))
+    // The lanes kept as units, at the scale they total at: an exact decimal
+    // SUM answered as a decimal.
+    let unit_lanes = (0..aggregates.len())
+        .map(|index| match merged_cell(&range.folds, index, 0) {
+            Some((
+                PackedLane::Sum {
+                    scale,
+                    float_output: false,
+                },
+                _,
+            )) => Some(scale),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let pieces = (0..slot_count.div_ceil(chunk))
         .into_par_iter()
-        .map(|piece| -> Result<Vec<Vec<Value>>, ExecError> {
-            let mut rows = Vec::new();
+        .map(|piece| -> Result<(usize, Vec<ReadyColumn>), ExecError> {
+            let mut columns = std::iter::once(ReadyColumn::Values(Vec::new()))
+                .chain(unit_lanes.iter().map(|scale| match scale {
+                    Some(scale) => ReadyColumn::Decimal {
+                        units: Vec::new(),
+                        scale: *scale,
+                    },
+                    None => ReadyColumn::Values(Vec::new()),
+                }))
+                .collect::<Vec<_>>();
+            let mut groups = 0_usize;
             let mut uncharged = 0_usize;
             for slot in piece * chunk..((piece + 1) * chunk).min(slot_count) {
                 if !occupied_in(&range.folds, slot) {
                     continue;
                 }
-                let mut states = aggregates
-                    .iter()
-                    .map(AggregateState::new)
-                    .collect::<Vec<_>>();
-                commit_merged(&range.folds, slot, &mut states, aggregates, memory)?;
+                groups += 1;
                 let (bits, null) = range.key_bits(slot);
-                let mut row = Vec::with_capacity(1 + states.len());
-                row.push(two_pass_key_value(bits, null, group_type));
-                for state in states {
-                    row.push(state.finish(memory)?);
+                let key = two_pass_key_value(bits, null, group_type);
+                uncharged = uncharged.saturating_add(size_of::<Value>() + key.heap_bytes());
+                if let ReadyColumn::Values(values) = &mut columns[0] {
+                    values.push(key);
                 }
-                uncharged = uncharged.saturating_add(estimated_row_payload_bytes(&row));
+                for (index, (column, aggregate)) in
+                    columns[1..].iter_mut().zip(aggregates).enumerate()
+                {
+                    match column {
+                        ReadyColumn::Decimal { units, .. } => {
+                            let cell = merged_cell(&range.folds, index, slot)
+                                .map(|(_, cell)| cell)
+                                .unwrap_or_default();
+                            units.push((cell.rows > 0).then_some(cell.total));
+                            uncharged = uncharged.saturating_add(size_of::<Option<i128>>());
+                        }
+                        ReadyColumn::Values(values) => {
+                            let mut state = AggregateState::new(aggregate);
+                            if let Some((lane, cell)) = merged_cell(&range.folds, index, slot) {
+                                cell.commit(lane, &mut state, aggregate, memory)?;
+                            }
+                            let value = state.finish(memory)?;
+                            uncharged =
+                                uncharged.saturating_add(size_of::<Value>() + value.heap_bytes());
+                            values.push(value);
+                        }
+                    }
+                }
                 if uncharged >= FINALIZE_CHARGE_SLICE {
                     memory.reserve(uncharged)?;
                     uncharged = 0;
                 }
-                rows.push(row);
             }
             memory.reserve(uncharged)?;
-            Ok(rows)
+            Ok((groups, columns))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(finished.into_iter().flatten().collect())
+    let mut len = 0;
+    let mut columns: Option<Vec<ReadyColumn>> = None;
+    for (groups, piece) in pieces {
+        len += groups;
+        match &mut columns {
+            None => columns = Some(piece),
+            Some(columns) => {
+                for (into, from) in columns.iter_mut().zip(piece) {
+                    match (into, from) {
+                        (ReadyColumn::Values(into), ReadyColumn::Values(from)) => {
+                            into.extend(from);
+                        }
+                        (
+                            ReadyColumn::Decimal { units: into, .. },
+                            ReadyColumn::Decimal { units: from, .. },
+                        ) => into.extend(from),
+                        _ => unreachable!("every piece lays its columns out alike"),
+                    }
+                }
+            }
+        }
+    }
+    Ok(ReadyColumns {
+        len,
+        columns: columns.unwrap_or_default(),
+    })
 }
 
 /// Folds one window through the integer-range fold. `false`, with the fold

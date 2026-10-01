@@ -45,7 +45,62 @@ struct Fixture {
     catalog: CatalogSnapshot,
 }
 
-#[allow(clippy::too_many_lines)] // one generated table, every column beside the others
+/// One row of the table: every column a function of `id`.
+fn stock_row(id: u64, key_type: DataType) -> StoredRow {
+    let key = key_of(id);
+    let owner = match (key, key_type) {
+        (None, _) => Value::Null,
+        // Unsigned keys sit above an offset, so they
+        // stay positive and the range does not start
+        // at zero.
+        (Some(key), DataType::UInt64) => {
+            Value::UInt64(u64::try_from(key + 2_000_000_000).expect("offset keeps it positive"))
+        }
+        (Some(key), _) => Value::Int64(key),
+    };
+    // Key 17 never has an amount, so its SUM, AVG, MIN
+    // and MAX stay NULL while its COUNT does not.
+    let amount = if id.is_multiple_of(13) || key == Some(17) {
+        Value::Null
+    } else {
+        let cents = i64::try_from((id * 7_919) % 2_000_000).expect("small") - 400_000;
+        Value::Utf8(format!(
+            "{}{}.{:02}",
+            if cents < 0 { "-" } else { "" },
+            cents.abs() / 100,
+            cents.abs() % 100
+        ))
+    };
+    let shelf = if id.is_multiple_of(31) {
+        Value::Null
+    } else {
+        Value::Utf8(SHELVES[usize::try_from(id % 6).expect("small")].to_owned())
+    };
+    // About five years of days, starting mid-year, NULL now and then.
+    let stocked = if id.is_multiple_of(41) {
+        Value::Null
+    } else {
+        let day = (id * 7) % 1_900;
+        Value::Utf8(format!(
+            "{}-{:02}-{:02}",
+            2019 + day / 365,
+            1 + (day % 365) / 31,
+            1 + (day % 365) % 28
+        ))
+    };
+    let aisle = if id.is_multiple_of(37) {
+        Value::Null
+    } else {
+        Value::Utf8(AISLES[usize::try_from(id % 3).expect("small")].to_owned())
+    };
+    StoredRow::new(
+        PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
+        vec![Value::UInt64(id), owner, amount, shelf, aisle, stocked],
+        1,
+        false,
+    )
+}
+
 fn fixture(key_type: DataType) -> Fixture {
     let schema = TableSchema::new(
         1,
@@ -75,66 +130,7 @@ fn fixture(key_type: DataType) -> Fixture {
     while start < rows {
         let end = (start + 40_000).min(rows);
         table
-            .bulk_ingest_snapshot(
-                (start..end)
-                    .map(|id| {
-                        let key = key_of(id);
-                        let owner = match (key, key_type) {
-                            (None, _) => Value::Null,
-                            // Unsigned keys sit above an offset, so they
-                            // stay positive and the range does not start
-                            // at zero.
-                            (Some(key), DataType::UInt64) => Value::UInt64(
-                                u64::try_from(key + 2_000_000_000)
-                                    .expect("offset keeps it positive"),
-                            ),
-                            (Some(key), _) => Value::Int64(key),
-                        };
-                        // Key 17 never has an amount, so its SUM, AVG, MIN
-                        // and MAX stay NULL while its COUNT does not.
-                        let amount = if id.is_multiple_of(13) || key == Some(17) {
-                            Value::Null
-                        } else {
-                            let cents =
-                                i64::try_from((id * 7_919) % 2_000_000).expect("small") - 400_000;
-                            Value::Utf8(format!(
-                                "{}{}.{:02}",
-                                if cents < 0 { "-" } else { "" },
-                                cents.abs() / 100,
-                                cents.abs() % 100
-                            ))
-                        };
-                        let shelf = if id.is_multiple_of(31) {
-                            Value::Null
-                        } else {
-                            Value::Utf8(SHELVES[usize::try_from(id % 6).expect("small")].to_owned())
-                        };
-                        // About five years of days, starting mid-year, NULL now and then.
-                        let stocked = if id.is_multiple_of(41) {
-                            Value::Null
-                        } else {
-                            let day = (id * 7) % 1_900;
-                            Value::Utf8(format!(
-                                "{}-{:02}-{:02}",
-                                2019 + day / 365,
-                                1 + (day % 365) / 31,
-                                1 + (day % 365) % 28
-                            ))
-                        };
-                        let aisle = if id.is_multiple_of(37) {
-                            Value::Null
-                        } else {
-                            Value::Utf8(AISLES[usize::try_from(id % 3).expect("small")].to_owned())
-                        };
-                        StoredRow::new(
-                            PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
-                            vec![Value::UInt64(id), owner, amount, shelf, aisle, stocked],
-                            1,
-                            false,
-                        )
-                    })
-                    .collect(),
-            )
+            .bulk_ingest_snapshot((start..end).map(|id| stock_row(id, key_type)).collect())
             .expect("ingest");
         start = end;
     }
@@ -305,5 +301,58 @@ fn date_part_folds_match_general() {
                 "SELECT DAY(stocked) + 0 AS d, {LANES} FROM stock {filter} GROUP BY d ORDER BY d"
             ),
         );
+    }
+}
+
+/// Rows in the memtable leave the scan unsettled, so no settled memo keeps
+/// the answer as rows, and a range fold over every group serves them as
+/// columns - its decimal totals as units - to the rounding and the top-k
+/// above it.
+#[test]
+fn range_fold_groups_served_as_columns_match_general() {
+    for key_type in [DataType::Int64, DataType::UInt64] {
+        let mut fixture = fixture(key_type);
+        fixture
+            .table
+            .ingest(
+                (560_000..566_000)
+                    .map(|id| stock_row(id, key_type))
+                    .collect(),
+            )
+            .expect("memtable rows");
+        for filter in [
+            "WHERE id < 400000 OR id >= 560000",
+            "WHERE (id < 400000 OR id >= 560000) AND id % 3 <> 1",
+        ] {
+            assert_same(
+                &fixture,
+                &format!("SELECT owner AS k, {LANES} FROM stock {filter} GROUP BY k ORDER BY k"),
+                &format!(
+                    "SELECT owner + 0 AS k, {LANES} FROM stock {filter} GROUP BY k ORDER BY k"
+                ),
+            );
+            assert_same(
+                &fixture,
+                &format!(
+                    "SELECT owner AS k, COUNT(*) AS n, ROUND(SUM(amount), 1) AS s FROM stock \
+                     {filter} GROUP BY k ORDER BY s DESC, k LIMIT 10"
+                ),
+                &format!(
+                    "SELECT owner + 0 AS k, COUNT(*) AS n, ROUND(SUM(amount), 1) AS s FROM stock \
+                     {filter} GROUP BY k ORDER BY s DESC, k LIMIT 10"
+                ),
+            );
+            assert_same(
+                &fixture,
+                &format!(
+                    "SELECT owner AS k, SUM(amount) AS s FROM stock {filter} GROUP BY k \
+                     ORDER BY s, k LIMIT 25"
+                ),
+                &format!(
+                    "SELECT owner + 0 AS k, SUM(amount) AS s FROM stock {filter} GROUP BY k \
+                     ORDER BY s, k LIMIT 25"
+                ),
+            );
+        }
     }
 }

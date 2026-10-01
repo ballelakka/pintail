@@ -2233,7 +2233,7 @@ fn fold_span(
                     collation,
                     key_collations,
                 )
-                .map(|rows| rows.rows)
+                .map(MaterializedRows::into_rows)
             })
             .collect::<Result<Vec<_>, ExecError>>()?;
         for rows in partials {
@@ -2357,7 +2357,7 @@ fn try_grouped_segment_fold(
                 collation,
                 key_collations,
             )?
-            .rows;
+            .into_rows();
             folded = Some(match folded {
                 None => rows,
                 Some(base) => merge_finished_aggregate_rows(
@@ -2731,6 +2731,7 @@ pub(super) fn build_hash_aggregate(
             rows,
             position: 0,
             spilled: None,
+            ready: None,
         });
     }
     if memo_key.is_none()
@@ -2784,7 +2785,7 @@ pub(super) fn build_hash_aggregate(
             )?;
             let merged = merge_finished_aggregate_rows(
                 base,
-                delta_rows.rows,
+                delta_rows.into_rows(),
                 group_by.len(),
                 aggregates,
                 collation,
@@ -2801,6 +2802,7 @@ pub(super) fn build_hash_aggregate(
                 rows: merged,
                 position: 0,
                 spilled: None,
+                ready: None,
             });
         }
     }
@@ -2819,6 +2821,7 @@ pub(super) fn build_hash_aggregate(
             rows,
             position: 0,
             spilled: None,
+            ready: None,
         });
     }
     // A grouped aggregate the segments can be folded one at a time. Tried
@@ -2843,6 +2846,7 @@ pub(super) fn build_hash_aggregate(
             rows,
             position: 0,
             spilled: None,
+            ready: None,
         });
     }
     let result = match project_computed_arguments(input, input_width, aggregates) {
@@ -2868,6 +2872,12 @@ pub(super) fn build_hash_aggregate(
             collation,
             key_collations,
         )?,
+    };
+    // The memo keeps rows; a result held as columns gives them up here.
+    let result = if memo_key.is_some() {
+        result.with_rows()
+    } else {
+        result
     };
     if let Some(key) = memo_key
         && result.spilled.is_none()
@@ -3365,6 +3375,7 @@ fn build_hash_aggregate_scan(
             rows: vec![row],
             position: 0,
             spilled: None,
+            ready: None,
         });
     }
     if !group_by.is_empty() {
@@ -3571,6 +3582,7 @@ fn build_hash_aggregate_scan(
         rows,
         position: 0,
         spilled: None,
+        ready: None,
     })
 }
 
@@ -3645,6 +3657,7 @@ fn build_buffered_hash_aggregate(
             rows: Vec::new(),
             position: 0,
             spilled: None,
+            ready: None,
         });
     };
     // GROUP BY over date-part expressions (the Q5 shape): bounded int
@@ -4633,6 +4646,7 @@ pub(super) fn merge_spilled_aggregate_groups(
     Ok(MaterializedRows {
         rows: Vec::new(),
         position: 0,
+        ready: None,
         spilled: Some(SpilledGroupMerge {
             merge,
             chunk_reserved: 0,
@@ -5614,6 +5628,7 @@ fn finish_aggregate_groups(
         rows,
         position: 0,
         spilled: None,
+        ready: None,
     })
 }
 
@@ -5678,6 +5693,7 @@ fn build_direct_column_aggregate(
                 rows: Vec::new(),
                 position: 0,
                 spilled: None,
+                ready: None,
             });
         };
         let typed_text = |column: usize| {
@@ -5961,6 +5977,7 @@ fn build_direct_column_aggregate(
         rows,
         position: 0,
         spilled: None,
+        ready: None,
     })
 }
 

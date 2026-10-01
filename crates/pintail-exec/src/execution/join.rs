@@ -3683,6 +3683,7 @@ impl LoopRows {
                 rows: self.rows,
                 position: 0,
                 spilled: None,
+                ready: None,
             }))
         }
     }

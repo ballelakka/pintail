@@ -815,6 +815,7 @@ fn build_memory_window(
         rows,
         position: 0,
         spilled: None,
+        ready: None,
     })
 }
 

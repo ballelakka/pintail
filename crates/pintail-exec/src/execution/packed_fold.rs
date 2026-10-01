@@ -354,33 +354,42 @@ pub(super) fn commit_merged(
     aggregates: &[CompiledAggregate],
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
-    let Some(first) = folds.first() else {
-        return Ok(());
-    };
-    let count: u64 = folds.iter().map(|fold| fold.counts[slot]).sum();
     for (index, (state, aggregate)) in states.iter_mut().zip(aggregates).enumerate() {
-        let Some(lane) = first.lanes[index] else {
-            continue;
-        };
-        let mut total = identity(Some(lane));
-        let mut nulls = 0_u64;
-        for fold in folds {
-            if let Some(&value) = fold.totals[index].get(slot) {
-                match lane {
-                    PackedLane::Minimum { .. } => total = total.min(value),
-                    PackedLane::Maximum { .. } => total = total.max(value),
-                    _ => total = total.wrapping_add(value),
-                }
-            }
-            nulls += fold.nulls[index].get(slot).copied().unwrap_or(0);
+        if let Some((lane, cell)) = merged_cell(folds, index, slot) {
+            cell.commit(lane, state, aggregate, memory)?;
         }
-        let cell = PackedCell {
-            total,
-            rows: count - nulls,
-        };
-        cell.commit(lane, state, aggregate, memory)?;
     }
     Ok(())
+}
+
+/// Lane `index`'s total and row count for `slot` across `folds`, or `None`
+/// for a lane that is not packed.
+pub(super) fn merged_cell(
+    folds: &[PackedFold],
+    index: usize,
+    slot: usize,
+) -> Option<(PackedLane, PackedCell)> {
+    let lane = folds.first()?.lanes[index]?;
+    let count: u64 = folds.iter().map(|fold| fold.counts[slot]).sum();
+    let mut total = identity(Some(lane));
+    let mut nulls = 0_u64;
+    for fold in folds {
+        if let Some(&value) = fold.totals[index].get(slot) {
+            match lane {
+                PackedLane::Minimum { .. } => total = total.min(value),
+                PackedLane::Maximum { .. } => total = total.max(value),
+                _ => total = total.wrapping_add(value),
+            }
+        }
+        nulls += fold.nulls[index].get(slot).copied().unwrap_or(0);
+    }
+    Some((
+        lane,
+        PackedCell {
+            total,
+            rows: count - nulls,
+        },
+    ))
 }
 
 /// `len` copies of `value`, written as they are made (see [`written_zeros`]:

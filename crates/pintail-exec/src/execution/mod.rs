@@ -6243,6 +6243,35 @@ struct MaterializedRows {
     /// An aggregate whose group map spilled serves its merged result from
     /// here, a chunk at a time into `rows`, instead of holding it whole.
     spilled: Option<aggregate::SpilledGroupMerge>,
+    /// Finished groups held as columns instead of `rows`, served a batch at
+    /// a time from `position`. Consumers that need rows ask
+    /// [`MaterializedRows::into_rows`].
+    ready: Option<two_pass::ReadyColumns>,
+}
+
+impl MaterializedRows {
+    /// Every row this holds, the column-held ones materialized. Only for a
+    /// result nothing has read from yet.
+    fn into_rows(self) -> Vec<Vec<Value>> {
+        match self.ready {
+            Some(ready) => ready.into_rows(),
+            None => self.rows,
+        }
+    }
+
+    /// The same result with its rows in `rows`, for a consumer that reads
+    /// them there.
+    fn with_rows(self) -> Self {
+        if self.ready.is_none() {
+            return self;
+        }
+        Self {
+            rows: self.into_rows(),
+            position: 0,
+            spilled: None,
+            ready: None,
+        }
+    }
 }
 
 fn next_materialized_batch(
@@ -6250,6 +6279,19 @@ fn next_materialized_batch(
     column_types: &[DataType],
     memory: &MemoryTracker,
 ) -> Result<Option<RecordBatch>, ExecError> {
+    if let Some(ready) = &state.ready {
+        if state.position >= ready.len() {
+            return Ok(None);
+        }
+        let end = state
+            .position
+            .saturating_add(affordable_batch_rows(memory, ready.row_bytes()))
+            .min(ready.len());
+        memory.ensure_transient(ready.row_bytes().saturating_mul(end - state.position))?;
+        let batch = ready.batch(state.position..end, column_types)?;
+        state.position = end;
+        return Ok(Some(batch));
+    }
     if state.position >= state.rows.len() {
         return Ok(None);
     }

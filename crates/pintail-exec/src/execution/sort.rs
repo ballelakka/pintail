@@ -461,6 +461,7 @@ pub(super) fn build_sort(
             rows,
             position: 0,
             spilled: None,
+            ready: None,
         }));
     }
     // Sorted as columns while the input fits beside its operators: its
@@ -518,6 +519,7 @@ fn sort_rows(
             rows,
             position: 0,
             spilled: None,
+            ready: None,
         }));
     }
     let merge = SpilledMerge::new(runs, &rows, keys.to_vec(), trim_to, collation, memory)?;
