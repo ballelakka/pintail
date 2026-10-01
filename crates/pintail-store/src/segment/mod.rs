@@ -1,10 +1,12 @@
 mod encoding;
 
+#[cfg(test)]
+use encoding::decompress_block;
 use encoding::{
     FRAME_ENTRY_BYTES, FRAMED_MINIMUM_BYTES, compare_cells, compress_block_for_storage,
     compress_framed_for_storage, decode_integer_base, decode_payload, decoded_heap_upper_bound,
-    decompress_block, decompress_frame, encode_payload, framed_head_digest, hll_registers,
-    parse_frame_directory, select_encoding, unpack, unpack_delta_each, unpack_signed_into,
+    decompress_block_into, decompress_frame, encode_payload, framed_head_digest, hll_registers,
+    parse_frame_directory, select_encoding, unpack_delta_each, unpack_into, unpack_signed_into,
     unpack_unsigned_into,
 };
 
@@ -153,6 +155,23 @@ impl FileDecoder {
         let mut bytes = vec![0_u8; length];
         self.read_exact(&mut bytes)?;
         Ok(bytes)
+    }
+
+    /// Appends exactly `length` bytes to `out` without zeroing the space
+    /// first, which a reused buffer would otherwise pay on every block.
+    fn read_appending(&mut self, length: usize, out: &mut Vec<u8>) -> Result<(), String> {
+        let wanted = u64::try_from(length).map_err(|_| "read length exceeds u64".to_owned())?;
+        let start = out.len();
+        out.reserve(length);
+        (&mut self.reader)
+            .take(wanted)
+            .read_to_end(out)
+            .map_err(|error| error.to_string())?;
+        if out.len() - start != length {
+            return Err("failed to fill whole buffer".to_owned());
+        }
+        self.position = self.position.saturating_add(length);
+        Ok(())
     }
 
     fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), String> {
@@ -3739,15 +3758,14 @@ fn read_file_block(
         .u32()
         .map_err(|reason| corrupt_here(path, decoder, reason))? as usize;
     let encoded_length = payload_length.saturating_add(12);
-    let mut encoded = Vec::with_capacity(encoded_length);
+    let mut encoded = ScratchBuffer::take(&READ_SCRATCH, encoded_length);
     encoded.extend_from_slice(
         &u32::try_from(payload_length)
             .map_err(|_| StoreError::FormatLimit("block payload exceeds u32::MAX".into()))?
             .to_le_bytes(),
     );
-    encoded.resize(payload_length.saturating_add(4), 0);
     decoder
-        .read_exact(&mut encoded[4..])
+        .read_appending(payload_length, &mut encoded)
         .map_err(|reason| corrupt_here(path, decoder, reason))?;
     encoded.extend_from_slice(
         &decoder
@@ -3757,6 +3775,63 @@ fn read_file_block(
     );
     let mut block_decoder = Decoder::with_base_offset(&encoded, block_offset);
     read_block(path, &mut block_decoder, logical_type, format_version)
+}
+
+thread_local! {
+    /// The stored bytes of the block a scan thread is reading.
+    static READ_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The decompressed payload of that block.
+    static DECOMPRESS_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A buffer above this size is freed rather than kept for the next block:
+/// one wide text block should not pin megabytes on every scan thread.
+const SCRATCH_RETAIN_BYTES: usize = 4 << 20;
+
+/// A per-thread block buffer, borrowed for one block and handed back when
+/// dropped. Blocks are a few tens of KiB; allocating each one fresh had the
+/// allocator purge and refault its pages, block after block, which put a
+/// filtered count's kernel time above a third of the query. A nested read
+/// on the same thread finds the slot empty and simply allocates.
+struct ScratchBuffer {
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u8>>>,
+    buffer: Vec<u8>,
+}
+
+impl ScratchBuffer {
+    fn take(
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u8>>>,
+        capacity: usize,
+    ) -> Self {
+        let mut buffer = slot.with(std::cell::RefCell::take);
+        buffer.clear();
+        buffer.reserve(capacity);
+        Self { slot, buffer }
+    }
+}
+
+impl std::ops::Deref for ScratchBuffer {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for ScratchBuffer {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buffer
+    }
+}
+
+impl Drop for ScratchBuffer {
+    fn drop(&mut self) {
+        if self.buffer.capacity() <= SCRATCH_RETAIN_BYTES {
+            let buffer = std::mem::take(&mut self.buffer);
+            self.slot.with(|slot| *slot.borrow_mut() = buffer);
+        }
+    }
 }
 
 struct BlockRead {
@@ -3807,10 +3882,7 @@ fn decode_int_payload_into(
     if !matches!(encoding, Encoding::BitPacked) {
         return Ok(false);
     }
-    let IntSink {
-        builder,
-        mut ranges,
-    } = sink;
+    let IntSink { builder, ranges } = sink;
     let mut decoder = Decoder::new(bytes);
     let base = decode_integer_base(&mut decoder, logical_type)?;
     // The dominant block shape - no nulls, every row selected, int-typed
@@ -3835,9 +3907,42 @@ fn decode_int_payload_into(
         decoder.finish()?;
         return Ok(true);
     }
-    let normalized = unpack(&mut decoder, non_null_count)?;
+    // Decoded into this thread's reused buffer: a fresh 128 KiB vector per
+    // block faulted its pages in again on every block of a filtered scan.
+    let mut normalized = UNPACK_SCRATCH.with(std::cell::RefCell::take);
+    normalized.clear();
+    unpack_into(&mut decoder, non_null_count, &mut normalized)?;
     decoder.finish()?;
-    if non_null_count == row_count && extend_selected_ranges(builder, &ranges, base, &normalized) {
+    let placed = place_unpacked(
+        builder,
+        ranges,
+        base,
+        &normalized,
+        row_count,
+        non_null_count,
+        null_bitmap,
+    );
+    UNPACK_SCRATCH.with(|slot| *slot.borrow_mut() = normalized);
+    placed
+}
+
+thread_local! {
+    /// Normalized values of the integer block a scan thread is placing.
+    static UNPACK_SCRATCH: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Places an unpacked integer block's selected rows into the builder.
+fn place_unpacked(
+    builder: &mut ColumnBuilder,
+    mut ranges: RangeCursor,
+    base: i128,
+    normalized: &[u64],
+    row_count: usize,
+    non_null_count: usize,
+    null_bitmap: &[u8],
+) -> Result<bool, String> {
+    if non_null_count == row_count && extend_selected_ranges(builder, &ranges, base, normalized) {
         return Ok(true);
     }
     let is_null = |row: usize| null_bitmap[row / 8] & (1 << (row % 8)) != 0;
@@ -4121,15 +4226,14 @@ where
         .map_err(|reason| corrupt_here(path, decoder, reason))? as usize;
     let encoded_length = payload_length.saturating_add(12);
     let _encoded_memory = memory.reserve_temporary(encoded_length)?;
-    let mut encoded = Vec::with_capacity(encoded_length);
+    let mut encoded = ScratchBuffer::take(&READ_SCRATCH, encoded_length);
     encoded.extend_from_slice(
         &u32::try_from(payload_length)
             .map_err(|_| StoreError::FormatLimit("block payload exceeds u32::MAX".into()))?
             .to_le_bytes(),
     );
-    encoded.resize(payload_length.saturating_add(4), 0);
     decoder
-        .read_exact(&mut encoded[4..])
+        .read_appending(payload_length, &mut encoded)
         .map_err(|reason| corrupt_here(path, decoder, reason))?;
     encoded.extend_from_slice(
         &decoder
@@ -4180,15 +4284,14 @@ fn read_file_block_utf8_into(
     }
     let encoded_length = payload_length.saturating_add(12);
     let _encoded_memory = memory.reserve_temporary(encoded_length)?;
-    let mut encoded = Vec::with_capacity(encoded_length);
+    let mut encoded = ScratchBuffer::take(&READ_SCRATCH, encoded_length);
     encoded.extend_from_slice(
         &u32::try_from(payload_length)
             .map_err(|_| StoreError::FormatLimit("block payload exceeds u32::MAX".into()))?
             .to_le_bytes(),
     );
-    encoded.resize(payload_length.saturating_add(4), 0);
     decoder
-        .read_exact(&mut encoded[4..])
+        .read_appending(payload_length, &mut encoded)
         .map_err(|reason| corrupt_here(path, decoder, reason))?;
     encoded.extend_from_slice(
         &decoder
@@ -4228,15 +4331,14 @@ fn read_file_block_int_into(
         .map_err(|reason| corrupt_here(path, decoder, reason))? as usize;
     let encoded_length = payload_length.saturating_add(12);
     let _encoded_memory = memory.reserve_temporary(encoded_length)?;
-    let mut encoded = Vec::with_capacity(encoded_length);
+    let mut encoded = ScratchBuffer::take(&READ_SCRATCH, encoded_length);
     encoded.extend_from_slice(
         &u32::try_from(payload_length)
             .map_err(|_| StoreError::FormatLimit("block payload exceeds u32::MAX".into()))?
             .to_le_bytes(),
     );
-    encoded.resize(payload_length.saturating_add(4), 0);
     decoder
-        .read_exact(&mut encoded[4..])
+        .read_appending(payload_length, &mut encoded)
         .map_err(|reason| corrupt_here(path, decoder, reason))?;
     encoded.extend_from_slice(
         &decoder
@@ -4385,11 +4487,25 @@ where
     let _uncompressed_memory = memory
         .map(|memory| memory.reserve_temporary(uncompressed_length))
         .transpose()?;
-    let uncompressed = decompress_block(compression, compressed, uncompressed_length)
-        .map_err(|reason| corrupt(path, compressed_offset, reason))?;
+    // A raw payload decodes in place: its length was checked against the
+    // declared one above. A compressed one decompresses into this thread's
+    // reused buffer; a fresh zeroed allocation per block had the allocator
+    // returning and refaulting pages on every block of a scan.
+    let mut scratch = None;
+    let uncompressed: &[u8] = if compression == Compression::None {
+        compressed
+    } else {
+        let buffer = scratch.insert(ScratchBuffer::take(
+            &DECOMPRESS_SCRATCH,
+            uncompressed_length,
+        ));
+        decompress_block_into(compression, compressed, uncompressed_length, buffer)
+            .map_err(|reason| corrupt(path, compressed_offset, reason))?;
+        buffer
+    };
     if let Some(sink) = utf8_sink {
         decode_utf8_payload_into(
-            &uncompressed,
+            uncompressed,
             encoding,
             row_count,
             non_null_count,
@@ -4405,7 +4521,7 @@ where
     }
     if let Some(sink) = int_sink
         && decode_int_payload_into(
-            &uncompressed,
+            uncompressed,
             logical_type,
             encoding,
             row_count,
@@ -4422,7 +4538,7 @@ where
         });
     }
     let decoded_heap =
-        decoded_heap_upper_bound(&uncompressed, logical_type, encoding, non_null_count)
+        decoded_heap_upper_bound(uncompressed, logical_type, encoding, non_null_count)
             .map_err(|reason| corrupt(path, compressed_offset, reason))?;
     let _decode_memory = memory
         .map(|memory| {
@@ -4441,7 +4557,7 @@ where
     if let Some(memory) = memory {
         memory.reserve(reserved_bytes)?;
     }
-    let decoded_values = decode_payload(&uncompressed, logical_type, encoding, non_null_count)
+    let decoded_values = decode_payload(uncompressed, logical_type, encoding, non_null_count)
         .map_err(|reason| corrupt(path, compressed_offset, reason))?;
     // A block with no nulls decodes straight into its final shape. The
     // splice below exists to interleave `Cell::Null`, and doing it anyway

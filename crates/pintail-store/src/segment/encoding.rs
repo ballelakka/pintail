@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use lz4_flex::block::{compress as lz4_compress, decompress as lz4_decompress};
+use lz4_flex::block::compress as lz4_compress;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::{Cell, Compression, Encoding, LogicalType, decode_cell, encode_cell};
@@ -255,6 +255,20 @@ pub(super) fn decompress_block(
     bytes: &[u8],
     uncompressed_length: usize,
 ) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    decompress_block_into(compression, bytes, uncompressed_length, &mut output)?;
+    Ok(output)
+}
+
+/// [`decompress_block`] into a caller's buffer, replacing its contents, so a
+/// scan can reuse one buffer across blocks.
+pub(super) fn decompress_block_into(
+    compression: Compression,
+    bytes: &[u8],
+    uncompressed_length: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    output.clear();
     match compression {
         Compression::None => {
             if bytes.len() != uncompressed_length {
@@ -263,21 +277,31 @@ pub(super) fn decompress_block(
                     bytes.len()
                 ));
             }
-            Ok(bytes.to_vec())
+            output.extend_from_slice(bytes);
         }
-        Compression::Lz4 => lz4_decompress(bytes, uncompressed_length)
-            .map_err(|error| format!("invalid LZ4 block: {error}")),
-        Compression::Zstd => zstd::bulk::decompress(bytes, uncompressed_length)
-            .map_err(|error| format!("invalid zstd block: {error}")),
+        Compression::Lz4 => {
+            output.resize(uncompressed_length, 0);
+            let written = lz4_flex::block::decompress_into(bytes, output)
+                .map_err(|error| format!("invalid LZ4 block: {error}"))?;
+            if written != uncompressed_length {
+                return Err(format!(
+                    "invalid LZ4 block: {written} bytes, expected {uncompressed_length}"
+                ));
+            }
+        }
+        Compression::Zstd => {
+            *output = zstd::bulk::decompress(bytes, uncompressed_length)
+                .map_err(|error| format!("invalid zstd block: {error}"))?;
+        }
         Compression::AdaptiveLz4 => {
-            Err("adaptive LZ4 is a writer policy, not a stored compression".to_owned())
+            return Err("adaptive LZ4 is a writer policy, not a stored compression".to_owned());
         }
         Compression::Framed => {
             // Frames decompress in place into one buffer, and zstd frames
             // share one context: a context per 64 KiB frame, or a copy per
             // frame, cost a full-column scan about a tenth of its time.
             let frames = parse_frames(bytes, uncompressed_length)?;
-            let mut output = vec![0_u8; uncompressed_length];
+            output.resize(uncompressed_length, 0);
             let mut zstd_context = None;
             let mut offset = 0_usize;
             for Frame { entry, data } in &frames {
@@ -314,9 +338,9 @@ pub(super) fn decompress_block(
                 }
                 offset = end;
             }
-            Ok(output)
         }
     }
+    Ok(())
 }
 
 pub(super) fn select_encoding(logical_type: LogicalType, cells: &[Cell]) -> Encoding {
@@ -1087,6 +1111,20 @@ pub(super) fn unpack_unsigned_into(
             out.push(u64::try_from(value).map_err(|_| "bit-packed unsigned integer overflow")?);
         }
         Ok(())
+    })
+}
+
+/// [`unpack`] appending to a caller's buffer, so a scan reuses one.
+pub(super) fn unpack_into(
+    decoder: &mut Decoder<'_>,
+    value_count: usize,
+    out: &mut Vec<u64>,
+) -> Result<(), String> {
+    let (width, bytes) = unpack_header(decoder, value_count)?;
+    out.reserve(value_count);
+    for_each_unpacked_group(bytes, width, value_count, |group| {
+        out.extend_from_slice(group);
+        Ok::<(), String>(())
     })
 }
 
