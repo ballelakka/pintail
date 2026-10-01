@@ -13,6 +13,7 @@ use super::aggregate::{
 };
 use super::join::{normalized_group_hash_key, normalized_group_text};
 use super::morsel::{Morsel, default_morsel_limit, morsel_plan};
+use super::packed_fold::{FoldRows, PackedFold, commit_merged, fold_rows, occupied_in};
 use super::{
     ExecError, HASH_ENTRY_OVERHEAD, MaterializedRows, MemoryTracker, PullOperator,
     estimated_row_payload_bytes,
@@ -416,6 +417,7 @@ fn two_pass_groups_map(
 struct TwoPassState<'a> {
     maps: &'a mut [GroupKeyMap],
     dense: &'a mut Option<DenseGroupSlots>,
+    range: &'a mut IntRange,
     group_reserved: &'a mut usize,
     spill_runs: &'a mut Vec<spill::ClosedRun>,
 }
@@ -440,6 +442,16 @@ fn two_pass_spill(
         fold_dense_into_maps(
             slots,
             keys,
+            aggregates,
+            partitions,
+            state.maps,
+            memory,
+            state.group_reserved,
+        )?;
+    }
+    if let IntRange::Active(range) = std::mem::replace(state.range, IntRange::Off) {
+        fold_int_range_into_maps(
+            &range,
             aggregates,
             partitions,
             state.maps,
@@ -609,6 +621,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         }
     }
 
+    let mut range = IntRange::default();
     let mut window: Vec<(RecordBatch, Vec<Vec<u64>>)> = Vec::new();
     let mut window_reserved = 0_usize;
     let mut window_rows = 0_usize;
@@ -668,6 +681,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     &mut TwoPassState {
                         maps: &mut maps,
                         dense: &mut dense,
+                        range: &mut range,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -688,6 +702,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     partitions,
                     &mut maps,
                     &mut dense,
+                    &mut range,
                     intern.as_ref().map_or(0, |intern| intern.values.len()),
                     memory,
                     &mut group_reserved,
@@ -702,6 +717,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                         &mut TwoPassState {
                             maps: &mut maps,
                             dense: &mut dense,
+                            range: &mut range,
                             group_reserved: &mut group_reserved,
                             spill_runs: &mut spill_runs,
                         },
@@ -728,6 +744,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     &mut TwoPassState {
                         maps: &mut maps,
                         dense: &mut dense,
+                        range: &mut range,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -748,6 +765,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     partitions,
                     &mut maps,
                     &mut dense,
+                    &mut range,
                     intern.as_ref().map_or(0, |intern| intern.values.len()),
                     memory,
                     &mut group_reserved,
@@ -760,6 +778,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                         &mut TwoPassState {
                             maps: &mut maps,
                             dense: &mut dense,
+                            range: &mut range,
                             group_reserved: &mut group_reserved,
                             spill_runs: &mut spill_runs,
                         },
@@ -793,6 +812,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                 &mut TwoPassState {
                     maps: &mut maps,
                     dense: &mut dense,
+                    range: &mut range,
                     group_reserved: &mut group_reserved,
                     spill_runs: &mut spill_runs,
                 },
@@ -821,6 +841,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     &mut TwoPassState {
                         maps: &mut maps,
                         dense: &mut dense,
+                        range: &mut range,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -892,6 +913,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                 &mut TwoPassState {
                     maps: &mut maps,
                     dense: &mut dense,
+                    range: &mut range,
                     group_reserved: &mut group_reserved,
                     spill_runs: &mut spill_runs,
                 },
@@ -920,6 +942,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
                     &mut TwoPassState {
                         maps: &mut maps,
                         dense: &mut dense,
+                        range: &mut range,
                         group_reserved: &mut group_reserved,
                         spill_runs: &mut spill_runs,
                     },
@@ -947,6 +970,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         &mut TwoPassState {
             maps: &mut maps,
             dense: &mut dense,
+            range: &mut range,
             group_reserved: &mut group_reserved,
             spill_runs: &mut spill_runs,
         },
@@ -967,6 +991,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         partitions,
         &mut maps,
         &mut dense,
+        &mut range,
         intern.as_ref().map_or(0, |intern| intern.values.len()),
         memory,
         &mut group_reserved,
@@ -976,6 +1001,7 @@ pub(super) fn build_streaming_two_pass_aggregate(
         &mut TwoPassState {
             maps: &mut maps,
             dense: &mut dense,
+            range: &mut range,
             group_reserved: &mut group_reserved,
             spill_runs: &mut spill_runs,
         },
@@ -1001,6 +1027,38 @@ pub(super) fn build_streaming_two_pass_aggregate(
         fold_dense_into_maps(
             slots,
             keys,
+            aggregates,
+            partitions,
+            &mut maps,
+            memory,
+            &mut group_reserved,
+        )?;
+    }
+    if let IntRange::Active(active) = std::mem::replace(&mut range, IntRange::Off) {
+        if let TwoPassKeySource::Int { group_type, .. } = keys
+            && spill_runs.is_empty()
+            && maps.iter().all(HashMap::is_empty)
+        {
+            // Every group is in the range fold: finish them straight from
+            // its slots, in key order, without building a map entry each.
+            let rows = finish_int_range(&active, group_type, aggregates, memory);
+            memory.release(active.reserved);
+            memory.release(group_reserved);
+            if std::env::var_os("PINTAIL_AGG_DEBUG").is_some() {
+                eprintln!(
+                    "[agg] streaming two-pass: range fold of {} slots, {} flushes",
+                    active.slot_count,
+                    flushes + 1
+                );
+            }
+            return Ok(MaterializedRows {
+                rows: rows?,
+                position: 0,
+                spilled: None,
+            });
+        }
+        fold_int_range_into_maps(
+            &active,
             aggregates,
             partitions,
             &mut maps,
@@ -1487,7 +1545,7 @@ impl PackedInts<'_> {
 /// and matched its representation for every row and lane, and the integer
 /// lanes read through `ColumnVector::value`, which materialized the whole
 /// column as `Value` cells to hand back one integer.
-enum LaneReader<'a> {
+pub(super) enum LaneReader<'a> {
     CountStar,
     /// Scaled decimal units from a packed decimal column.
     Units(
@@ -1503,7 +1561,7 @@ enum LaneReader<'a> {
 impl LaneReader<'_> {
     /// The same bits [`two_pass_lane_bits`] returns for this row.
     #[inline]
-    fn bits(&self, row: usize) -> Option<u64> {
+    pub(super) fn bits(&self, row: usize) -> Option<u64> {
         match self {
             Self::CountStar => Some(0),
             Self::Units(values, validity) => validity
@@ -1637,7 +1695,7 @@ impl StringIntern {
 /// batch — no cross-worker sharing) and folds every set in one pass-2
 /// flush. Only int-keyed sources scatter in parallel: string sources
 /// share the intern table and stay on the serial path.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn drain_two_pass_window(
     window: &mut Vec<(RecordBatch, Vec<Vec<u64>>)>,
     keys: TwoPassKeySource,
@@ -1646,6 +1704,7 @@ fn drain_two_pass_window(
     partitions: usize,
     maps: &mut [GroupKeyMap],
     dense: &mut Option<DenseGroupSlots>,
+    range: &mut IntRange,
     intern_len: usize,
     memory: &MemoryTracker,
     group_reserved: &mut usize,
@@ -1687,6 +1746,28 @@ fn drain_two_pass_window(
             memory,
             group_reserved,
         )?;
+    }
+    if let TwoPassKeySource::Int { column, group_type } = keys
+        && matches!(
+            group_type.storage_type(),
+            DataType::Int64 | DataType::UInt64
+        )
+        && fold_int_range_window(
+            window,
+            column,
+            lanes,
+            aggregates,
+            partitions,
+            maps,
+            range,
+            memory,
+            group_reserved,
+        )?
+    {
+        window.clear();
+        memory.release(*window_reserved);
+        *window_reserved = 0;
+        return Ok(());
     }
     // Row-range morsels rather than whole batches: the window's width then
     // comes from the pool, and a window of one or two batches - the tail of
@@ -1782,13 +1863,490 @@ fn two_pass_flush(
     outcome
 }
 
+/// Most key slots the integer-range fold takes. Every worker holds a fold
+/// this wide, so the bound is what keeps those folds inside a core's share
+/// of the last-level cache: past it, the random updates miss to memory and
+/// the scatter's partitioned maps are the better shape.
+const RANGE_SLOT_CAP: usize = 1 << 18;
+
+/// Rows a range fold computes slots for at a time, so the slot buffer stays
+/// in the first-level cache while each lane reads it.
+const RANGE_FOLD_ROWS: usize = 4_096;
+
+/// Packed totals for an integer group key, indexed by the key's offset
+/// from the smallest key seen. Slot 0 is the NULL group and slot `1 + k -
+/// base` holds key `k`.
+///
+/// A high-cardinality grouped SUM over an integer key - one per customer,
+/// per product - spent most of its time scattering every row into partition
+/// buckets and probing a map per partition. When the keys sit in a range not
+/// much wider than the rows that fill it, which is how surrogate and foreign
+/// keys look, each worker folds its rows straight into an array of that
+/// range instead: no buffer, no hash, one indexed add per row and lane.
+struct IntRangeFold {
+    base: i128,
+    /// Key slots, the NULL slot excluded.
+    span: usize,
+    /// Whether the key column is signed, which is how its bits are spelled.
+    signed: bool,
+    /// Key slots plus the NULL slot.
+    slot_count: usize,
+    /// One fold per worker, kept across windows and combined per slot only
+    /// when the groups are committed: merging them whole after every window
+    /// was a serial pass over every slot of every partial.
+    folds: Vec<PackedFold>,
+    /// Rows folded so far, for the density bound.
+    rows: usize,
+    reserved: usize,
+}
+
+impl IntRangeFold {
+    /// The map key the scatter would have built for `slot`.
+    fn key_bits(&self, slot: usize) -> (u64, bool) {
+        if slot == 0 {
+            return (0, true);
+        }
+        let key = self.base + i128::try_from(slot - 1).expect("slot fits i128");
+        let bits = if self.signed {
+            u64::from_ne_bytes(
+                i64::try_from(key)
+                    .expect("signed key in range")
+                    .to_ne_bytes(),
+            )
+        } else {
+            u64::try_from(key).expect("unsigned key in range")
+        };
+        (bits, false)
+    }
+}
+
+/// Where the integer-range fold stands for a query.
+#[derive(Default)]
+enum IntRange {
+    /// No window has been offered yet.
+    #[default]
+    Untried,
+    Active(Box<IntRangeFold>),
+    /// The key or the lanes do not fit; the scatter takes every window.
+    Off,
+}
+
+/// A packed integer key column of one batch.
+fn int_key_column(
+    batch: &RecordBatch,
+    column: usize,
+) -> Option<(PackedInts<'_>, &crate::array::ValidityMask)> {
+    match batch.column(column)?.typed()? {
+        (crate::batch::TypedValues::Int64(values), validity)
+            if values.len() >= batch.row_count() =>
+        {
+            Some((PackedInts::Signed(values.as_slice()), validity))
+        }
+        (crate::batch::TypedValues::UInt64(values), validity)
+            if values.len() >= batch.row_count() =>
+        {
+            Some((PackedInts::Unsigned(values.as_slice()), validity))
+        }
+        _ => None,
+    }
+}
+
+/// The smallest and largest non-NULL key among `rows`.
+fn key_bounds(
+    keys: PackedInts<'_>,
+    validity: &crate::array::ValidityMask,
+    rows: &FoldRows<'_>,
+) -> Option<(i128, i128)> {
+    fn widen<T: Copy + Ord + Into<i128>>(
+        values: &[T],
+        validity: &crate::array::ValidityMask,
+        rows: &FoldRows<'_>,
+    ) -> Option<(i128, i128)> {
+        match rows {
+            FoldRows::Span(span) if validity.no_nulls() => {
+                let values = &values[span.clone()];
+                let low = values.iter().copied().min()?;
+                let high = values.iter().copied().max()?;
+                Some((low.into(), high.into()))
+            }
+            FoldRows::Span(span) => span
+                .clone()
+                .filter(|row| validity.is_valid(*row))
+                .map(|row| values[row].into())
+                .fold(None, |bounds, key: i128| {
+                    Some(bounds.map_or((key, key), |(low, high): (i128, i128)| {
+                        (low.min(key), high.max(key))
+                    }))
+                }),
+            FoldRows::Picked(picked) => picked
+                .iter()
+                .map(|row| *row as usize)
+                .filter(|row| validity.is_valid(*row))
+                .map(|row| values[row].into())
+                .fold(None, |bounds, key: i128| {
+                    Some(bounds.map_or((key, key), |(low, high): (i128, i128)| {
+                        (low.min(key), high.max(key))
+                    }))
+                }),
+        }
+    }
+    match keys {
+        PackedInts::Signed(values) => widen(values, validity, rows),
+        PackedInts::Unsigned(values) => widen(values, validity, rows),
+    }
+}
+
+/// Each listed row's slot: `1 + key - base`, or 0 for a NULL key. Every
+/// key was checked against the range before the fold began.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn range_slots(
+    keys: PackedInts<'_>,
+    validity: &crate::array::ValidityMask,
+    rows: &FoldRows<'_>,
+    base: i128,
+    slots: &mut Vec<u32>,
+) {
+    slots.clear();
+    // Offsets are below RANGE_SLOT_CAP, so the wrapping difference in the
+    // key's own width is the offset, and it fits u32.
+    macro_rules! fill {
+        ($values:expr, $base:expr) => {{
+            let values = $values;
+            let base = $base;
+            match rows {
+                FoldRows::Span(span) if validity.no_nulls() => slots.extend(
+                    values[span.clone()]
+                        .iter()
+                        .map(|key| (key.wrapping_sub(base) as u32) + 1),
+                ),
+                FoldRows::Span(span) => slots.extend(span.clone().map(|row| {
+                    if validity.is_valid(row) {
+                        (values[row].wrapping_sub(base) as u32) + 1
+                    } else {
+                        0
+                    }
+                })),
+                FoldRows::Picked(picked) => slots.extend(picked.iter().map(|row| {
+                    let row = *row as usize;
+                    if validity.is_valid(row) {
+                        (values[row].wrapping_sub(base) as u32) + 1
+                    } else {
+                        0
+                    }
+                })),
+            }
+        }};
+    }
+    match keys {
+        PackedInts::Signed(values) => fill!(values, base as i64),
+        PackedInts::Unsigned(values) => fill!(values, base as u64),
+    }
+}
+
+/// Folds one morsel into a worker's range fold.
+fn fold_range_morsel(
+    morsel: &Morsel<'_>,
+    column: usize,
+    lanes: &[TwoPassLane],
+    base: i128,
+    fold: &mut PackedFold,
+) -> Result<(), ExecError> {
+    let batch = morsel.batch;
+    let (keys, validity) = int_key_column(batch, column).ok_or(ExecError::InvalidBatch(
+        "range fold key lost its packed projection",
+    ))?;
+    let inputs = fold.resolve(batch, lanes);
+    let readers = inputs.is_none().then(|| lane_readers(batch, lanes));
+    let mut selected = Vec::new();
+    let mut slots = Vec::with_capacity(RANGE_FOLD_ROWS);
+    let mut start = morsel.rows.start;
+    while start < morsel.rows.end {
+        let end = start.saturating_add(RANGE_FOLD_ROWS).min(morsel.rows.end);
+        let rows = fold_rows(batch, start..end, &mut selected);
+        range_slots(keys, validity, &rows, base, &mut slots);
+        match (&inputs, &readers) {
+            (Some(inputs), _) => fold.fold(inputs, &slots, &rows),
+            (None, Some(readers)) => {
+                for (row, slot) in batch.selection().selected_rows_in(start..end).zip(&slots) {
+                    fold.add_row(*slot as usize, readers, row);
+                }
+            }
+            (None, None) => unreachable!("readers stand in for missing inputs"),
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// Commits the range fold's groups into the partition maps, where the
+/// scatter's groups and a spill expect them, and hands its slab back.
+fn fold_int_range_into_maps(
+    range: &IntRangeFold,
+    aggregates: &[CompiledAggregate],
+    partitions: usize,
+    maps: &mut [GroupKeyMap],
+    memory: &MemoryTracker,
+    group_reserved: &mut usize,
+) -> Result<(), ExecError> {
+    let per_group_bytes = size_of::<(u64, bool)>()
+        .saturating_add(aggregates.len().saturating_mul(size_of::<AggregateState>()))
+        .saturating_add(32);
+    let outcome = (|| {
+        for slot in 0..range.slot_count {
+            if !occupied_in(&range.folds, slot) {
+                continue;
+            }
+            let (bits, null) = range.key_bits(slot);
+            let partition =
+                usize::try_from(crate::batch::mix64(bits ^ u64::from(null)) % partitions as u64)
+                    .expect("partition index fits usize");
+            let states = match maps[partition].entry((bits, null)) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    memory.reserve(per_group_bytes)?;
+                    *group_reserved = group_reserved.saturating_add(per_group_bytes);
+                    entry.insert(aggregates.iter().map(AggregateState::new).collect())
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            };
+            commit_merged(&range.folds, slot, states, aggregates, memory)?;
+        }
+        Ok(())
+    })();
+    memory.release(range.reserved);
+    outcome
+}
+
+/// Finishes every group of a range fold into rows, in key order, when no
+/// other path holds groups of the same query.
+fn finish_int_range(
+    range: &IntRangeFold,
+    group_type: DataType,
+    aggregates: &[CompiledAggregate],
+    memory: &MemoryTracker,
+) -> Result<Vec<Vec<Value>>, ExecError> {
+    let slot_count = range.slot_count;
+    let chunk = slot_count
+        .div_ceil(rayon::current_num_threads().saturating_mul(4))
+        .max(1_024);
+    let finished = (0..slot_count.div_ceil(chunk))
+        .into_par_iter()
+        .map(|piece| -> Result<Vec<Vec<Value>>, ExecError> {
+            let mut rows = Vec::new();
+            let mut uncharged = 0_usize;
+            for slot in piece * chunk..((piece + 1) * chunk).min(slot_count) {
+                if !occupied_in(&range.folds, slot) {
+                    continue;
+                }
+                let mut states = aggregates
+                    .iter()
+                    .map(AggregateState::new)
+                    .collect::<Vec<_>>();
+                commit_merged(&range.folds, slot, &mut states, aggregates, memory)?;
+                let (bits, null) = range.key_bits(slot);
+                let mut row = Vec::with_capacity(1 + states.len());
+                row.push(two_pass_key_value(bits, null, group_type));
+                for state in states {
+                    row.push(state.finish(memory)?);
+                }
+                uncharged = uncharged.saturating_add(estimated_row_payload_bytes(&row));
+                if uncharged >= FINALIZE_CHARGE_SLICE {
+                    memory.reserve(uncharged)?;
+                    uncharged = 0;
+                }
+                rows.push(row);
+            }
+            memory.reserve(uncharged)?;
+            Ok(rows)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(finished.into_iter().flatten().collect())
+}
+
+/// Folds one window through the integer-range fold. `false`, with the fold
+/// committed to the maps and switched off, when the key or the lanes do not
+/// fit it; the caller then scatters the window.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn fold_int_range_window(
+    window: &[(RecordBatch, Vec<Vec<u64>>)],
+    column: usize,
+    lanes: &[TwoPassLane],
+    aggregates: &[CompiledAggregate],
+    partitions: usize,
+    maps: &mut [GroupKeyMap],
+    range: &mut IntRange,
+    memory: &MemoryTracker,
+    group_reserved: &mut usize,
+) -> Result<bool, ExecError> {
+    let give_up = |range: &mut IntRange,
+                   maps: &mut [GroupKeyMap],
+                   group_reserved: &mut usize|
+     -> Result<bool, ExecError> {
+        if let IntRange::Active(active) = std::mem::replace(range, IntRange::Off) {
+            fold_int_range_into_maps(
+                &active,
+                aggregates,
+                partitions,
+                maps,
+                memory,
+                group_reserved,
+            )?;
+        }
+        Ok(false)
+    };
+    if matches!(range, IntRange::Off) {
+        return Ok(false);
+    }
+    let packed = lanes
+        .iter()
+        .zip(aggregates)
+        .map(|(lane, aggregate)| packed_lane(lane, aggregate))
+        .collect::<Vec<_>>();
+    if packed.iter().any(Option::is_none) {
+        return give_up(range, maps, group_reserved);
+    }
+    let morsels: Vec<Morsel<'_>> = morsel_plan(
+        window.iter().map(|(batch, _)| batch.row_count()),
+        default_morsel_limit(),
+    )
+    .into_iter()
+    .map(|(index, rows)| Morsel {
+        batch: &window[index].0,
+        rows,
+    })
+    .collect();
+    // The window's key bounds and signedness, read in parallel.
+    let bounds = morsels
+        .par_iter()
+        .map(|morsel| {
+            let (keys, validity) = int_key_column(morsel.batch, column)?;
+            let mut selected = Vec::new();
+            let rows = fold_rows(morsel.batch, morsel.rows.clone(), &mut selected);
+            let signed = matches!(keys, PackedInts::Signed(_));
+            Some((signed, key_bounds(keys, validity, &rows)))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(bounds) = bounds else {
+        return give_up(range, maps, group_reserved);
+    };
+    let signed = match range {
+        IntRange::Active(active) => active.signed,
+        _ => bounds.first().is_none_or(|(signed, _)| *signed),
+    };
+    if bounds.iter().any(|(each, _)| *each != signed) {
+        return give_up(range, maps, group_reserved);
+    }
+    let mut low_high = bounds
+        .iter()
+        .filter_map(|(_, bounds)| *bounds)
+        .reduce(|(low, high), (other_low, other_high)| (low.min(other_low), high.max(other_high)));
+    if let IntRange::Active(active) = range
+        && active.span > 0
+    {
+        let (low, high) = (
+            active.base,
+            active.base + i128::try_from(active.span - 1).expect("span fits i128"),
+        );
+        low_high = Some(low_high.map_or((low, high), |(other_low, other_high)| {
+            (low.min(other_low), high.max(other_high))
+        }));
+    }
+    let window_rows: usize = window
+        .iter()
+        .map(|(batch, _)| batch.visible_row_count())
+        .sum();
+    let rows_seen = match range {
+        IntRange::Active(active) => active.rows,
+        _ => 0,
+    }
+    .saturating_add(window_rows);
+    let (base, span) = match low_high {
+        Some((low, high)) => match usize::try_from(high - low + 1) {
+            Ok(span) => (low, span),
+            Err(_) => return give_up(range, maps, group_reserved),
+        },
+        None => (0, 0),
+    };
+    // Dense enough to beat a hash table: no wider than the rows that fill
+    // it (a small floor lets a short input in), and within the cache bound.
+    if span > RANGE_SLOT_CAP || span > rows_seen.max(4_096) {
+        return give_up(range, maps, group_reserved);
+    }
+    let slot_count = span + 1;
+    let workers = rayon::current_num_threads().max(1);
+    let fold_bytes = PackedFold::bytes(slot_count, &packed);
+    let needed = fold_bytes.saturating_mul(workers + 1);
+    let current = match range {
+        IntRange::Active(active) => active.reserved,
+        _ => 0,
+    };
+    let rebase = match range {
+        IntRange::Active(active) => active.base != base || active.span != span,
+        _ => true,
+    };
+    if rebase {
+        if memory.reserve(needed).is_err() {
+            return give_up(range, maps, group_reserved);
+        }
+        let mut folds = Vec::new();
+        let mut rows = 0;
+        if let IntRange::Active(old) = std::mem::replace(range, IntRange::Off) {
+            // An old range of no keys holds only the NULL slot.
+            let shift = if old.span == 0 {
+                0
+            } else {
+                usize::try_from(old.base - base).expect("old range inside the new one")
+            };
+            let mut fold = PackedFold::new(slot_count, &packed);
+            for partial in &old.folds {
+                fold.merge_from(partial, |slot| if slot == 0 { 0 } else { slot + shift });
+            }
+            folds.push(fold);
+            rows = old.rows;
+            memory.release(old.reserved);
+        }
+        *range = IntRange::Active(Box::new(IntRangeFold {
+            base,
+            span,
+            signed,
+            slot_count,
+            folds,
+            rows,
+            reserved: needed,
+        }));
+    } else {
+        debug_assert_eq!(current, needed);
+    }
+    let IntRange::Active(active) = range else {
+        unreachable!("the range was just made active");
+    };
+    let pool = std::sync::Mutex::new(std::mem::take(&mut active.folds));
+    let fresh = || PackedFold::new(slot_count, &packed);
+    morsels.par_iter().try_for_each(|morsel| {
+        let taken = pool
+            .lock()
+            .map_err(|_| ExecError::InvalidBatch("range fold pool poisoned"))?
+            .pop();
+        let mut fold = taken.unwrap_or_else(fresh);
+        let outcome = fold_range_morsel(morsel, column, lanes, base, &mut fold);
+        pool.lock()
+            .map_err(|_| ExecError::InvalidBatch("range fold pool poisoned"))?
+            .push(fold);
+        outcome
+    })?;
+    active.folds = pool
+        .into_inner()
+        .map_err(|_| ExecError::InvalidBatch("range fold pool poisoned"))?;
+    active.rows = rows_seen;
+    Ok(true)
+}
+
 /// A lane whose rows reduce to one integer total and a row count, so a
 /// group's rows can be summed in a plain cell and applied to its
 /// [`AggregateState`] once. Applying every row to the state costs a call,
 /// an enum match and a carrier rebuild per row, on state that is often
 /// out of cache: that was most of a high-cardinality grouped SUM's time.
 #[derive(Clone, Copy)]
-enum PackedLane {
+pub(super) enum PackedLane {
     Count,
     Sum {
         scale: u8,
@@ -1846,9 +2404,9 @@ fn packed_lane(lane: &TwoPassLane, aggregate: &CompiledAggregate) -> Option<Pack
 
 /// One group's running total for one packed lane.
 #[derive(Clone, Copy, Default)]
-struct PackedCell {
-    total: i128,
-    rows: u64,
+pub(super) struct PackedCell {
+    pub(super) total: i128,
+    pub(super) rows: u64,
 }
 
 impl PackedCell {
@@ -1882,7 +2440,7 @@ impl PackedCell {
 
     /// Applies the cell to the group's state: the same state the per-row
     /// path leaves, since every packed lane is an exact, order-free fold.
-    fn commit(
+    pub(super) fn commit(
         &self,
         lane: PackedLane,
         state: &mut AggregateState,
@@ -2384,11 +2942,9 @@ fn dense_packed_chunk(
     acc: &mut DenseGroupSlots,
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
-    let lane_count = lanes.len();
     let unpacked = packed.iter().any(Option::is_none);
-    let slot_count = acc.len();
-    let mut cells = vec![PackedCell::default(); slot_count * lane_count];
-    let mut present = vec![false; slot_count];
+    let mut fold = PackedFold::new(acc.len(), packed);
+    let mut selected = Vec::new();
     for (batch, translations) in chunk {
         let Some(slots) = dense_row_slots(batch, keys, columns, translations)? else {
             two_pass_dense_batch(
@@ -2403,20 +2959,21 @@ fn dense_packed_chunk(
             )?;
             continue;
         };
-        let readers = lane_readers(batch, lanes);
-        for (row, slot) in batch.selection().selected_rows().zip(&slots) {
-            let slot = *slot as usize;
-            present[slot] = true;
-            let group_cells = &mut cells[slot * lane_count..(slot + 1) * lane_count];
-            for ((cell, reader), lane) in group_cells.iter_mut().zip(&readers).zip(packed) {
-                if let Some(lane) = lane
-                    && let Some(bits) = reader.bits(row)
-                {
-                    cell.add(*lane, bits)?;
-                }
+        // Packed lanes fold a column at a time; a batch whose decimal
+        // column carries no 64-bit units folds the same totals row by row.
+        let rows = fold_rows(batch, 0..batch.row_count(), &mut selected);
+        if let Some(inputs) = fold.resolve(batch, lanes) {
+            fold.fold(&inputs, &slots, &rows);
+        } else {
+            let readers = lane_readers(batch, lanes);
+            for (row, slot) in batch.selection().selected_rows().zip(&slots) {
+                fold.add_row(*slot as usize, &readers, row);
             }
-            if unpacked {
-                let states = acc[slot]
+        }
+        if unpacked {
+            let readers = lane_readers(batch, lanes);
+            for (row, slot) in batch.selection().selected_rows().zip(&slots) {
+                let states = acc[*slot as usize]
                     .get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
                 for (index, (((state, reader), lane), aggregate)) in states
                     .iter_mut()
@@ -2434,22 +2991,13 @@ fn dense_packed_chunk(
             }
         }
     }
-    for (slot, seen) in present.iter().enumerate() {
-        if !seen {
+    for (slot, entry) in acc.iter_mut().enumerate() {
+        if !fold.occupied(slot) {
             continue;
         }
         let states =
-            acc[slot].get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
-        for (lane_index, (lane, aggregate)) in packed.iter().zip(aggregates).enumerate() {
-            if let Some(lane) = lane {
-                cells[slot * lane_count + lane_index].commit(
-                    *lane,
-                    &mut states[lane_index],
-                    aggregate,
-                    memory,
-                )?;
-            }
-        }
+            entry.get_or_insert_with(|| aggregates.iter().map(AggregateState::new).collect());
+        fold.commit_slot(slot, states, aggregates, memory)?;
     }
     Ok(())
 }
@@ -2498,27 +3046,68 @@ fn dense_row_slots(
         };
         readers.push((codes, validity, translation));
     }
-    let pair = readers.len() == 2;
-    for row in batch.selection().selected_rows() {
-        let mut key_bits = 0_u64;
-        let mut key_null = false;
-        for (codes, validity, translation) in &readers {
-            let id = if validity.is_valid(row) {
-                let code = usize::try_from(codes[row]).expect("dict code fits usize");
-                let interned = *translation
-                    .get(code)
-                    .ok_or(ExecError::InvalidBatch("dictionary code is out of bounds"))?;
-                if pair { interned + 1 } else { interned }
-            } else {
-                if !pair {
-                    key_null = true;
-                }
-                0
-            };
-            key_bits = if pair { (key_bits << 32) | id } else { id };
+    // A row's slot is the sum of its columns' shares: (intern id + 1) times
+    // the column's weight, and 0 for NULL - `dense_slot_index` spelled as
+    // one lookup per column. The shares are tabled per dictionary code once
+    // per batch, so the row loop is a lookup and an add; a code with no
+    // translation saturates to a slot past the table and fails below.
+    let pair_weights = [
+        u32::try_from(DENSE_PAIR_SIDE).expect("pair side fits u32"),
+        1,
+    ];
+    let weights: &[u32] = if readers.len() == 2 {
+        &pair_weights
+    } else {
+        &[1]
+    };
+    let tables = readers
+        .iter()
+        .zip(weights)
+        .map(|((_, _, translation), weight)| {
+            translation
+                .iter()
+                .map(|id| {
+                    u32::try_from(id + 1)
+                        .ok()
+                        .and_then(|share| share.checked_mul(*weight))
+                        .unwrap_or(u32::MAX)
+                })
+                .collect::<Vec<u32>>()
+        })
+        .collect::<Vec<_>>();
+    let share = |table: &[u32], code: u32| table.get(code as usize).copied().unwrap_or(u32::MAX);
+    let rows = batch.row_count();
+    let every_row = batch.visible_row_count() == rows;
+    let no_nulls = readers
+        .iter()
+        .all(|(codes, validity, _)| validity.no_nulls() && codes.len() >= rows);
+    match (readers.as_slice(), tables.as_slice()) {
+        ([(codes, ..)], [table]) if every_row && no_nulls => {
+            slots.extend(codes[..rows].iter().map(|code| share(table, *code)));
         }
-        let slot = dense_slot_index(keys, key_bits, key_null);
-        slots.push(u32::try_from(slot).expect("dense slot fits u32"));
+        ([(first, ..), (second, ..)], [first_table, second_table]) if every_row && no_nulls => {
+            slots.extend(
+                first[..rows]
+                    .iter()
+                    .zip(&second[..rows])
+                    .map(|(a, b)| share(first_table, *a).saturating_add(share(second_table, *b))),
+            );
+        }
+        _ => {
+            for row in batch.selection().selected_rows() {
+                let mut slot = 0_u32;
+                for ((codes, validity, _), table) in readers.iter().zip(&tables) {
+                    if validity.is_valid(row) {
+                        slot = slot.saturating_add(share(table, codes[row]));
+                    }
+                }
+                slots.push(slot);
+            }
+        }
+    }
+    let slot_count = dense_slot_count(keys).expect("text keys have dense slots");
+    if slots.iter().any(|slot| *slot as usize >= slot_count) {
+        return Err(ExecError::InvalidBatch("dictionary code is out of bounds"));
     }
     Ok(Some(slots))
 }

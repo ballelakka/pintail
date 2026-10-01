@@ -65,6 +65,7 @@ mod null_rejected_outer_join;
 mod null_safe_join;
 mod ordered_group_limit;
 mod out_of_range_diagnostics;
+mod packed_lane_folds;
 mod packed_predicate_kernels;
 mod pairs_fixture;
 mod partition_rewrites;

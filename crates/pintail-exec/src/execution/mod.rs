@@ -12,6 +12,7 @@ pub(crate) mod membership;
 mod memo;
 mod morsel;
 mod order;
+mod packed_fold;
 mod points;
 mod sort;
 mod two_pass;
