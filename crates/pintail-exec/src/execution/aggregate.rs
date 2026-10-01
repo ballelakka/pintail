@@ -4878,17 +4878,11 @@ fn build_fused_inner_join_aggregate(
     // exception. What is fused-aggregate-specific is resolved here, once
     // per distinct key: which group each bucket's rows fold into, so a
     // probe row that hit the dense table needs no further lookup (the
-    // `plan.buckets` address map below stays for the non-dense fallback,
+    // plan's bucket address map below stays for the non-dense fallback,
     // and for grace-spilled builds, where nothing is finalized to dense).
     let dense_group_indexes: Vec<Option<&[usize]>> = if join.build.is_dense() {
-        join.build
-            .dense_buckets()
-            .iter()
-            .map(|bucket| {
-                plan.buckets
-                    .get(&(std::ptr::from_ref(bucket) as usize))
-                    .map(Vec::as_slice)
-            })
+        (0..plan.bucket_count())
+            .map(|position| Some(plan.ordered(position)))
             .collect()
     } else {
         Vec::new()
@@ -5197,13 +5191,10 @@ fn build_local_fused_join_groups(
                 .and_then(|key| build.get(&key))
             {
                 Some(matches) => {
-                    let indexes = plan
-                        .buckets
-                        .get(&(std::ptr::from_ref(matches) as usize))
-                        .ok_or(ExecError::InvalidPhysicalPlan(
-                            "probe matched a bucket outside the resolved group plan",
-                        ))?;
-                    Some((matches, indexes.as_slice()))
+                    let indexes = plan.bucket(matches).ok_or(ExecError::InvalidPhysicalPlan(
+                        "probe matched a bucket outside the resolved group plan",
+                    ))?;
+                    Some((matches, indexes))
                 }
                 None => None,
             }

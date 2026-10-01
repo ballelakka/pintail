@@ -175,7 +175,7 @@ impl<R> PartitionedBuild<R> {
     }
 
     /// Like [`Self::get`], but also returns the flat index into
-    /// [`Self::dense_buckets`] a caller can use to keep its own array (one
+    /// the dense buckets a caller can use to keep its own array (one
     /// entry per distinct key, built once) aligned to this bucket - the
     /// fused join-aggregate's precomputed group indexes, in particular.
     /// `None` whenever `get` would return through the hashed path instead.
@@ -185,7 +185,7 @@ impl<R> PartitionedBuild<R> {
     }
 
     /// The dense table's smallest key and its per-offset index into
-    /// [`Self::dense_buckets`], once [`Self::is_dense`].
+    /// the dense buckets, once [`Self::is_dense`].
     pub(super) fn dense_layout(&self) -> Option<(i128, &[Option<usize>])> {
         self.dense_index
             .as_ref()
@@ -194,12 +194,6 @@ impl<R> PartitionedBuild<R> {
 
     pub(super) const fn is_dense(&self) -> bool {
         self.dense_index.is_some()
-    }
-
-    /// Every distinct bucket, in the order [`Self::dense_get`]'s flat index
-    /// addresses - only meaningful once [`Self::is_dense`].
-    pub(super) fn dense_buckets(&self) -> &[Vec<R>] {
-        &self.dense_buckets
     }
 
     /// Moves every bucket into a flat, densely-addressable array when the
@@ -250,10 +244,6 @@ impl<R> PartitionedBuild<R> {
 
     pub(super) fn partitions(&self) -> usize {
         self.partitions.len()
-    }
-
-    fn contains_key(&self, key: &JoinHashKey) -> bool {
-        self.partitions[self.slot(key)].contains_key(key)
     }
 
     fn entry_or_default(&mut self, key: JoinHashKey) -> &mut Vec<R> {
@@ -474,8 +464,61 @@ pub(super) type AddressMap<V> = HashMap<usize, V, std::hash::BuildHasherDefault<
 pub(super) struct JoinGroupPlan {
     /// Group key values in index order.
     pub(super) values: Vec<Vec<Value>>,
-    /// Per build bucket (keyed by its address), the group index of each row.
-    pub(super) buckets: AddressMap<Vec<usize>>,
+    /// Every build row's group index, bucket after bucket in the order
+    /// [`PartitionedBuild::values`] yields them.
+    groups: Vec<usize>,
+    /// Where each bucket's run starts in `groups`, in the same order, with
+    /// the end as a last entry.
+    starts: Vec<usize>,
+    /// Per build bucket (keyed by its address), its position in that order.
+    /// Only a build that did not finalize to a dense table needs it: a dense
+    /// table's flat bucket index already is that position.
+    positions: AddressMap<usize>,
+}
+
+impl JoinGroupPlan {
+    /// The group index of each row of the `position`-th bucket.
+    pub(super) fn ordered(&self, position: usize) -> &[usize] {
+        &self.groups[self.starts[position]..self.starts[position + 1]]
+    }
+
+    /// The group index of each row of `bucket`, a bucket of the build this
+    /// plan was resolved from.
+    pub(super) fn bucket<R>(&self, bucket: &Vec<R>) -> Option<&[usize]> {
+        self.positions
+            .get(&(std::ptr::from_ref(bucket) as usize))
+            .map(|position| self.ordered(*position))
+    }
+
+    /// How many buckets the plan resolved.
+    pub(super) fn bucket_count(&self) -> usize {
+        self.starts.len().saturating_sub(1)
+    }
+}
+
+/// Group positions already resolved, by the raw text of a single text group
+/// column.
+///
+/// The build side repeats a handful of group values across every row - eight
+/// regions over a hundred thousand customers - and resolving each row through
+/// its collation key hashed the text, looked its weights up, then hashed the
+/// weights, all to find a group already found. Equal raw text is equal text,
+/// so it is the same group under any collation: a row whose bytes were seen
+/// reuses that answer, and only a new spelling takes the full path. A coded
+/// column answers by its dictionary code, without touching the text at all.
+#[derive(Default)]
+struct RawGroupCache {
+    text: ByteKeyMap<Vec<u8>, usize>,
+    /// Per kept batch, the position of each dictionary code once resolved.
+    codes: HashMap<u32, Vec<Option<usize>>>,
+    null: Option<usize>,
+}
+
+/// What a build row's single text group cell is, without materializing it.
+enum RawCell<'a> {
+    Null,
+    Code(u32, &'a [u8]),
+    Text,
 }
 
 /// Appends a value's collation sort key, without the hex detour.
@@ -654,6 +697,7 @@ fn encode_group_value(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn resolve_join_group_plan(
     build: &PartitionedBuild,
     right_group_columns: &[usize],
@@ -661,8 +705,14 @@ pub(super) fn resolve_join_group_plan(
 ) -> Result<JoinGroupPlan, ExecError> {
     let mut values = Vec::new();
     let mut index = ByteKeyMap::<Vec<u8>, usize>::default();
-    let mut buckets =
-        AddressMap::with_capacity_and_hasher(build.len(), std::hash::BuildHasherDefault::default());
+    let dense = build.is_dense();
+    let mut positions = if dense {
+        AddressMap::default()
+    } else {
+        AddressMap::with_capacity_and_hasher(build.len(), std::hash::BuildHasherDefault::default())
+    };
+    let mut groups = Vec::with_capacity(build.len());
+    let mut starts = Vec::with_capacity(build.len().saturating_add(1));
     // One scratch buffer for the whole plan. The key used to be a
     // `Vec<Value>`: a heap vector per row, each cell a 32-byte tagged enum,
     // and every text cell an owned hexadecimal `String`. For a build side of
@@ -672,38 +722,124 @@ pub(super) fn resolve_join_group_plan(
     // group is genuinely new.
     let mut key = Vec::<u8>::with_capacity(64);
     let mut keys = CollationKeyCache::default();
-    for bucket in build.values() {
-        let mut indexes = Vec::with_capacity(bucket.len());
-        for row in bucket {
-            key.clear();
-            let group_value = |column: usize| {
-                build
-                    .value(*row, column)
-                    .ok_or(ExecError::InvalidPhysicalPlan(
-                        "join aggregate group is outside the build-side layout",
-                    ))
-            };
-            for column in right_group_columns {
-                encode_group_value(group_value(*column)?, collation, &mut keys, &mut key);
-            }
-            // Borrowed lookup: `Vec<u8>` keys probe by slice, so the hit path
-            // - the common one - neither allocates nor copies.
-            let position = if let Some(position) = index.get(key.as_slice()) {
-                *position
-            } else {
-                let group_values = right_group_columns
-                    .iter()
-                    .map(|column| group_value(*column).cloned())
-                    .collect::<Result<Vec<_>, _>>()?;
-                values.push(group_values);
-                index.insert(key.clone(), values.len() - 1);
-                values.len() - 1
-            };
-            indexes.push(position);
+    let mut raw = RawGroupCache::default();
+    let single_text = match right_group_columns {
+        [column] => Some(*column),
+        _ => None,
+    };
+    // The full path: the group's encoded key, found or added.
+    let mut resolve = |row: BuildRow,
+                       values: &mut Vec<Vec<Value>>,
+                       key: &mut Vec<u8>|
+     -> Result<usize, ExecError> {
+        key.clear();
+        let group_value = |column: usize| {
+            build
+                .value(row, column)
+                .ok_or(ExecError::InvalidPhysicalPlan(
+                    "join aggregate group is outside the build-side layout",
+                ))
+        };
+        for column in right_group_columns {
+            encode_group_value(group_value(*column)?, collation, &mut keys, key);
         }
-        buckets.insert(std::ptr::from_ref(bucket) as usize, indexes);
+        // Borrowed lookup: `Vec<u8>` keys probe by slice, so the hit path
+        // - the common one - neither allocates nor copies.
+        Ok(if let Some(position) = index.get(key.as_slice()) {
+            *position
+        } else {
+            let group_values = right_group_columns
+                .iter()
+                .map(|column| group_value(*column).cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            values.push(group_values);
+            index.insert(key.clone(), values.len() - 1);
+            values.len() - 1
+        })
+    };
+    for (position, bucket) in build.values().enumerate() {
+        starts.push(groups.len());
+        if !dense {
+            positions.insert(std::ptr::from_ref(bucket) as usize, position);
+        }
+        for row in bucket {
+            let text = single_text.and_then(|column| {
+                let vector = build.batches.get(row.batch as usize)?.column(column)?;
+                if vector.data_type() != DataType::Utf8 {
+                    return None;
+                }
+                match vector.typed()? {
+                    (crate::batch::TypedValues::Utf8(text), validity) => Some((text, validity)),
+                    _ => None,
+                }
+            });
+            let Some((text, validity)) = text else {
+                groups.push(resolve(*row, &mut values, &mut key)?);
+                continue;
+            };
+            let cell = row.row as usize;
+            let raw_cell = if !validity.is_valid(cell) {
+                RawCell::Null
+            } else if let Some((codes, dictionary)) = text.dictionary() {
+                let code = codes[cell];
+                RawCell::Code(code, dictionary[code as usize].as_bytes())
+            } else {
+                RawCell::Text
+            };
+            let known = match &raw_cell {
+                RawCell::Null => raw.null,
+                RawCell::Code(code, _) => raw
+                    .codes
+                    .get(&row.batch)
+                    .and_then(|codes| codes.get(*code as usize).copied().flatten()),
+                RawCell::Text => {
+                    text.views()[cell].with_bytes(text.heap(), |bytes| raw.text.get(bytes).copied())
+                }
+            };
+            if let Some(position) = known {
+                groups.push(position);
+                continue;
+            }
+            // A code new to this batch may still be text an earlier batch
+            // resolved.
+            let seen = match &raw_cell {
+                RawCell::Code(_, bytes) => raw.text.get(*bytes).copied(),
+                RawCell::Null | RawCell::Text => None,
+            };
+            let position = match seen {
+                Some(position) => position,
+                None => resolve(*row, &mut values, &mut key)?,
+            };
+            match raw_cell {
+                RawCell::Null => raw.null = Some(position),
+                RawCell::Code(code, bytes) => {
+                    let codes = raw.codes.entry(row.batch).or_default();
+                    if codes.len() <= code as usize {
+                        codes.resize(code as usize + 1, None);
+                    }
+                    codes[code as usize] = Some(position);
+                    if seen.is_none() && raw.text.len() < COLLATION_KEY_CACHE_LIMIT {
+                        raw.text.insert(bytes.to_vec(), position);
+                    }
+                }
+                RawCell::Text => {
+                    if raw.text.len() < COLLATION_KEY_CACHE_LIMIT {
+                        text.views()[cell].with_bytes(text.heap(), |bytes| {
+                            raw.text.entry(bytes.to_vec()).or_insert(position);
+                        });
+                    }
+                }
+            }
+            groups.push(position);
+        }
     }
-    Ok(JoinGroupPlan { values, buckets })
+    starts.push(groups.len());
+    Ok(JoinGroupPlan {
+        values,
+        groups,
+        starts,
+        positions,
+    })
 }
 
 /// Bytes of fixed-size binned keys a build charges at once.
@@ -879,25 +1015,33 @@ fn insert_resident_row(
     batch_bytes: usize,
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
-    let key_bytes = if build.contains_key(&key) {
-        0
-    } else {
-        key.heap_bytes()
-    };
-    build.reserve_for_key(
-        &key,
-        size_of::<JoinHashKey>()
-            .saturating_add(size_of::<Vec<BuildRow>>())
-            .saturating_add(HASH_ENTRY_OVERHEAD),
-        batch_bytes,
-        memory,
-    )?;
-    if key_bytes > 0 {
-        memory.reserve(key_bytes)?;
+    // One hash for the partition and one for the entry: the existence check,
+    // the reservation and the insert each hashed the key again.
+    let slot = build.slot(&key);
+    let partition = &mut build.partitions[slot];
+    if partition.len() >= partition.capacity() {
+        reserve_hash_map_entries(
+            partition,
+            partition.capacity().max(64),
+            size_of::<JoinHashKey>()
+                .saturating_add(size_of::<Vec<BuildRow>>())
+                .saturating_add(HASH_ENTRY_OVERHEAD),
+            batch_bytes,
+            memory,
+        )?;
     }
+    let bucket = match partition.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let key_bytes = entry.key().heap_bytes();
+            if key_bytes > 0 {
+                memory.reserve(key_bytes)?;
+            }
+            entry.insert(Vec::new())
+        }
+    };
     // A reference is small and most keys name one row, so a bucket grows
     // from a few slots rather than from a batch's worth.
-    let bucket = build.entry_or_default(key);
     reserve_vec_elements(bucket, 1, 0, memory)?;
     bucket.push(row);
     Ok(())
@@ -4884,7 +5028,7 @@ mod dense_join_table_tests {
                 .dense_get(key)
                 .expect("dense_get mirrors get once dense");
             assert_eq!(&payloads(via_dense_get), expected);
-            assert!(flat_index < hashed.dense_buckets().len());
+            assert!(flat_index < hashed.len());
         }
         assert!(
             hashed.get(&JoinHashKey::NonNegativeInteger(999)).is_none(),
