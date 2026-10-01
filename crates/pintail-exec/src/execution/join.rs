@@ -1010,14 +1010,15 @@ impl HashJoinState {
 /// caller, which decides whether the map has anything to spill.
 fn insert_resident_row(
     build: &mut PartitionedBuild,
+    slot: usize,
     key: JoinHashKey,
     row: BuildRow,
     batch_bytes: usize,
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
-    // One hash for the partition and one for the entry: the existence check,
-    // the reservation and the insert each hashed the key again.
-    let slot = build.slot(&key);
+    // One hash, for the entry: the partition came with the key from its bin,
+    // where the existence check, the reservation and the insert each hashed
+    // the key again.
     let partition = &mut build.partitions[slot];
     if partition.len() >= partition.capacity() {
         reserve_hash_map_entries(
@@ -1025,6 +1026,7 @@ fn insert_resident_row(
             partition.capacity().max(64),
             size_of::<JoinHashKey>()
                 .saturating_add(size_of::<Vec<BuildRow>>())
+                .saturating_add(INITIAL_BUCKET_BYTES)
                 .saturating_add(HASH_ENTRY_OVERHEAD),
             batch_bytes,
             memory,
@@ -1037,15 +1039,23 @@ fn insert_resident_row(
             if key_bytes > 0 {
                 memory.reserve(key_bytes)?;
             }
-            entry.insert(Vec::new())
+            // Charged with the entry above: most keys name one row, and a
+            // charge per new key was the build's largest cost after hashing.
+            entry.insert(Vec::with_capacity(INITIAL_BUCKET_ROWS))
         }
     };
-    // A reference is small and most keys name one row, so a bucket grows
-    // from a few slots rather than from a batch's worth.
+    // A bucket that outgrows its first slots grows from a few rather than
+    // from a batch's worth.
     reserve_vec_elements(bucket, 1, 0, memory)?;
     bucket.push(row);
     Ok(())
 }
+
+/// Rows a new build bucket has room for before it first grows.
+const INITIAL_BUCKET_ROWS: usize = 4;
+
+/// What a new bucket's first slots hold, charged with its map entry.
+const INITIAL_BUCKET_BYTES: usize = INITIAL_BUCKET_ROWS * size_of::<BuildRow>();
 
 /// `batch` as a batch of only its selected rows, when its selection leaves
 /// most of its rows out. A build keeps the batches its rows are in, so a
@@ -1232,7 +1242,11 @@ pub(super) fn build_hash_join_state(
                 binned[build.slot(&key)].push((key, row));
             }
             settle(&mut pending, &mut binned_bytes)?;
-            for (key, row) in binned.into_iter().flatten() {
+            let binned = binned
+                .into_iter()
+                .enumerate()
+                .flat_map(|(slot, keys)| keys.into_iter().map(move |(key, row)| (slot, key, row)));
+            for (slot, key, row) in binned {
                 if let Some(grace) = grace.as_mut() {
                     let values = batch_row(&batch, row)?;
                     grace.build_files[grace_partition(&key, 0)].append(&key, &values, memory)?;
@@ -1253,6 +1267,7 @@ pub(super) fn build_hash_join_state(
                     })?;
                     insert_resident_row(
                         &mut build,
+                        slot,
                         key,
                         BuildRow { batch: index, row },
                         batch_bytes,
