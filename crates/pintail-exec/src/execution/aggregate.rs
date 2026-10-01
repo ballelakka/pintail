@@ -693,9 +693,15 @@ pub(super) struct AggregateState {
     /// values transfers to the exact ordering (rounding is monotone), so only
     /// f64 ties pay the full text/value comparison. Invalidated on merge.
     extreme_number: Option<f64>,
-    /// Scaled integer units of the current extreme when every update so far
-    /// arrived through `update_extreme_units` (same column, same scale, so
-    /// unit ordering IS the value ordering). Invalidated on merge.
+    /// Scaled integer units of the current extreme when it arrived through
+    /// `update_extreme_units` (same column, same scale, so unit ordering IS
+    /// the value ordering). Each cache describes the value only while the
+    /// path that set it is the last to have replaced it: a per-row update or
+    /// a merge drops these units, and a unit update drops the f64 guide.
+    /// A batch that is not packed - a memtable row, a row under an older
+    /// schema - takes the per-row update between packed batches, and units
+    /// left from before it made a later batch compare against a value the
+    /// state no longer held.
     extreme_units: Option<i128>,
 }
 
@@ -1176,6 +1182,7 @@ impl AggregateState {
                 if replace {
                     replace_retained_value(minimum, value.clone(), memory)?;
                     self.extreme_number = number;
+                    self.extreme_units = None;
                 }
             }
             AggregateValue::Maximum(maximum) => {
@@ -1197,6 +1204,7 @@ impl AggregateState {
                 if replace {
                     replace_retained_value(maximum, value.clone(), memory)?;
                     self.extreme_number = number;
+                    self.extreme_units = None;
                 }
             }
             AggregateValue::GroupConcat { items, .. } => {
@@ -1225,6 +1233,7 @@ impl AggregateState {
         // Merging may replace the extreme through the Value path; the cached
         // f64 guide is conservative-invalidated rather than tracked.
         self.extreme_number = None;
+        self.extreme_units = None;
         if let AggregateValue::GroupConcat { items, .. } = other.value {
             for (keys, _, value) in items {
                 self.update_group_concat(&value, keys, memory)?;
@@ -1771,6 +1780,7 @@ impl AggregateState {
             };
             replace_retained_value(slot, value, memory)?;
             self.extreme_units = Some(units);
+            self.extreme_number = None;
         }
         Ok(())
     }
@@ -7066,6 +7076,97 @@ mod binary_fold_tests {
                     };
                     6
                 ])
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod extreme_cache_tests {
+    use super::*;
+
+    fn aggregate(function: AggregateFunction) -> CompiledAggregate {
+        CompiledAggregate {
+            function,
+            expr: None,
+            input_type: Some(DataType::DateTime64 { fsp: 0 }),
+            binary_width: None,
+            distinct: false,
+            data_type: Some(DataType::DateTime64 { fsp: 0 }),
+            separator: ",".to_owned(),
+            order_within: Vec::new(),
+            collation: Collation::default(),
+        }
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Utf8(value.to_owned())
+    }
+
+    /// A packed batch, then a batch of text rows (a memtable row, a row
+    /// under an older schema), then a packed batch again: the extreme the
+    /// text row set must be what the last batch compares against, not the
+    /// units the first batch left behind.
+    #[test]
+    fn a_text_row_between_packed_batches_keeps_its_extreme() {
+        let memory = MemoryTracker::new(1024 * 1024);
+        for (function, first, text_row, last, expected) in [
+            (
+                AggregateFunction::Minimum,
+                300,
+                "2024-01-01 00:01:40",
+                200,
+                "2024-01-01 00:01:40",
+            ),
+            (
+                AggregateFunction::Maximum,
+                100,
+                "2024-01-01 00:05:00",
+                200,
+                "2024-01-01 00:05:00",
+            ),
+        ] {
+            let aggregate = aggregate(function);
+            let at = |seconds: i128| {
+                let base = 1_704_067_200_i128;
+                let micros = (base + seconds) * 1_000_000;
+                move || {
+                    chrono::DateTime::from_timestamp_micros(i64::try_from(micros).ok()?)
+                        .map(|moment| moment.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string())
+                }
+            };
+            let units = |seconds: i128| (1_704_067_200_i128 + seconds) * 1_000_000;
+            let mut state = AggregateState::new(&aggregate);
+            state
+                .update_extreme_units(&aggregate, units(first), at(first), &memory)
+                .unwrap();
+            state.update(&aggregate, &text(text_row), &memory).unwrap();
+            state
+                .update_extreme_units(&aggregate, units(last), at(last), &memory)
+                .unwrap();
+            assert_eq!(
+                state.finish(&memory).unwrap(),
+                text(expected),
+                "{function:?}"
+            );
+
+            // The same through a merge of a partial that held the text row.
+            let mut merged = AggregateState::new(&aggregate);
+            merged
+                .update_extreme_units(&aggregate, units(first), at(first), &memory)
+                .unwrap();
+            let mut partial = AggregateState::new(&aggregate);
+            partial
+                .update(&aggregate, &text(text_row), &memory)
+                .unwrap();
+            merged.merge(&aggregate, partial, &memory).unwrap();
+            merged
+                .update_extreme_units(&aggregate, units(last), at(last), &memory)
+                .unwrap();
+            assert_eq!(
+                merged.finish(&memory).unwrap(),
+                text(expected),
+                "{function:?} merged"
             );
         }
     }
