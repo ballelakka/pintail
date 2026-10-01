@@ -6,8 +6,8 @@ use encoding::{
     FRAME_ENTRY_BYTES, FRAMED_MINIMUM_BYTES, compare_cells, compress_block_for_storage,
     compress_framed_for_storage, decode_integer_base, decode_payload, decoded_heap_upper_bound,
     decompress_block_into, decompress_frame, encode_payload, framed_head_digest, hll_registers,
-    parse_frame_directory, select_encoding, unpack_delta_each, unpack_into, unpack_signed_into,
-    unpack_unsigned_into,
+    parse_frame_directory, select_encoding, unpack_delta_each, unpack_delta_into, unpack_into,
+    unpack_signed_into, unpack_unsigned_into,
 };
 
 use std::{
@@ -4051,20 +4051,34 @@ fn decode_delta_payload_into(
     {
         match destination {
             IntBulkDestination::Signed { values, validity } => {
-                values.reserve(non_null_count);
-                unpack_delta_each(&mut decoder, non_null_count, first, logical_type, |value| {
-                    values.push(i64::try_from(value).map_err(|_| "delta signed integer overflow")?);
-                    Ok(())
-                })?;
+                #[allow(clippy::cast_possible_wrap)]
+                let step_signed = |current: i64, delta: u64| current.wrapping_add(delta as i64);
+                unpack_delta_into(
+                    &mut decoder,
+                    non_null_count,
+                    first,
+                    logical_type,
+                    values,
+                    |value| {
+                        i64::try_from(value).map_err(|_| "delta signed integer overflow".to_owned())
+                    },
+                    step_signed,
+                )?;
                 validity.extend_valid(non_null_count);
             }
             IntBulkDestination::Unsigned { values, validity } => {
-                values.reserve(non_null_count);
-                unpack_delta_each(&mut decoder, non_null_count, first, logical_type, |value| {
-                    values
-                        .push(u64::try_from(value).map_err(|_| "delta unsigned integer overflow")?);
-                    Ok(())
-                })?;
+                unpack_delta_into(
+                    &mut decoder,
+                    non_null_count,
+                    first,
+                    logical_type,
+                    values,
+                    |value| {
+                        u64::try_from(value)
+                            .map_err(|_| "delta unsigned integer overflow".to_owned())
+                    },
+                    u64::wrapping_add,
+                )?;
                 validity.extend_valid(non_null_count);
             }
         }
@@ -6198,6 +6212,43 @@ mod delta_direct_tests {
             )
             .expect("direct decode")
         );
+        assert_eq!(
+            actual.finish().into_values(),
+            expected.finish().into_values()
+        );
+    }
+
+    #[test]
+    fn a_delta_block_near_the_type_limit_takes_the_checked_path() {
+        // Width one over 4,096 values could climb past i64::MAX from this
+        // start, so the native prefix sum is not provable; the values
+        // themselves stop ten short of the limit and must decode exactly.
+        let count = 4_096_usize;
+        let cells = (0..count)
+            .map(|row| Cell::Int64(i64::MAX - 10 + i64::try_from(row.min(10)).expect("small")))
+            .collect::<Vec<_>>();
+        let payload =
+            encode_payload(LogicalType::Int64, Encoding::DeltaBitPacked, &cells).expect("encode");
+        let mut actual = ColumnBuilder::new_for_column(LogicalType::Int64, None, count);
+        assert!(
+            decode_int_payload_into(
+                &payload,
+                LogicalType::Int64,
+                Encoding::DeltaBitPacked,
+                count,
+                count,
+                &vec![0_u8; count.div_ceil(8)],
+                IntSink {
+                    builder: &mut actual,
+                    ranges: RangeCursor::new(vec![(0, count)]),
+                },
+            )
+            .expect("direct decode")
+        );
+        let mut expected = ColumnBuilder::new_for_column(LogicalType::Int64, None, count);
+        for cell in cells {
+            expected.push(cell).expect("push");
+        }
         assert_eq!(
             actual.finish().into_values(),
             expected.finish().into_values()

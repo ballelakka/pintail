@@ -1122,6 +1122,62 @@ pub(super) fn unpack_delta_each(
     })
 }
 
+/// [`unpack_delta_each`] straight into a typed vector. When the block's
+/// width proves no running value can leave the destination type, the
+/// prefix sum runs in that type, one add a value; the per-value callback,
+/// widened to `i128` and range-checked, cost a key-range filter over a
+/// monotone column about a fifth of its time. Otherwise every value is
+/// checked exactly as the callback path checks it, with the same errors.
+pub(super) fn unpack_delta_into<T: Copy>(
+    decoder: &mut Decoder<'_>,
+    value_count: usize,
+    first: i128,
+    logical_type: LogicalType,
+    out: &mut Vec<T>,
+    lift: impl Fn(i128) -> Result<T, String>,
+    step: impl Fn(T, u64) -> T,
+) -> Result<(), String> {
+    if value_count == 0 {
+        return Err("delta block cannot be empty".to_owned());
+    }
+    let (width, bytes) = unpack_header(decoder, value_count - 1)?;
+    let mask = width_mask(width);
+    let maximum = match logical_type {
+        LogicalType::Int64 => i128::from(i64::MAX),
+        LogicalType::UInt64 => i128::from(u64::MAX),
+        _ => return Err("delta destination must be integer".to_owned()),
+    };
+    out.reserve(value_count);
+    let lifted = lift(first)?;
+    out.push(lifted);
+    let bounded = i128::try_from(value_count - 1)
+        .ok()
+        .and_then(|count| i128::from(mask).checked_mul(count))
+        .and_then(|span| first.checked_add(span))
+        .is_some_and(|last| last <= maximum);
+    if bounded {
+        let mut current = lifted;
+        return for_each_unpacked_group(bytes, width, value_count - 1, |group| {
+            out.extend(group.iter().map(|delta| {
+                current = step(current, *delta);
+                current
+            }));
+            Ok(())
+        });
+    }
+    let mut current = first;
+    for_each_unpacked_group(bytes, width, value_count - 1, |group| {
+        for delta in group {
+            current = current
+                .checked_add(i128::from(*delta))
+                .filter(|value| *value <= maximum)
+                .ok_or_else(|| "integer delta overflow".to_owned())?;
+            out.push(lift(current)?);
+        }
+        Ok(())
+    })
+}
+
 /// The unsigned twin of [`unpack_signed_into`].
 pub(super) fn unpack_unsigned_into(
     decoder: &mut Decoder<'_>,
