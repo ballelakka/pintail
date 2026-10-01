@@ -401,3 +401,174 @@ fn filled(len: usize, value: i128) -> Vec<i128> {
     }
     values
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FoldRows, LaneInput, PackedFold, PackedLane, merged_cell};
+    use crate::array::ValidityMask;
+
+    const LANES: [Option<PackedLane>; 4] = [
+        Some(PackedLane::Count),
+        Some(PackedLane::Sum {
+            scale: 2,
+            float_output: false,
+        }),
+        Some(PackedLane::Minimum { scale: 2 }),
+        Some(PackedLane::Maximum { scale: 2 }),
+    ];
+
+    /// Invented column values: signed units, every seventh row NULL.
+    fn column(rows: usize) -> (Vec<i64>, ValidityMask) {
+        let values = (0..rows)
+            .map(|row| {
+                let row = i64::try_from(row).expect("small");
+                (row * 7_919) % 20_011 - 10_000
+            })
+            .collect::<Vec<_>>();
+        let valid = (0..rows).map(|row| row % 7 != 3).collect::<Vec<_>>();
+        (values, ValidityMask::from_bools(&valid))
+    }
+
+    fn slots_of(rows: impl Iterator<Item = usize>, slot_count: usize) -> Vec<u32> {
+        rows.map(|row| u32::try_from((row * 31) % slot_count).expect("small"))
+            .collect()
+    }
+
+    /// Per slot: rows, then (total, non-NULL rows) for SUM, MIN and MAX.
+    fn reference(
+        rows: &[usize],
+        slots: &[u32],
+        values: &[i64],
+        valid: &ValidityMask,
+        slot_count: usize,
+    ) -> Vec<(u64, [(i128, u64); 3])> {
+        let mut expected = vec![(0, [(0, 0), (i128::MAX, 0), (i128::MIN, 0)]); slot_count];
+        for (&row, &slot) in rows.iter().zip(slots) {
+            let entry = &mut expected[slot as usize];
+            entry.0 += 1;
+            if valid.is_valid(row) {
+                let value = i128::from(values[row]);
+                entry.1[0] = (entry.1[0].0 + value, entry.1[0].1 + 1);
+                entry.1[1] = (entry.1[1].0.min(value), entry.1[1].1 + 1);
+                entry.1[2] = (entry.1[2].0.max(value), entry.1[2].1 + 1);
+            }
+        }
+        expected
+    }
+
+    fn check(folds: &[PackedFold], expected: &[(u64, [(i128, u64); 3])]) {
+        for (slot, (rows, lanes)) in expected.iter().enumerate() {
+            let (_, count) = merged_cell(folds, 0, slot).expect("count lane");
+            assert_eq!(count.rows, *rows, "slot {slot} rows");
+            for (index, (total, non_null)) in lanes.iter().enumerate() {
+                let (_, cell) = merged_cell(folds, index + 1, slot).expect("packed lane");
+                assert_eq!(cell.rows, *non_null, "slot {slot} lane {index} rows");
+                if *non_null > 0 {
+                    assert_eq!(cell.total, *total, "slot {slot} lane {index} total");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spans_picked_rows_and_partials_agree_with_a_row_by_row_reference() {
+        let rows = 10_000;
+        let slot_count = 13;
+        let (values, valid) = column(rows);
+        let inputs = [
+            LaneInput::Count,
+            LaneInput::Units(&values, &valid),
+            LaneInput::Units(&values, &valid),
+            LaneInput::Units(&values, &valid),
+        ];
+        // A whole span into one fold.
+        let all = (0..rows).collect::<Vec<_>>();
+        let slots = slots_of(all.iter().copied(), slot_count);
+        let mut fold = PackedFold::new(slot_count, &LANES);
+        fold.fold(&inputs, &slots, &FoldRows::Span(0..rows));
+        check(
+            std::slice::from_ref(&fold),
+            &reference(&all, &slots, &values, &valid, slot_count),
+        );
+        // Every third row picked, split across two partials.
+        let picked = (0..rows).filter(|row| row % 3 == 0).collect::<Vec<_>>();
+        let half = picked.len() / 2;
+        let mut partials = Vec::new();
+        for part in [&picked[..half], &picked[half..]] {
+            let indices = part
+                .iter()
+                .map(|row| u32::try_from(*row).expect("small"))
+                .collect::<Vec<_>>();
+            let part_slots = slots_of(part.iter().copied(), slot_count);
+            let mut fold = PackedFold::new(slot_count, &LANES);
+            fold.fold(&inputs, &part_slots, &FoldRows::Picked(&indices));
+            partials.push(fold);
+        }
+        let picked_slots = slots_of(picked.iter().copied(), slot_count);
+        check(
+            &partials,
+            &reference(&picked, &picked_slots, &values, &valid, slot_count),
+        );
+    }
+
+    /// Kernel measurement, ignored by default:
+    /// `cargo test --release -p pintail-exec --lib packed_fold::tests::kernel -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn kernel_against_row_at_a_time() {
+        let rows = 1 << 22;
+        let (values, _) = column(rows);
+        let valid = ValidityMask::all_valid(rows);
+        let lanes = [LANES[0], LANES[1]];
+        for slot_count in [5, 1_025, 100_001] {
+            let slots = slots_of(0..rows, slot_count);
+            let inputs = [LaneInput::Count, LaneInput::Units(&values, &valid)];
+            let mut best_fold = f64::MAX;
+            let mut best_rows = f64::MAX;
+            for _ in 0..5 {
+                let mut fold = PackedFold::new(slot_count, &lanes);
+                let started = std::time::Instant::now();
+                for start in (0..rows).step_by(4_096) {
+                    let end = (start + 4_096).min(rows);
+                    fold.fold(&inputs, &slots[start..end], &FoldRows::Span(start..end));
+                }
+                best_fold = best_fold.min(started.elapsed().as_secs_f64());
+                std::hint::black_box(&fold);
+                // The shape this replaced: per row and lane, a reader match,
+                // a lane match and a checked add returning a Result.
+                let mut cells = vec![(0_i128, 0_u64); slot_count * 2];
+                let started = std::time::Instant::now();
+                for (row, slot) in slots.iter().enumerate() {
+                    for (index, lane) in lanes.iter().enumerate() {
+                        let bits = match index {
+                            0 => Some(0),
+                            _ => valid.is_valid(row).then_some(values[row]),
+                        };
+                        let cell = &mut cells[*slot as usize * 2 + index];
+                        if let Some(bits) = std::hint::black_box(bits) {
+                            let added: Result<(), ()> = match lane {
+                                Some(PackedLane::Count) => Ok(()),
+                                _ => cell
+                                    .0
+                                    .checked_add(i128::from(bits))
+                                    .map(|total| cell.0 = total)
+                                    .ok_or(()),
+                            };
+                            added.expect("no overflow");
+                            cell.1 += 1;
+                        }
+                    }
+                }
+                best_rows = best_rows.min(started.elapsed().as_secs_f64());
+                std::hint::black_box(&cells);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let per_row = |seconds: f64| seconds * 1e9 / rows as f64;
+            eprintln!(
+                "{slot_count} slots: fold {:.2} ns/row, row-at-a-time {:.2} ns/row",
+                per_row(best_fold),
+                per_row(best_rows)
+            );
+        }
+    }
+}

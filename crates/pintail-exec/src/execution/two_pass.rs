@@ -2198,6 +2198,13 @@ impl ReadyColumns {
         rows: std::ops::Range<usize>,
         column_types: &[DataType],
     ) -> Result<RecordBatch, ExecError> {
+        // As cells the rows would serve the layout's columns from their
+        // front, so too short is the only mismatch.
+        if self.columns.len() < column_types.len() {
+            return Err(ExecError::InvalidBatch(
+                "finished groups do not match the aggregate's layout",
+            ));
+        }
         let columns = self
             .columns
             .iter()
