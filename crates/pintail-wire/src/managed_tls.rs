@@ -50,9 +50,10 @@ pub struct ManagedTls {
 /// # Errors
 ///
 /// Returns an error when the data directory cannot be written or the
-/// certificate cannot be generated. Callers treat that as "no wire TLS"
-/// rather than a failed boot: a database that refuses to start because it
-/// could not write a certificate is worse than one serving without it.
+/// certificate cannot be generated. A caller whose TLS is optional treats
+/// that as "no wire TLS" rather than a failed boot; one that requires TLS
+/// must fail the boot, since a listener without a certificate cannot refuse
+/// plaintext clients.
 pub fn ensure(data_dir: &Path, hostnames: &[String]) -> io::Result<ManagedTls> {
     let certificate_path = data_dir.join("wire-cert.pem");
     let key_path = data_dir.join("wire-key.pem");

@@ -4,6 +4,16 @@ All notable changes to Pintail are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Security
+
+- A node told to require TLS on the MySQL wire port (`PINTAIL_WIRE_REQUIRE_TLS`)
+  with no certificate configured now refuses to start when it cannot prepare
+  or load its own certificate. It used to start without one and then accept
+  plaintext connections, since the listener had nothing to refuse them with.
+  With TLS optional the node still starts and serves without it.
+
 ## [0.1.7-rc1] - 2026-10-01
 
 Two of 0.1.6's known regressions fixed, faster grouped aggregation, a

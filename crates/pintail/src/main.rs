@@ -241,27 +241,50 @@ fn resolve_wire_tls(
     // Resolved by the same code the settings API reads, so what an operator
     // sees on the page and what the certificate covers cannot drift apart.
     let hostnames = pintail_api::wire_tls_hostnames(metadata);
-    // Failure here is not fatal. A database that refuses to boot because it
-    // could not write a certificate is worse than one serving without it, and
-    // the operator can still supply their own.
-    match pintail_wire::managed_tls::ensure(config.data_dir(), &hostnames) {
-        Ok(managed) => {
-            if managed.generated {
-                pintail_log::log_info!(
-                    "wire tls: generated a node certificate covering {} name(s)",
-                    hostnames.len() + 3
-                );
-            }
-            Ok(load_wire_tls(
-                &managed.certificate_path,
-                &managed.key_path,
-                config.wire_require_tls(),
-            )
-            .ok())
+    managed_wire_tls(config.data_dir(), &hostnames, config.wire_require_tls())
+}
+
+/// The node's own certificate, generated on first use.
+///
+/// When TLS is optional a failure here is not fatal: a database that refuses
+/// to boot because it could not write a certificate is worse than one serving
+/// without it, and the operator can still supply their own. When TLS is
+/// required the failure stops the boot instead, because a listener with no
+/// certificate has nothing to refuse plaintext clients with and would serve
+/// them unencrypted against the operator's stated requirement.
+fn managed_wire_tls(
+    data_dir: &Path,
+    hostnames: &[String],
+    required: bool,
+) -> Result<Option<pintail_wire::WireTls>> {
+    let managed = match pintail_wire::managed_tls::ensure(data_dir, hostnames) {
+        Ok(managed) => managed,
+        Err(error) if required => {
+            return Err(anyhow::Error::from(error).context(
+                "wire tls is required but the node certificate could not be prepared; \
+                 supply a certificate and key or fix the data directory",
+            ));
         }
         Err(error) => {
             pintail_log::log_error!(
                 "wire tls: could not prepare a node certificate, serving without TLS: {error}"
+            );
+            return Ok(None);
+        }
+    };
+    if managed.generated {
+        pintail_log::log_info!(
+            "wire tls: generated a node certificate covering {} name(s)",
+            hostnames.len() + 3
+        );
+    }
+    match load_wire_tls(&managed.certificate_path, &managed.key_path, required) {
+        Ok(tls) => Ok(Some(tls)),
+        Err(error) if required => Err(anyhow::Error::from(error)
+            .context("wire tls is required but the node certificate could not be loaded")),
+        Err(error) => {
+            pintail_log::log_error!(
+                "wire tls: could not load the node certificate, serving without TLS: {error}"
             );
             Ok(None)
         }
@@ -394,4 +417,52 @@ fn open_file_limit() -> String {
     let describe =
         |value: Option<u64>| value.map_or_else(|| "unlimited".to_owned(), |v| v.to_string());
     format!("{}/{}", describe(limit.current), describe(limit.maximum))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::managed_wire_tls;
+
+    /// A data directory that is really a file: nothing can be written under it.
+    fn unwritable_data_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("pintail-{name}-{}", std::process::id()));
+        std::fs::write(&path, b"not a directory").expect("write the blocking file");
+        path
+    }
+
+    #[test]
+    fn required_tls_stops_the_boot_when_the_certificate_cannot_be_prepared() {
+        let data_dir = unwritable_data_dir("tls-required");
+        let outcome = managed_wire_tls(&data_dir, &[], true);
+        std::fs::remove_file(&data_dir).ok();
+        assert!(
+            outcome.is_err(),
+            "a required-TLS node must not start without a certificate"
+        );
+    }
+
+    #[test]
+    fn optional_tls_serves_without_a_certificate_it_cannot_prepare() {
+        let data_dir = unwritable_data_dir("tls-optional");
+        let outcome = managed_wire_tls(&data_dir, &[], false);
+        std::fs::remove_file(&data_dir).ok();
+        assert!(matches!(outcome, Ok(None)));
+    }
+
+    #[test]
+    fn required_tls_stops_the_boot_when_the_certificate_cannot_be_loaded() {
+        let data_dir =
+            std::env::temp_dir().join(format!("pintail-tls-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).expect("create the data directory");
+        managed_wire_tls(&data_dir, &[], false).expect("generate a certificate");
+        std::fs::write(data_dir.join("wire-key.pem"), b"not a key").expect("corrupt the key");
+        let required = managed_wire_tls(&data_dir, &[], true);
+        let optional = managed_wire_tls(&data_dir, &[], false);
+        std::fs::remove_dir_all(&data_dir).ok();
+        assert!(
+            required.is_err(),
+            "a required-TLS node must not start on an unreadable key"
+        );
+        assert!(matches!(optional, Ok(None)));
+    }
 }
