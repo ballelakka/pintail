@@ -841,7 +841,14 @@ async function main() {
     // the busy window itself, toasts the accept, parses the progress events
     // and renders a bar - all of which this asserts against a copy made
     // slow enough to observe.
-    for (let doubling = 0; doubling < 9; doubling += 1) {
+    //
+    // Slow enough means more than one snapshot chunk: progress is reported
+    // per chunk, and the bar renders only while /tables still says
+    // snapshotting. At 2,048 rows the copy took about ten milliseconds and
+    // the bar was seen in 8 of 40 runs; 262,144 rows (16 doublings of the
+    // four seed rows) spans three chunks and keeps the bar up for about two
+    // seconds, which the poll below sees within its first quarter second.
+    for (let doubling = 0; doubling < 16; doubling += 1) {
       await sql(`INSERT INTO events (kind, amount, happened_at) SELECT kind, amount, happened_at FROM events`)
     }
     await page!.getByRole('link', { name: 'Databases', exact: true }).click()
@@ -872,19 +879,14 @@ async function main() {
       .waitFor({ timeout: 45_000 })
 
     // The progress bar renders while the copy runs, with a live row count.
-    // The bar exists only while the table is snapshotting, and a copy of
-    // two thousand rows takes about ten milliseconds on a fast runner: the
-    // one progress frame lands together with completion, and there is no
-    // moment for a bar to be seen. So the wait accepts either outcome the
-    // user would: a bar with its row count, or a copy the journal shows
-    // finished before a frame could render. A copy that neither renders
-    // nor finishes within the window is the regression this guards.
+    // The table is sized so the copy outlasts many polls, so a bar that is
+    // never seen is a failure whether or not the copy finished: a copy with
+    // no visible progress is exactly what the user reported.
     const progress = page!.getByTestId('resnapshot-progress').first()
     const barDeadline = Date.now() + 30_000
-    let observed: 'bar' | 'finished' | null = null
-    while (observed === null) {
-      // One read, no wait: a count() followed by textContent() raced the
-      // copy - the bar unmounted between the two calls and textContent()
+    for (;;) {
+      // One read, no wait. A count() followed by textContent() raced the
+      // copy: the bar unmounted between the two calls and textContent()
       // then waited out its 20s timeout for an element that was gone for
       // good. allTextContents() returns what is rendered at this instant,
       // so a bar is either seen with its label or not seen at all.
@@ -894,18 +896,12 @@ async function main() {
         if (!/rows copied/.test(label)) {
           throw new Error(`progress rendered without its row count: ${JSON.stringify(label)}`)
         }
-        observed = 'bar'
-        break
-      }
-      const rowsNow = await journalledRows()
-      if (rowsNow > rowsBefore && rowsNow >= 2_048) {
-        observed = 'finished'
-        log(`  resync copied ${rowsNow} rows before a progress frame could render`)
         break
       }
       if (Date.now() > barDeadline) {
+        const rowsNow = await journalledRows()
         throw new Error(
-          `the resync neither rendered a progress bar nor finished within 30s (journal rows ${rowsNow}, before ${rowsBefore})`,
+          `no progress bar was seen within 30s of the accept (journal rows ${rowsNow}, before ${rowsBefore})`,
         )
       }
       await Bun.sleep(250)
@@ -940,6 +936,11 @@ async function main() {
       if (gone && /streaming/i.test(body)) break
       if (Date.now() > settled) throw new Error('the resync never settled back to streaming')
       await Bun.sleep(2_000)
+    }
+    // And the copy was whole: the journal records every row it wrote.
+    const rowsAfter = await journalledRows()
+    if (rowsAfter < 262_144) {
+      throw new Error(`the resync journalled ${rowsAfter} rows, expected at least 262144 (before ${rowsBefore})`)
     }
   })
 
