@@ -287,7 +287,7 @@ fn aggregates_over_a_recent_window() {
 
     let span = (rows - 1) * STEP_SECONDS;
     let full = "COUNT(*), SUM(price), AVG(price), MIN(occurred_at), MAX(occurred_at)";
-    let cases: [(&str, Grouping, Shape, String); 4] = [
+    let cases: [(&str, Grouping, Shape, String); 6] = [
         (
             "count+sum",
             Grouping::None,
@@ -315,6 +315,23 @@ fn aggregates_over_a_recent_window() {
             Shape::Daily,
             "SELECT DATE(occurred_at) AS d, COUNT(*), SUM(price) FROM events \
              WHERE {window} GROUP BY d ORDER BY d"
+                .to_owned(),
+        ),
+        (
+            "by day, full",
+            Grouping::Day,
+            Shape::Full,
+            format!(
+                "SELECT DATE(occurred_at) AS d, {full} FROM events WHERE {{window}} \
+                 GROUP BY d ORDER BY d"
+            ),
+        ),
+        (
+            "by formatted day",
+            Grouping::Day,
+            Shape::Daily,
+            "SELECT DATE_FORMAT(occurred_at, '%Y-%m-%d') AS d, COUNT(*), SUM(price) \
+             FROM events WHERE {window} GROUP BY d ORDER BY d"
                 .to_owned(),
         ),
     ];

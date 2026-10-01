@@ -15,13 +15,26 @@
 //! ungrouped aggregate's do. Groups are keyed by the same normalized value
 //! the general path uses, and the first row of a group in row order supplies
 //! its key value, so the groups and their keys are the general path's.
+//!
+//! When every aggregate merges exactly, batches are held in a window and
+//! folded on the pool: each row range builds its own groups, and the
+//! partials merge into the query's groups in row order. Row order is what
+//! keeps the answer the serial one: a group's key comes from its first row,
+//! and a MIN or MAX merge keeps the earlier of two equal values, as the
+//! serial fold keeps the first row holding it. A float sum or average, a
+//! variance and a DISTINCT aggregate stay serial, because their partials
+//! would add in another order or merge through another path.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
+use pintail_sql::AggregateFunction;
 use pintail_types::Value;
+use rayon::prelude::*;
 
-use super::aggregate::{AggregateGroup, AggregateState, CompiledAggregate, GroupKeyHasher};
+use super::aggregate::{
+    AggregateGroup, AggregateState, CompiledAggregate, GroupKeyHasher, aggregate_uses_float,
+};
 use super::join::normalized_group_hash_key;
 use super::packed_fold::FoldRows;
 use super::ungrouped_fold::{FoldTally, eligible, fold_rows_into};
@@ -42,6 +55,8 @@ use crate::expression::CompiledExpr;
 const MAX_FIRST_BATCH_GROUPS: usize = 256;
 /// Rows the first batch must hold per distinct key.
 const MIN_ROWS_PER_GROUP: usize = 64;
+/// Batches a parallel window holds per pool thread before it folds.
+const WINDOW_BATCHES_PER_THREAD: usize = 2;
 
 /// A key column for one batch: borrowed when the key is a column, computed
 /// when it is an expression with a column kernel.
@@ -79,19 +94,34 @@ fn key_column<'a>(key: &CompiledExpr, batch: &'a RecordBatch) -> Option<KeyColum
     }
 }
 
+/// [`key_column`] on a pool thread: an expression key that raised a
+/// warning, or has no packed kernel, answers `None` and is evaluated again
+/// on the query's thread, where what it raises is recorded.
+fn key_column_quietly<'a>(key: &CompiledExpr, batch: &'a RecordBatch) -> Option<KeyColumn<'a>> {
+    match key.column_index() {
+        Some(index) => batch.column(index).map(KeyColumn::Borrowed),
+        None => key
+            .evaluate_vector_column_quietly(batch, declared_type(key))
+            .map(KeyColumn::Owned),
+    }
+}
+
 /// Whether the fold suits this query, judged on its first batch: one key
 /// with a column form, aggregates the fold takes, and few distinct keys
-/// over many rows.
+/// over many rows. A refusal names its reason for the profile.
 pub(super) fn suits(
     group_by: &[CompiledExpr],
     aggregates: &[CompiledAggregate],
     first: &RecordBatch,
-) -> bool {
+) -> Result<(), &'static str> {
     let [key] = group_by else {
-        return false;
+        return Err("more than one key");
     };
-    if !eligible(aggregates) || key.has_variable_effects() {
-        return false;
+    if !eligible(aggregates) {
+        return Err("an aggregate that collects values");
+    }
+    if key.has_variable_effects() {
+        return Err("a key that assigns a variable");
     }
     // An expression key must have a packed kernel: one read row by row
     // builds its column from values and then parses them back, which costs
@@ -103,29 +133,29 @@ pub(super) fn suits(
             .map(KeyColumn::Owned),
     };
     let Some(column) = column else {
-        return false;
+        return Err("the key has no packed kernel");
     };
     let column = column.get();
     let rows = first.visible_row_count();
     let limit = MAX_FIRST_BATCH_GROUPS.min(rows / MIN_ROWS_PER_GROUP);
     if limit == 0 {
-        return false;
+        return Err("too few rows in the first batch");
     }
     let Some((typed, validity)) = column.typed() else {
-        return false;
+        return Err("the key column is not typed");
     };
     let mut seen = std::collections::HashSet::<u64>::new();
     let mut distinct = |bits: u64| {
         seen.insert(bits);
         seen.len() <= limit
     };
-    match typed {
+    let few = match typed {
         TypedValues::Utf8(strings) => match strings.dictionary() {
             Some((codes, _)) => first
                 .selection()
                 .selected_rows()
                 .all(|row| !validity.is_valid(row) || distinct(u64::from(codes[row]))),
-            None => false,
+            None => return Err("a text key without dictionary codes"),
         },
         TypedValues::Temporal { units, text } if text.derived() => first
             .selection()
@@ -139,17 +169,47 @@ pub(super) fn suits(
             .selection()
             .selected_rows()
             .all(|row| !validity.is_valid(row) || distinct(values[row])),
-        _ => false,
+        _ => return Err("a key type without packed bits"),
+    };
+    if few {
+        Ok(())
+    } else {
+        Err("too many distinct keys in the first batch")
     }
 }
 
+/// Whether partial states of every aggregate merge into the serial answer
+/// when merged in row order.
+fn merges_exactly(aggregates: &[CompiledAggregate]) -> bool {
+    aggregates.iter().all(|aggregate| {
+        !aggregate.distinct
+            && !aggregate_uses_float(aggregate)
+            && !matches!(
+                aggregate.function,
+                AggregateFunction::StdDev { .. } | AggregateFunction::Variance { .. }
+            )
+    })
+}
+
 /// The groups so far, keyed as the general path keys them.
+#[allow(clippy::struct_field_names)] // `groups.groups` reads as the list it is
 struct Groups {
     groups: Vec<AggregateGroup>,
     index: HashMap<Value, u32>,
+    /// Bytes reserved for the groups, handed back when a partial's groups
+    /// have merged into the query's.
+    reserved: usize,
 }
 
 impl Groups {
+    fn new() -> Self {
+        Self {
+            groups: Vec::new(),
+            index: HashMap::new(),
+            reserved: 0,
+        }
+    }
+
     /// The group of a row whose key value is `value`, made when new.
     fn resolve(
         &mut self,
@@ -170,6 +230,7 @@ impl Groups {
             .saturating_add(aggregates.len().saturating_mul(size_of::<AggregateState>()))
             .saturating_add(HASH_ENTRY_OVERHEAD);
         memory.reserve(bytes)?;
+        self.reserved = self.reserved.saturating_add(bytes);
         let group = u32::try_from(self.groups.len())
             .map_err(|_| ExecError::InvalidBatch("too many groups for a small-group fold"))?;
         self.groups.push(AggregateGroup {
@@ -183,10 +244,12 @@ impl Groups {
 
 type UnitGroups = HashMap<u64, u32, BuildHasherDefault<GroupKeyHasher>>;
 
-/// Each selected row's group, in row order, into `out`.
+/// Each of `rows`' group, in row order, into `out`. `column` is the key's
+/// column form for the batch, `None` to evaluate the key row by row.
 #[allow(clippy::too_many_arguments)]
-fn resolve_batch(
+fn resolve_rows(
     key: &CompiledExpr,
+    column: Option<&ColumnVector>,
     batch: &RecordBatch,
     groups: &mut Groups,
     collation: Collation,
@@ -196,10 +259,7 @@ fn resolve_batch(
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
     out.clear();
-    let column = key_column(key, batch);
-    let typed = column
-        .as_ref()
-        .and_then(|column| column.get().typed().map(|typed| (column.get(), typed)));
+    let typed = column.and_then(|column| column.typed().map(|typed| (column, typed)));
     // Resolves `row` once per distinct key: `cached` finds it again.
     let mut by_value = |column: &ColumnVector, row: usize| -> Result<u32, ExecError> {
         let value = column
@@ -328,7 +388,202 @@ fn by_bits(
     Ok(())
 }
 
+/// Buffers one fold of a row set reuses.
+#[derive(Default)]
+struct Scratch {
+    selected: Vec<u32>,
+    row_groups: Vec<u32>,
+    ordered: Vec<u32>,
+    offsets: Vec<usize>,
+}
+
+/// Folds the selected rows of `batch` within `range` into `groups`.
+#[allow(clippy::too_many_arguments)]
+fn fold_range(
+    key: &CompiledExpr,
+    column: Option<&ColumnVector>,
+    batch: &RecordBatch,
+    range: std::ops::Range<usize>,
+    groups: &mut Groups,
+    collation: Collation,
+    aggregates: &[CompiledAggregate],
+    scratch: &mut Scratch,
+    tally: &mut FoldTally,
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
+    let Scratch {
+        selected,
+        row_groups,
+        ordered,
+        offsets,
+    } = scratch;
+    selected.clear();
+    for row in batch.selection().selected_rows_in(range) {
+        selected.push(
+            u32::try_from(row)
+                .map_err(|_| ExecError::InvalidBatch("a batch row past u32 for a fold"))?,
+        );
+    }
+    if selected.is_empty() {
+        return Ok(());
+    }
+    resolve_rows(
+        key, column, batch, groups, collation, aggregates, selected, row_groups, memory,
+    )?;
+    // A counting sort by group keeps each group's rows in row order.
+    let group_count = groups.groups.len();
+    offsets.clear();
+    offsets.resize(group_count + 1, 0);
+    for group in row_groups.iter() {
+        offsets[*group as usize + 1] += 1;
+    }
+    for group in 0..group_count {
+        offsets[group + 1] += offsets[group];
+    }
+    ordered.clear();
+    ordered.resize(selected.len(), 0);
+    let mut cursor = offsets.clone();
+    for (row, group) in selected.iter().zip(row_groups.iter()) {
+        let slot = &mut cursor[*group as usize];
+        ordered[*slot] = *row;
+        *slot += 1;
+    }
+    for group in 0..group_count {
+        let range = offsets[group]..offsets[group + 1];
+        if range.is_empty() {
+            continue;
+        }
+        fold_rows_into(
+            batch,
+            &FoldRows::Picked(&ordered[range]),
+            aggregates,
+            &mut groups.groups[group].states,
+            tally,
+            memory,
+        )?;
+    }
+    Ok(())
+}
+
+/// What a parallel fold has done, for the profile.
+#[derive(Default)]
+struct Parallelism {
+    windows: usize,
+    ranges: usize,
+    serial_windows: usize,
+}
+
+/// Folds a window of batches on the pool and merges the partials into
+/// `groups` in row order. A window where some batch's key has no quiet
+/// column form folds serially, so what the key raises is recorded once on
+/// the query's thread.
+#[allow(clippy::too_many_arguments)]
+fn fold_window(
+    key: &CompiledExpr,
+    window: &[RecordBatch],
+    groups: &mut Groups,
+    collation: Collation,
+    aggregates: &[CompiledAggregate],
+    scratch: &mut Scratch,
+    tally: &mut FoldTally,
+    parallelism: &mut Parallelism,
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
+    memory.check_interruption()?;
+    let columns: Vec<Option<KeyColumn<'_>>> = window
+        .par_iter()
+        .map(|batch| key_column_quietly(key, batch))
+        .collect();
+    if columns.iter().any(Option::is_none) {
+        parallelism.serial_windows += 1;
+        for batch in window {
+            let column = key_column(key, batch);
+            fold_range(
+                key,
+                column.as_ref().map(KeyColumn::get),
+                batch,
+                0..batch.row_count(),
+                groups,
+                collation,
+                aggregates,
+                scratch,
+                tally,
+                memory,
+            )?;
+        }
+        return Ok(());
+    }
+    let plan = super::morsel::morsel_plan(
+        window.iter().map(RecordBatch::row_count),
+        super::morsel::default_morsel_limit(),
+    );
+    parallelism.windows += 1;
+    parallelism.ranges += plan.len();
+    let partials = plan
+        .par_iter()
+        .map(|(index, range)| {
+            let mut local = Groups::new();
+            let mut local_tally = FoldTally::default();
+            let result = fold_range(
+                key,
+                columns[*index].as_ref().map(KeyColumn::get),
+                &window[*index],
+                range.clone(),
+                &mut local,
+                collation,
+                aggregates,
+                &mut Scratch::default(),
+                &mut local_tally,
+                memory,
+            );
+            // A failed partial hands back what it took before the error
+            // goes up.
+            if result.is_err() {
+                memory.release(local.reserved);
+            }
+            result.map(|()| (local, local_tally))
+        })
+        .collect::<Vec<_>>();
+    let mut failure = None;
+    for partial in partials {
+        let (local, local_tally) = match partial {
+            Ok(partial) => partial,
+            Err(error) => {
+                failure.get_or_insert(error);
+                continue;
+            }
+        };
+        if failure.is_some() {
+            memory.release(local.reserved);
+            continue;
+        }
+        tally.folded += local_tally.folded;
+        tally.per_row += local_tally.per_row;
+        let reserved = local.reserved;
+        let merged = (|| {
+            for group in local.groups {
+                let mut values = group.values;
+                let value = values.pop().unwrap_or(Value::Null);
+                let target = groups.resolve(value, collation, aggregates, memory)?;
+                let states = &mut groups.groups[target as usize].states;
+                for ((state, partial), aggregate) in
+                    states.iter_mut().zip(group.states).zip(aggregates)
+                {
+                    state.merge(aggregate, partial, memory)?;
+                }
+            }
+            Ok(())
+        })();
+        memory.release(reserved);
+        if let Err(error) = merged {
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 /// Folds every batch of `input`, `first` included, by group.
+#[allow(clippy::too_many_lines)] // one pull loop: hold, fold, then finish
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_small_group_fold(
     input: &mut PullOperator,
@@ -338,76 +593,115 @@ pub(super) fn build_small_group_fold(
     memory: &MemoryTracker,
     key_collation: Collation,
 ) -> Result<MaterializedRows, ExecError> {
-    let mut groups = Groups {
-        groups: Vec::new(),
-        index: HashMap::new(),
-    };
+    let mut groups = Groups::new();
     let mut tally = FoldTally::default();
-    let mut selected = Vec::<u32>::new();
-    let mut row_groups = Vec::<u32>::new();
-    let mut ordered = Vec::<u32>::new();
-    let mut offsets = Vec::<usize>::new();
+    let mut scratch = Scratch::default();
+    let mut parallelism = Parallelism::default();
+    let threads = rayon::current_num_threads();
+    let parallel = threads > 1 && merges_exactly(aggregates);
+    let window_cap = threads.saturating_mul(WINDOW_BATCHES_PER_THREAD);
+    let mut window = Vec::<RecordBatch>::new();
+    let mut window_reserved = 0_usize;
     let mut next = Some(first);
+    let flush = |window: &mut Vec<RecordBatch>,
+                 window_reserved: &mut usize,
+                 groups: &mut Groups,
+                 scratch: &mut Scratch,
+                 tally: &mut FoldTally,
+                 parallelism: &mut Parallelism|
+     -> Result<(), ExecError> {
+        if window.is_empty() {
+            return Ok(());
+        }
+        let result = fold_window(
+            key,
+            window,
+            groups,
+            key_collation,
+            aggregates,
+            scratch,
+            tally,
+            parallelism,
+            memory,
+        );
+        window.clear();
+        memory.release(*window_reserved);
+        *window_reserved = 0;
+        result
+    };
     while let Some(batch) = match next.take() {
         Some(batch) => Some(batch),
         None => input.next_batch(memory)?,
     } {
         memory.check_interruption()?;
-        selected.clear();
-        for row in batch.selection().selected_rows() {
-            selected.push(
-                u32::try_from(row)
-                    .map_err(|_| ExecError::InvalidBatch("a batch row past u32 for a fold"))?,
-            );
-        }
-        if selected.is_empty() {
+        if batch.visible_row_count() == 0 {
             continue;
         }
-        resolve_batch(
+        if parallel {
+            // A held batch is charged until its window folds; with no
+            // room, the window folds now, and a batch that still does not
+            // fit folds alone.
+            let bytes = batch.estimated_bytes();
+            let mut held = memory.reserve(bytes).is_ok();
+            if !held {
+                flush(
+                    &mut window,
+                    &mut window_reserved,
+                    &mut groups,
+                    &mut scratch,
+                    &mut tally,
+                    &mut parallelism,
+                )?;
+                held = memory.reserve(bytes).is_ok();
+            }
+            if held {
+                window_reserved = window_reserved.saturating_add(bytes);
+                window.push(batch);
+                if window.len() >= window_cap {
+                    flush(
+                        &mut window,
+                        &mut window_reserved,
+                        &mut groups,
+                        &mut scratch,
+                        &mut tally,
+                        &mut parallelism,
+                    )?;
+                }
+                continue;
+            }
+        }
+        let column = key_column(key, &batch);
+        fold_range(
             key,
+            column.as_ref().map(KeyColumn::get),
             &batch,
+            0..batch.row_count(),
             &mut groups,
             key_collation,
             aggregates,
-            &selected,
-            &mut row_groups,
+            &mut scratch,
+            &mut tally,
             memory,
         )?;
-        // A counting sort by group keeps each group's rows in row order.
-        let group_count = groups.groups.len();
-        offsets.clear();
-        offsets.resize(group_count + 1, 0);
-        for group in &row_groups {
-            offsets[*group as usize + 1] += 1;
-        }
-        for group in 0..group_count {
-            offsets[group + 1] += offsets[group];
-        }
-        ordered.clear();
-        ordered.resize(selected.len(), 0);
-        let mut cursor = offsets.clone();
-        for (row, group) in selected.iter().zip(&row_groups) {
-            let slot = &mut cursor[*group as usize];
-            ordered[*slot] = *row;
-            *slot += 1;
-        }
-        for group in 0..group_count {
-            let range = offsets[group]..offsets[group + 1];
-            if range.is_empty() {
-                continue;
-            }
-            fold_rows_into(
-                &batch,
-                &FoldRows::Picked(&ordered[range]),
-                aggregates,
-                &mut groups.groups[group].states,
-                &mut tally,
-                memory,
-            )?;
-        }
     }
+    flush(
+        &mut window,
+        &mut window_reserved,
+        &mut groups,
+        &mut scratch,
+        &mut tally,
+        &mut parallelism,
+    )?;
+    let mode = if parallel {
+        format!(
+            "{} parallel windows over {} row ranges, {} serial windows",
+            parallelism.windows, parallelism.ranges, parallelism.serial_windows
+        )
+    } else {
+        "serial: an aggregate whose partials do not merge exactly".to_owned()
+    };
     super::ProfileNote::of(input).set(&format!(
-        "small-group column fold: {} groups, {} aggregate-batches by column, {} per row",
+        "small-group column fold: {} groups, {} aggregate-batches by column, {} per row, {mode}",
         groups.groups.len(),
         tally.folded,
         tally.per_row

@@ -3817,9 +3817,15 @@ fn build_buffered_hash_aggregate(
     // column per group instead of through the general row loop.
     // The lane check goes first: it is cheap, and a query the two-pass
     // takes never pays for counting its first batch's keys.
-    if (direct_columns.is_none() || two_pass_lanes(aggregates, &first_batch).is_none())
-        && super::small_group_fold::suits(group_by, aggregates, &first_batch)
-    {
+    let small_group = (direct_columns.is_none()
+        || two_pass_lanes(aggregates, &first_batch).is_none())
+    .then(|| super::small_group_fold::suits(group_by, aggregates, &first_batch));
+    if let Some(Err(reason)) = small_group {
+        // Why a grouped aggregate went down the per-row path is otherwise
+        // invisible: the profile shows only that it was slow.
+        super::ProfileNote::of(input).set(&format!("small-group column fold declined: {reason}"));
+    }
+    if let Some(Ok(())) = small_group {
         return super::small_group_fold::build_small_group_fold(
             input,
             first_batch,
