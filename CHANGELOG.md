@@ -30,6 +30,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   first workspace. Any account could create a workspace, become its
   administrator, and change them. `/api/session` reports `node_admin`, and the
   dashboard shows those settings only to a node administrator.
+- A database's replication mode can be changed only from the workspace that
+  owns it. The mode endpoint wrote the change before checking the caller's
+  workspace, so an operator of one workspace could pause or re-mode another
+  workspace's database by its identifier.
 
 ## [0.1.7-rc1] - 2026-10-01
 

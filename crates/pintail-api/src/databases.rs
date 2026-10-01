@@ -485,6 +485,9 @@ pub(crate) async fn set_mode(
 ) -> Result<Json<DatabaseResponse>, ApiError> {
     principal.require_operator()?;
     principal.authorize_database(&id)?;
+    // Before the write, not after: the identifier alone names a database in
+    // any workspace, and only this lookup ties it to the caller's.
+    load_database(&state, &principal, &id)?;
     state
         .metadata()?
         .set_database_mode(&id, &request.mode, &Utc::now().to_rfc3339())

@@ -355,7 +355,13 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK);
         // and reaches no node-wide setting, to read or to write.
-        assert_refused(&node, Some(&own), StatusCode::FORBIDDEN, "a workspace creator").await;
+        assert_refused(
+            &node,
+            Some(&own),
+            StatusCode::FORBIDDEN,
+            "a workspace creator",
+        )
+        .await;
 
         // The first administrator keeps the node from their first workspace
         // and from one they create afterwards.
@@ -415,5 +421,41 @@ mod tests {
             "a bad credential",
         )
         .await;
+    }
+
+    /// A database's replication mode is changed only from the workspace that
+    /// owns it. The refusal has to come before the write.
+    #[tokio::test]
+    async fn a_database_mode_is_not_writable_from_another_workspace() {
+        let node = Node::new().await;
+        let database = node.database(&node.admin, "ledger").await;
+        let (second_workspace, _) = node.workspace(&node.admin, "Second").await;
+        let (_, outsider) = node.member(&second_workspace, "admin");
+        let uri = format!("/api/databases/{database}/mode");
+        let mode = |node: &Node| {
+            node.metadata()
+                .database(&database)
+                .expect("database")
+                .expect("a database")
+                .mode
+        };
+        let before = mode(&node);
+
+        let (status, _) = node
+            .call("POST", &uri, Some(&outsider), Some(r#"{"mode":"paused"}"#))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(mode(&node), before, "the refused change was stored");
+
+        let (status, _) = node
+            .call(
+                "POST",
+                &uri,
+                Some(&node.admin),
+                Some(r#"{"mode":"paused"}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(mode(&node), "paused");
     }
 }
