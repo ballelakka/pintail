@@ -56,15 +56,15 @@ impl UniqueKeyGroups {
         dense_group_indexes: &[Option<&[usize]>],
         group_count: usize,
     ) -> Option<Self> {
-        let (minimum, index) = build.dense_layout()?;
+        let (minimum, slots) = build.dense_layout()?;
         let miss = u32::try_from(group_count)
             .ok()
             .filter(|miss| *miss < u32::MAX - 1)?;
-        let mut groups = Vec::with_capacity(index.len());
-        for slot in index {
-            let group = match slot {
+        let mut groups = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let group = match slot.checked_sub(1) {
                 None => miss,
-                Some(flat) => match dense_group_indexes.get(*flat).copied().flatten() {
+                Some(bucket) => match dense_group_indexes.get(bucket as usize).copied().flatten() {
                     None | Some([]) => miss,
                     Some([group]) => u32::try_from(*group).ok().filter(|g| *g < miss)?,
                     Some(_) => return None,

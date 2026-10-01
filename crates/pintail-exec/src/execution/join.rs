@@ -52,22 +52,58 @@ pub(super) const BUILD_PARTITIONS: usize = 64;
 pub(super) struct PartitionedBuild<R = BuildRow> {
     partitions: Vec<JoinKeyMap<Vec<R>>>,
     /// Set once, after every build row was inserted, when the keys are a
-    /// plain integer set spanning fewer than [`MAX_DENSE_SPAN`] values:
-    /// (minimum key, per-offset index into `dense_buckets`). `get` and the
-    /// other read accessors consult this first, trading a probe row's
-    /// hash-and-compare for one bounds-checked array index. `partitions`
-    /// is left as an emptied skeleton rather than cleared away, since
-    /// nothing reads it again once this is `Some` - only the build phase
-    /// (`entry_or_default`, `reserve_for_key`, `slot`, `drain`, `clear`)
-    /// touches it, and that phase is over by the time this is set.
-    dense_index: Option<(i128, Vec<Option<usize>>)>,
-    dense_buckets: Vec<Vec<R>>,
+    /// plain integer set spanning fewer than [`MAX_DENSE_SPAN`] values.
+    /// `get` and the other read accessors consult this first, trading a
+    /// probe row's hash-and-compare for one bounds-checked array index.
+    /// `partitions` is left as an emptied skeleton rather than cleared away,
+    /// since nothing reads it again once this is `Some` - only the build
+    /// phase (`entry_or_default`, `reserve_for_key`, `slot`, `drain`,
+    /// `clear`) touches it, and that phase is over by the time this is set.
+    dense: Option<DenseTable<R>>,
     /// The batches a resident build's row references point into.
     batches: Vec<RecordBatch>,
     /// About what one kept row holds, once the probe first asks. Summing
     /// the kept batches' sizes walks every value of a materialized column,
     /// and the probe asked for every chunk of output it built.
     kept_row_bytes: std::sync::OnceLock<usize>,
+}
+
+/// A dense build's buckets, laid out flat: no allocation per key, and a
+/// probe's lookup is an index into `slots` and a slice of `rows`.
+struct DenseTable<R> {
+    minimum: i128,
+    /// Per key offset from `minimum`: one more than the index of the bucket
+    /// that key names, or zero where no key falls.
+    slots: Vec<u32>,
+    /// Bucket `b` holds `rows[starts[b]..starts[b + 1]]`.
+    starts: Vec<usize>,
+    rows: Vec<R>,
+}
+
+impl<R> DenseTable<R> {
+    fn buckets(&self) -> usize {
+        self.starts.len().saturating_sub(1)
+    }
+
+    fn bucket(&self, index: usize) -> &[R] {
+        &self.rows[self.starts[index]..self.starts[index + 1]]
+    }
+
+    /// The index of the bucket `key` names, if any.
+    fn index(&self, key: &JoinHashKey) -> Option<usize> {
+        let offset = usize::try_from(integer_key(key)?.checked_sub(self.minimum)?).ok()?;
+        let slot = *self.slots.get(offset)?;
+        (slot != 0).then(|| slot as usize - 1)
+    }
+}
+
+/// A plain integer key's value; `None` for every other key form.
+fn integer_key(key: &JoinHashKey) -> Option<i128> {
+    match key {
+        JoinHashKey::NegativeInteger(value) => Some(i128::from(*value)),
+        JoinHashKey::NonNegativeInteger(value) => Some(i128::from(*value)),
+        _ => None,
+    }
 }
 
 /// A resident build row: its batch among the build's kept batches, and its
@@ -129,8 +165,7 @@ impl<R> PartitionedBuild<R> {
     fn with_partitions(count: usize) -> Self {
         Self {
             partitions: (0..count.max(1)).map(|_| JoinKeyMap::default()).collect(),
-            dense_index: None,
-            dense_buckets: Vec::new(),
+            dense: None,
             batches: Vec::new(),
             kept_row_bytes: std::sync::OnceLock::new(),
         }
@@ -151,95 +186,79 @@ impl<R> PartitionedBuild<R> {
         }
     }
 
-    /// The dense slot a key resolves to, when this build finalized to a
-    /// dense table and the key is the plain integer variant that mode
-    /// requires. `Some` only while dense; the general (hashed) path never
-    /// calls this directly - `get` already dispatches to it.
-    fn dense_offset(&self, key: &JoinHashKey) -> Option<usize> {
-        let (min, index) = self.dense_index.as_ref()?;
-        let value = match key {
-            JoinHashKey::NegativeInteger(value) => i128::from(*value),
-            JoinHashKey::NonNegativeInteger(value) => i128::from(*value),
-            _ => return None,
-        };
-        *index.get(usize::try_from(value.checked_sub(*min)?).ok()?)?
-    }
-
-    pub(super) fn get(&self, key: &JoinHashKey) -> Option<&Vec<R>> {
-        if self.dense_index.is_some() {
-            return self
-                .dense_offset(key)
-                .map(|offset| &self.dense_buckets[offset]);
+    pub(super) fn get(&self, key: &JoinHashKey) -> Option<&[R]> {
+        if let Some(dense) = &self.dense {
+            return dense.index(key).map(|index| dense.bucket(index));
         }
-        self.partitions[self.slot(key)].get(key)
+        self.partitions[self.slot(key)].get(key).map(Vec::as_slice)
     }
 
-    /// Like [`Self::get`], but also returns the flat index into
-    /// the dense buckets a caller can use to keep its own array (one
-    /// entry per distinct key, built once) aligned to this bucket - the
-    /// fused join-aggregate's precomputed group indexes, in particular.
+    /// Like [`Self::get`], but also returns the bucket's index in the order
+    /// [`Self::values`] yields them, which a caller can use to keep its own
+    /// array (one entry per distinct key, built once) aligned to this bucket:
+    /// the fused join-aggregate's precomputed group indexes, in particular.
     /// `None` whenever `get` would return through the hashed path instead.
-    pub(super) fn dense_get(&self, key: &JoinHashKey) -> Option<(usize, &Vec<R>)> {
-        let offset = self.dense_offset(key)?;
-        Some((offset, &self.dense_buckets[offset]))
+    pub(super) fn dense_get(&self, key: &JoinHashKey) -> Option<(usize, &[R])> {
+        let dense = self.dense.as_ref()?;
+        let index = dense.index(key)?;
+        Some((index, dense.bucket(index)))
     }
 
-    /// The dense table's smallest key and its per-offset index into
-    /// the dense buckets, once [`Self::is_dense`].
-    pub(super) fn dense_layout(&self) -> Option<(i128, &[Option<usize>])> {
-        self.dense_index
+    /// The dense table's smallest key and, per offset from it, one more than
+    /// the index of the bucket that key names - zero where none does - once
+    /// [`Self::is_dense`].
+    pub(super) fn dense_layout(&self) -> Option<(i128, &[u32])> {
+        self.dense
             .as_ref()
-            .map(|(minimum, index)| (*minimum, index.as_slice()))
+            .map(|dense| (dense.minimum, dense.slots.as_slice()))
     }
 
     pub(super) const fn is_dense(&self) -> bool {
-        self.dense_index.is_some()
+        self.dense.is_some()
     }
 
-    /// Moves every bucket into a flat, densely-addressable array when the
+    /// Moves every bucket into a flat, densely-addressable table when the
     /// build key is a plain integer whose span fits [`MAX_DENSE_SPAN`] -
     /// `MySQL` auto-increment keys make this the common case, not the
     /// exception. Idempotent; a no-op once already dense. Must run only
     /// after every insert for this build is done: nothing re-populates
     /// `partitions` afterward.
     pub(super) fn finalize_dense(&mut self) {
-        if self.dense_index.is_some() || self.is_empty() {
+        if self.dense.is_some() || self.is_empty() {
             return;
         }
         let mut min = i128::MAX;
         let mut max = i128::MIN;
         for key in self.keys() {
-            match key {
-                JoinHashKey::NegativeInteger(value) => {
-                    min = min.min(i128::from(*value));
-                    max = max.max(i128::from(*value));
-                }
-                JoinHashKey::NonNegativeInteger(value) => {
-                    min = min.min(i128::from(*value));
-                    max = max.max(i128::from(*value));
-                }
-                _ => return,
-            }
+            let Some(value) = integer_key(key) else {
+                return;
+            };
+            min = min.min(value);
+            max = max.max(value);
         }
         if max - min >= MAX_DENSE_SPAN {
             return;
         }
         let span = usize::try_from(max - min).expect("bounded span") + 1;
-        let mut index: Vec<Option<usize>> = vec![None; span];
-        let mut buckets = Vec::with_capacity(self.len());
+        let buckets = self.len();
+        let mut table = DenseTable {
+            minimum: min,
+            slots: vec![0; span],
+            starts: Vec::with_capacity(buckets + 1),
+            rows: Vec::with_capacity(self.values().map(<[R]>::len).sum()),
+        };
         for partition in &mut self.partitions {
             for (key, bucket) in partition.drain() {
-                let value = match key {
-                    JoinHashKey::NegativeInteger(value) => i128::from(value),
-                    JoinHashKey::NonNegativeInteger(value) => i128::from(value),
-                    _ => unreachable!("verified integer keys above"),
-                };
-                index[usize::try_from(value - min).expect("within span")] = Some(buckets.len());
-                buckets.push(bucket);
+                let value = integer_key(&key).expect("verified integer keys above");
+                let offset = usize::try_from(value - min).expect("within span");
+                table.starts.push(table.rows.len());
+                table.slots[offset] =
+                    u32::try_from(table.starts.len()).expect("a dense span fits u32");
+                table.rows.extend(bucket);
             }
         }
-        self.dense_index = Some((min, index));
-        self.dense_buckets = buckets;
+        table.starts.push(table.rows.len());
+        self.dense = Some(table);
     }
 
     pub(super) fn partitions(&self) -> usize {
@@ -252,25 +271,30 @@ impl<R> PartitionedBuild<R> {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        if self.dense_index.is_some() {
-            return self.dense_buckets.is_empty();
+        if let Some(dense) = &self.dense {
+            return dense.buckets() == 0;
         }
         self.partitions.iter().all(JoinKeyMap::is_empty)
     }
 
     /// Distinct keys across every partition.
     pub(super) fn len(&self) -> usize {
-        if self.dense_index.is_some() {
-            return self.dense_buckets.len();
+        if let Some(dense) = &self.dense {
+            return dense.buckets();
         }
         self.partitions.iter().map(JoinKeyMap::len).sum()
     }
 
-    pub(super) fn values(&self) -> Box<dyn Iterator<Item = &Vec<R>> + '_> {
-        if self.dense_index.is_some() {
-            Box::new(self.dense_buckets.iter())
+    pub(super) fn values(&self) -> Box<dyn Iterator<Item = &[R]> + '_> {
+        if let Some(dense) = &self.dense {
+            Box::new((0..dense.buckets()).map(|index| dense.bucket(index)))
         } else {
-            Box::new(self.partitions.iter().flat_map(JoinKeyMap::values))
+            Box::new(
+                self.partitions
+                    .iter()
+                    .flat_map(JoinKeyMap::values)
+                    .map(Vec::as_slice),
+            )
         }
     }
 
@@ -484,9 +508,9 @@ impl JoinGroupPlan {
 
     /// The group index of each row of `bucket`, a bucket of the build this
     /// plan was resolved from.
-    pub(super) fn bucket<R>(&self, bucket: &Vec<R>) -> Option<&[usize]> {
+    pub(super) fn bucket<R>(&self, bucket: &[R]) -> Option<&[usize]> {
         self.positions
-            .get(&(std::ptr::from_ref(bucket) as usize))
+            .get(&(bucket.as_ptr() as usize))
             .map(|position| self.ordered(*position))
     }
 
@@ -510,7 +534,7 @@ impl JoinGroupPlan {
 struct RawGroupCache {
     text: ByteKeyMap<Vec<u8>, usize>,
     /// Per kept batch, the position of each dictionary code once resolved.
-    codes: HashMap<u32, Vec<Option<usize>>>,
+    codes: Vec<Vec<Option<usize>>>,
     null: Option<usize>,
 }
 
@@ -760,7 +784,7 @@ pub(super) fn resolve_join_group_plan(
     for (position, bucket) in build.values().enumerate() {
         starts.push(groups.len());
         if !dense {
-            positions.insert(std::ptr::from_ref(bucket) as usize, position);
+            positions.insert(bucket.as_ptr() as usize, position);
         }
         for row in bucket {
             let text = single_text.and_then(|column| {
@@ -790,7 +814,7 @@ pub(super) fn resolve_join_group_plan(
                 RawCell::Null => raw.null,
                 RawCell::Code(code, _) => raw
                     .codes
-                    .get(&row.batch)
+                    .get(row.batch as usize)
                     .and_then(|codes| codes.get(*code as usize).copied().flatten()),
                 RawCell::Text => {
                     text.views()[cell].with_bytes(text.heap(), |bytes| raw.text.get(bytes).copied())
@@ -813,7 +837,11 @@ pub(super) fn resolve_join_group_plan(
             match raw_cell {
                 RawCell::Null => raw.null = Some(position),
                 RawCell::Code(code, bytes) => {
-                    let codes = raw.codes.entry(row.batch).or_default();
+                    let batch = row.batch as usize;
+                    if raw.codes.len() <= batch {
+                        raw.codes.resize_with(batch + 1, Vec::new);
+                    }
+                    let codes = &mut raw.codes[batch];
                     if codes.len() <= code as usize {
                         codes.resize(code as usize + 1, None);
                     }
@@ -907,7 +935,7 @@ impl HashJoinState {
         &mut self,
         memory: &MemoryTracker,
     ) -> Option<Arc<HashSet<JoinHashKey>>> {
-        if self.spilled() || self.build.dense_index.is_some() {
+        if self.spilled() || self.build.is_dense() {
             return None;
         }
         // Include hash capacity, the packed filter and its temporary integer
@@ -1096,6 +1124,238 @@ fn spill_resident(
     Ok(())
 }
 
+/// What the direct dense build left: the finished state, or the batches it
+/// read for the general build to take over from.
+enum DenseBuild {
+    Built(Box<HashJoinState>),
+    Declined(Vec<RecordBatch>),
+}
+
+/// Builds a dense table straight from an integer key column.
+///
+/// A unique integer key over a dense range - an auto-increment primary key -
+/// is the commonest build side, and the general build spent most of its
+/// time on machinery such a key does not need: a hash table per partition,
+/// an allocation per key for its bucket, the drain into the dense table at
+/// the end. Here keys are read from the packed column into one flat list
+/// with their rows, the span is watched as they arrive, and the table is
+/// laid out once by counting: rows of one key stay in the order they were
+/// read, as the general build keeps them.
+///
+/// Optimistic: anything this path does not handle - a key that is not a
+/// plain integer column, a span past [`MAX_DENSE_SPAN`], a ceiling that
+/// refuses a reservation - declines, handing every batch it read to the
+/// general build, which starts over from them and spills where it must.
+#[allow(clippy::too_many_lines)]
+fn build_dense_directly(
+    right: &mut PullOperator,
+    right_key: &CompiledExpr,
+    key_mode: JoinKeyMode,
+    extra_keys: &[(CompiledExpr, CompiledExpr, JoinKeyMode)],
+    probe_floor: usize,
+    memory: &MemoryTracker,
+) -> Result<DenseBuild, ExecError> {
+    let mut batches = Vec::new();
+    let (KeyForm::Integer, false, true, Some(column)) = (
+        key_mode.form,
+        key_mode.null_safe,
+        extra_keys.is_empty(),
+        right_key.column_index(),
+    ) else {
+        return Ok(DenseBuild::Declined(batches));
+    };
+    // Bytes held against the ceiling: the kept batches, and the flat key
+    // list while it lives.
+    let mut batch_bytes = 0_usize;
+    let mut flat_bytes = 0_usize;
+    let declined = |batches: Vec<RecordBatch>, held: usize| -> Result<DenseBuild, ExecError> {
+        memory.release(held);
+        Ok(DenseBuild::Declined(batches))
+    };
+    let mut keys = Vec::<i128>::new();
+    let mut rows = Vec::<BuildRow>::new();
+    let mut signed: Option<bool> = None;
+    let (mut minimum, mut maximum) = (i128::MAX, i128::MIN);
+    loop {
+        match memory.ensure_transient(right.scan_transient_floor()) {
+            Ok(()) => {}
+            Err(ExecError::MemoryLimitExceeded { .. }) => {
+                return declined(batches, batch_bytes + flat_bytes);
+            }
+            Err(error) => return Err(error),
+        }
+        let Some(batch) = right.next_batch(memory)? else {
+            break;
+        };
+        let batch = compacted(batch)?;
+        let Some(index) = u32::try_from(batches.len()).ok() else {
+            batches.push(batch);
+            return declined(batches, batch_bytes + flat_bytes);
+        };
+        let typed = batch.column(column).and_then(ColumnVector::typed);
+        let (values, validity, batch_signed) = match typed {
+            Some((crate::batch::TypedValues::Int64(values), validity)) => {
+                (Keys::Signed(values), validity, true)
+            }
+            Some((crate::batch::TypedValues::UInt64(values), validity)) => {
+                (Keys::Unsigned(values), validity, false)
+            }
+            _ => {
+                batches.push(batch);
+                return declined(batches, batch_bytes + flat_bytes);
+            }
+        };
+        if *signed.get_or_insert(batch_signed) != batch_signed {
+            batches.push(batch);
+            return declined(batches, batch_bytes + flat_bytes);
+        }
+        let held = batch.estimated_bytes();
+        let listed = batch
+            .visible_row_count()
+            .saturating_mul(size_of::<i128>() + size_of::<BuildRow>());
+        match memory.reserve(held.saturating_add(listed)) {
+            Ok(()) => {
+                batch_bytes = batch_bytes.saturating_add(held);
+                flat_bytes = flat_bytes.saturating_add(listed);
+            }
+            Err(ExecError::MemoryLimitExceeded { .. }) => {
+                batches.push(batch);
+                return declined(batches, batch_bytes + flat_bytes);
+            }
+            Err(error) => return Err(error),
+        }
+        for row in batch.selection().selected_rows() {
+            if !validity.is_valid(row) {
+                continue;
+            }
+            let key = values.get(row);
+            minimum = minimum.min(key);
+            maximum = maximum.max(key);
+            keys.push(key);
+            rows.push(BuildRow {
+                batch: index,
+                row: u32::try_from(row).map_err(|_| {
+                    ExecError::InvalidBatch("a build batch holds more rows than a join addresses")
+                })?,
+            });
+        }
+        batches.push(batch);
+        // Past the span a dense table takes, or past the share of the
+        // ceiling a resident build keeps before it spills: the general
+        // build knows what to do with both.
+        if (!keys.is_empty() && maximum - minimum >= MAX_DENSE_SPAN)
+            || batch_bytes.saturating_add(flat_bytes) > memory.limit() / 2
+        {
+            return declined(batches, batch_bytes + flat_bytes);
+        }
+    }
+    if keys.is_empty() {
+        return declined(batches, batch_bytes + flat_bytes);
+    }
+    let span = usize::try_from(maximum - minimum).expect("bounded span") + 1;
+    let mut slots = vec![0_u32; span];
+    for key in &keys {
+        let slot = &mut slots[usize::try_from(key - minimum).expect("within span")];
+        *slot = slot.checked_add(1).ok_or(ExecError::InvalidBatch(
+            "a join build key names more rows than a dense table addresses",
+        ))?;
+    }
+    // Counts become bucket numbers, in key order, and each bucket's start.
+    let mut starts = Vec::new();
+    let mut next = 0_usize;
+    for slot in &mut slots {
+        if *slot != 0 {
+            starts.push(next);
+            next += *slot as usize;
+            *slot = u32::try_from(starts.len()).expect("a dense span fits u32");
+        }
+    }
+    starts.push(next);
+    let table_bytes = span
+        .saturating_mul(size_of::<u32>())
+        .saturating_add(starts.len().saturating_mul(size_of::<usize>() * 2))
+        .saturating_add(rows.len().saturating_mul(size_of::<BuildRow>()));
+    match memory.reserve(table_bytes) {
+        Ok(()) => {}
+        Err(ExecError::MemoryLimitExceeded { .. }) => {
+            return declined(batches, batch_bytes + flat_bytes);
+        }
+        Err(error) => return Err(error),
+    }
+    let mut cursors = starts.clone();
+    let mut placed = vec![BuildRow { batch: 0, row: 0 }; rows.len()];
+    for (key, row) in keys.iter().zip(&rows) {
+        let bucket = slots[usize::try_from(key - minimum).expect("within span")] as usize - 1;
+        placed[cursors[bucket]] = *row;
+        cursors[bucket] += 1;
+    }
+    drop(cursors);
+    drop(keys);
+    drop(rows);
+    memory.release(flat_bytes);
+    let held = batch_bytes.saturating_add(table_bytes);
+    // A build that fitted can still leave the probe no room to run, and a
+    // resident probe refused by the ceilings fails rather than spills. The
+    // general build keeps a resident side to half the query ceiling; this
+    // one asks the same of both ceilings - room for as much again as it
+    // holds, and for the probe's next batch - and otherwise hands over to
+    // the general build, which spills under that pressure.
+    match memory.ensure_transient(probe_floor.max(held)) {
+        Ok(()) => {}
+        Err(ExecError::MemoryLimitExceeded { .. }) => return declined(batches, held),
+        Err(error) => return Err(error),
+    }
+    let bound = |value: i128| {
+        if signed == Some(true) {
+            Value::Int64(i64::try_from(value).expect("read from an i64 column"))
+        } else {
+            Value::UInt64(u64::try_from(value).expect("read from a u64 column"))
+        }
+    };
+    let mut build = PartitionedBuild::with_partitions(BUILD_PARTITIONS);
+    build.batches = batches;
+    build.dense = Some(DenseTable {
+        minimum,
+        slots,
+        starts,
+        rows: placed,
+    });
+    Ok(DenseBuild::Built(Box::new(HashJoinState {
+        build,
+        grace: None,
+        key_bounds: Some((bound(minimum), bound(maximum))),
+        batch: None,
+        batch_reserved: 0,
+        batch_row_bytes: 0,
+        row: 0,
+        match_index: 0,
+        left_values: None,
+        left_key: None,
+        left_reserved: 0,
+        prefetched: VecDeque::new(),
+        ready: VecDeque::new(),
+        probe_batches: 0,
+        probe_done: false,
+        filter_reserved: 0,
+        build_reserved: held,
+    })))
+}
+
+/// A packed integer key column.
+enum Keys<'a> {
+    Signed(&'a [i64]),
+    Unsigned(&'a [u64]),
+}
+
+impl Keys<'_> {
+    fn get(&self, row: usize) -> i128 {
+        match self {
+            Self::Signed(values) => i128::from(values[row]),
+            Self::Unsigned(values) => i128::from(values[row]),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)] // one linear build walk with the spill valve
 pub(super) fn build_hash_join_state(
     right: &mut PullOperator,
@@ -1106,6 +1366,11 @@ pub(super) fn build_hash_join_state(
     memory: &MemoryTracker,
     collation: Collation,
 ) -> Result<HashJoinState, ExecError> {
+    let mut handed_over =
+        match build_dense_directly(right, right_key, key_mode, extra_keys, probe_floor, memory)? {
+            DenseBuild::Built(state) => return Ok(*state),
+            DenseBuild::Declined(batches) => VecDeque::from(batches),
+        };
     let mut build = PartitionedBuild::with_partitions(BUILD_PARTITIONS);
     let mut grace: Option<GraceJoin> = None;
     // Bytes reserved for the resident map, measured through used()
@@ -1153,7 +1418,12 @@ pub(super) fn build_hash_join_state(
             &mut build_reserved,
             right.scan_transient_floor(),
         )?;
-        let Some(batch) = right.next_batch(memory)? else {
+        // Batches the direct dense build read before declining come first.
+        let next = match handed_over.pop_front() {
+            Some(batch) => Some(batch),
+            None => right.next_batch(memory)?,
+        };
+        let Some(batch) = next else {
             break;
         };
         let batch = compacted(batch)?;
@@ -2285,11 +2555,11 @@ fn apply_join_residual(
     residual: Option<&CompiledExpr>,
     columns: &[BoundColumn],
     left_values: &[Value],
-    matches: Option<&Vec<Vec<Value>>>,
+    matches: Option<&[Vec<Value>]>,
     first_only: bool,
 ) -> Result<Option<Vec<Vec<Value>>>, ExecError> {
     let (Some(residual), Some(matches)) = (residual, matches) else {
-        return Ok(matches.cloned());
+        return Ok(matches.map(<[_]>::to_vec));
     };
     let column_types = columns
         .iter()
@@ -2319,13 +2589,13 @@ fn apply_join_residual(
 pub(super) fn join_emit(
     kind: BoundJoinKind,
     left_values: &[Value],
-    matches: Option<&Vec<Vec<Value>>>,
+    matches: Option<&[Vec<Value>]>,
     match_index: &mut usize,
     right_width: usize,
 ) -> Result<(Option<Vec<Value>>, bool), ExecError> {
     if kind == BoundJoinKind::Scalar && matches.is_some_and(|rows| rows.len() > 1) {
         return Err(ExecError::ScalarSubqueryRows {
-            rows: matches.map_or(0, Vec::len),
+            rows: matches.map_or(0, <[_]>::len),
         });
     }
     let output = match kind {
@@ -2357,7 +2627,7 @@ pub(super) fn join_emit(
     };
     let complete = match kind {
         BoundJoinKind::Inner | BoundJoinKind::Left | BoundJoinKind::Scalar => {
-            *match_index >= matches.map_or(1, Vec::len)
+            *match_index >= matches.map_or(1, <[_]>::len)
         }
         BoundJoinKind::Semi | BoundJoinKind::Anti => true,
         BoundJoinKind::Cross => unreachable!("handled above"),
@@ -2573,7 +2843,7 @@ fn next_hash_join_existence_columns(
                 bucket: key
                     .as_ref()
                     .and_then(|key| state.build.get(key))
-                    .map_or(&[][..], Vec::as_slice),
+                    .unwrap_or(&[]),
                 tried: 0,
                 tries: FIRST_TRIES,
                 found: false,
@@ -3058,7 +3328,7 @@ fn probe_residual_chunk(
             }
             let key = probe.key(batch, current)?;
             let bucket = key.as_ref().and_then(|key| build.get(key));
-            let size = bucket.map_or(0, Vec::len);
+            let size = bucket.map_or(0, <[BuildRow]>::len);
             // A probe row keeps its bucket whole; a chunk holds at least one.
             if !groups.is_empty()
                 && (candidates.probe_rows.len() + size > SPILL_SERVE_BATCH_ROWS
@@ -3501,7 +3771,7 @@ pub(super) fn next_grace_join_batch(
             None
         };
         let matches = if residual.is_some() {
-            filtered.as_ref()
+            filtered.as_deref()
         } else {
             matches
         };
@@ -4696,7 +4966,13 @@ mod tests {
             vec![Value::Utf8("second".to_owned())],
         ];
         assert!(matches!(
-            super::join_emit(BoundJoinKind::Scalar, &left, Some(&matches), &mut 0, 1,),
+            super::join_emit(
+                BoundJoinKind::Scalar,
+                &left,
+                Some(matches.as_slice()),
+                &mut 0,
+                1,
+            ),
             Err(super::ExecError::ScalarSubqueryRows { rows: 2 })
         ));
     }
