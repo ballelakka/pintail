@@ -287,6 +287,33 @@ pub(super) enum TwoPassKeySource {
 type KeyDeclarations = [Option<(std::sync::Arc<Vec<String>>, bool)>; 2];
 type KeyMembers = [Option<std::sync::Arc<Vec<String>>>; 2];
 
+/// Two label tables rebuilt from observed ordinals, as one: every slot
+/// either batch filled. An unfilled slot is an empty string, so a filled
+/// one wins; where both filled a slot they hold the same label.
+fn merge_partial_labels(
+    held: std::sync::Arc<Vec<String>>,
+    seen: &std::sync::Arc<Vec<String>>,
+) -> std::sync::Arc<Vec<String>> {
+    let adds = seen.len() > held.len()
+        || seen
+            .iter()
+            .zip(held.iter())
+            .any(|(seen, held)| held.is_empty() && !seen.is_empty());
+    if !adds {
+        return held;
+    }
+    let mut merged = held.as_ref().clone();
+    if merged.len() < seen.len() {
+        merged.resize(seen.len(), String::new());
+    }
+    for (slot, label) in merged.iter_mut().zip(seen.iter()) {
+        if slot.is_empty() {
+            slot.clone_from(label);
+        }
+    }
+    std::sync::Arc::new(merged)
+}
+
 /// One interned text key as a value: an ENUM group key rebuilds with its
 /// declaration index and a SET key with its member bitmask, so an ORDER BY
 /// above sorts by `MySQL`'s rule; anything undeclared stays a plain string.
@@ -649,16 +676,31 @@ pub(super) fn build_streaming_two_pass_aggregate(
             break;
         };
         for (slot, key_column) in key_columns.iter().enumerate() {
+            // A complete declaration settles the slot. A table rebuilt from
+            // the ordinals one batch held does not: the next batch may hold
+            // labels this one lacked, or be the first to carry the catalog's
+            // own declaration, and a key resolved against the partial table
+            // alone would come out as plain text and sort alphabetically
+            // beside its ordinal-sorted neighbours.
+            let settled = key_set_members[slot].is_some()
+                || key_enum_labels[slot]
+                    .as_ref()
+                    .is_some_and(|(_, exhaustive)| *exhaustive);
             if let Some(column) = key_column
-                && key_enum_labels[slot].is_none()
-                && key_set_members[slot].is_none()
+                && !settled
                 && let Some(vector) = current.column(*column)
                 && let Some((crate::batch::TypedValues::Utf8(strings), _)) = vector.typed()
             {
-                key_enum_labels[slot] = strings
-                    .declared_enum_labels()
-                    .cloned()
-                    .map(|labels| (labels, strings.enum_labels_exhaustive()));
+                let exhaustive = strings.enum_labels_exhaustive();
+                match (key_enum_labels[slot].take(), strings.declared_enum_labels()) {
+                    (Some((held, _)), Some(seen)) if !exhaustive => {
+                        key_enum_labels[slot] = Some((merge_partial_labels(held, seen), false));
+                    }
+                    (_, Some(seen)) => {
+                        key_enum_labels[slot] = Some((std::sync::Arc::clone(seen), exhaustive));
+                    }
+                    (held, None) => key_enum_labels[slot] = held,
+                }
                 key_set_members[slot] = strings.declared_set_members().cloned();
             }
         }

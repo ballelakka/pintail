@@ -2511,17 +2511,17 @@ fn try_grouped_segment_fold(
                     // ordinal (the shape of #256).
                     let labels = fold.enum_labels[column].as_ref();
                     let members = fold.set_members[column].as_ref();
-                    let values = chunk
-                        .iter()
-                        .map(|row| {
-                            if labels.is_some() || members.is_some() {
-                                crate::storage::ordinal_value(row[column].clone(), labels, members)
-                            } else {
-                                row[column].clone()
-                            }
-                        })
-                        .collect();
-                    ColumnVector::new(fold.types[column], values)
+                    let values = chunk.iter().map(|row| row[column].clone()).collect();
+                    if labels.is_some() || members.is_some() {
+                        crate::storage::column_vector_from_values(
+                            fold.types[column],
+                            values,
+                            labels,
+                            members,
+                        )
+                    } else {
+                        ColumnVector::new(fold.types[column], values).map_err(ExecError::from)
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| ExecError::InvalidBatch("fold rows do not match the scan types"))?;

@@ -73,6 +73,7 @@ mod null_rejected_outer_join;
 mod null_safe_join;
 mod observation_folds;
 mod ordered_group_limit;
+mod ordinal_keys_under_writes;
 mod out_of_range_diagnostics;
 mod packed_lane_folds;
 mod packed_predicate_kernels;

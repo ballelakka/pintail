@@ -1629,16 +1629,7 @@ impl BatchStream for SnapshotStream {
                     // columnar decode path does, or a scan straddling
                     // settled segments and fresh rows mixes ordinal-ordered
                     // and text-ordered values in one sort (#256).
-                    let values = if labels.is_some() || members.is_some() {
-                        values
-                            .into_iter()
-                            .map(|value| ordinal_value(value, labels.as_ref(), members.as_ref()))
-                            .collect()
-                    } else {
-                        values
-                    };
-                    ColumnVector::new(data_type, widen_decimal_values(data_type, values))
-                        .map_err(ExecError::from)
+                    column_vector_from_values(data_type, values, labels.as_ref(), members.as_ref())
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -2900,6 +2891,74 @@ pub(crate) fn ordinal_value(
     )
 }
 
+/// Builds a scan column from row-shaped values: the memtable's rows, and
+/// the rows of a part merged across versions.
+///
+/// An ENUM or SET column is built as text carrying the catalog's
+/// declaration, exactly as a decoded segment column is. Handing over
+/// `Value::Enum` rows instead left the declaration to be rebuilt from the
+/// ordinals that batch happened to hold - a partial ENUM table, and for a
+/// SET a table of whole values indexed by bitmask - and a consumer that
+/// takes one batch's declaration for the whole scan (the grouping that
+/// interns text keys does) then ordered every key that batch lacked as
+/// plain text. A scan that streams a segment and memtable rows together
+/// hands over both kinds of batch, so both must carry the same thing.
+pub(crate) fn column_vector_from_values(
+    data_type: pintail_types::DataType,
+    values: Vec<pintail_types::Value>,
+    enum_labels: Option<&Arc<Vec<String>>>,
+    set_members: Option<&Arc<Vec<String>>>,
+) -> Result<ColumnVector, ExecError> {
+    let declared = enum_labels.is_some() || set_members.is_some();
+    if declared
+        && matches!(data_type, pintail_types::DataType::Utf8)
+        && values.iter().all(|value| {
+            matches!(
+                value,
+                pintail_types::Value::Null
+                    | pintail_types::Value::Utf8(_)
+                    | pintail_types::Value::Enum { .. }
+            )
+        })
+    {
+        fn text_of(value: &pintail_types::Value) -> Option<&str> {
+            match value {
+                pintail_types::Value::Utf8(text)
+                | pintail_types::Value::Enum { label: text, .. } => Some(text.as_str()),
+                _ => None,
+            }
+        }
+        let mut text = StrColumn::with_capacity_for_lengths(
+            values
+                .iter()
+                .map(|value| text_of(value).map_or(0, str::len)),
+        );
+        let mut validity = Vec::with_capacity(values.len());
+        for value in &values {
+            let label = text_of(value);
+            validity.push(label.is_some());
+            text.push(label.map_or(&[][..], str::as_bytes));
+        }
+        let text = text
+            .with_enum_labels(enum_labels.map(Arc::clone))
+            .with_set_members(set_members.map(Arc::clone));
+        return Ok(ColumnVector::from_typed(
+            data_type,
+            TypedValues::Utf8(text),
+            ValidityMask::from_bools(&validity),
+        ));
+    }
+    let values = if declared {
+        values
+            .into_iter()
+            .map(|value| ordinal_value(value, enum_labels, set_members))
+            .collect()
+    } else {
+        values
+    };
+    ColumnVector::new(data_type, widen_decimal_values(data_type, values)).map_err(ExecError::from)
+}
+
 /// materialize lazily only if a row-shaped consumer asks. Falls back to
 /// row values when the packed shape does not match the declared type.
 ///
@@ -2918,16 +2977,7 @@ pub(crate) fn column_vector_from_decoded(
     let storage = data_type.storage_type();
     match decoded {
         DecodedColumn::Values(values) => {
-            let values = if enum_labels.is_some() || set_members.is_some() {
-                values
-                    .into_iter()
-                    .map(|value| ordinal_value(value, enum_labels, set_members))
-                    .collect()
-            } else {
-                values
-            };
-            ColumnVector::new(data_type, widen_decimal_values(data_type, values))
-                .map_err(ExecError::from)
+            column_vector_from_values(data_type, values, enum_labels, set_members)
         }
         DecodedColumn::Int64 { values, validity }
             if matches!(storage, pintail_types::DataType::Int64) =>
