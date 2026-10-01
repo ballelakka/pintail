@@ -13,6 +13,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   or load its own certificate. It used to start without one and then accept
   plaintext connections, since the listener had nothing to refuse them with.
   With TLS optional the node still starts and serves without it.
+- The wire listener now holds the TLS requirement on its own, apart from the
+  certificate. A listener that requires TLS and has no certificate refuses to
+  run, and a plaintext login on a required-TLS listener is closed whether or
+  not a certificate is present.
 
 ## [0.1.7-rc1] - 2026-10-01
 

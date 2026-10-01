@@ -190,7 +190,7 @@ pub async fn serve(
         backend.use_default_sql_mode(&sql_mode);
         backend.client_ip = stream.peer_addr().ok().map(|peer| peer.ip().to_string());
         tokio::spawn(async move {
-            match serve_connection(stream, backend, None, DEFAULT_WIRE_IDLE_TIMEOUT).await {
+            match serve_connection(stream, backend, None, false, DEFAULT_WIRE_IDLE_TIMEOUT).await {
                 Ok(end) => log_connection_close(end),
                 Err(error) => log_connection_end(&error),
             }
@@ -325,6 +325,7 @@ where
         metadata_path,
         WireOptions {
             query_memory_limit,
+            require_tls: tls.as_ref().is_some_and(|tls| tls.required),
             tls,
             idle_timeout,
             limits: WireLimits::default(),
@@ -341,10 +342,25 @@ pub struct WireOptions {
     pub query_memory_limit: usize,
     /// TLS to offer, or require, on the listener.
     pub tls: Option<WireTls>,
+    /// Whether a client must be on TLS before it may log in.
+    ///
+    /// Held apart from [`WireOptions::tls`] on purpose. A requirement that
+    /// lives only inside the certificate disappears with the certificate, and
+    /// a listener that lost its certificate would then serve plaintext
+    /// clients it was told to refuse. With the requirement set and no
+    /// certificate the listener does not start, and a connection that reaches
+    /// the login step unencrypted is closed whatever the listener holds.
+    pub require_tls: bool,
     /// How long an authenticated connection may sit idle.
     pub idle_timeout: Duration,
     /// Connection and prepared-statement bounds.
     pub limits: WireLimits,
+}
+
+/// Whether the listener refuses plaintext logins: asked for directly, or
+/// carried by the certificate's own policy.
+fn tls_required(options: &WireOptions) -> bool {
+    options.require_tls || options.tls.as_ref().is_some_and(|tls| tls.required)
 }
 
 /// Serves clients with every listener option, including the connection and
@@ -352,7 +368,8 @@ pub struct WireOptions {
 ///
 /// # Errors
 ///
-/// Returns an error when the listener cannot accept another connection.
+/// Returns an error when the listener cannot accept another connection, or
+/// when TLS is required and the options carry no certificate to serve it with.
 pub async fn serve_until_configured<F>(
     listener: TcpListener,
     data_dir: impl Into<PathBuf>,
@@ -365,6 +382,13 @@ where
 {
     let data_dir = data_dir.into();
     let metadata_path = metadata_path.into();
+    let require_tls = tls_required(&options);
+    if require_tls && options.tls.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the wire listener requires TLS but has no certificate to serve it with",
+        ));
+    }
     let sql_mode = configured_sql_mode(std::env::var("PINTAIL_SQL_MODE").ok().as_deref())?;
     // One permit per connection, held from accept until the connection's
     // task ends, so an unauthenticated or idle session counts the same as a
@@ -402,7 +426,9 @@ where
                     // Both released with the task, whatever ends it.
                     let _permit = permit;
                     let _active = active;
-                    match serve_connection(stream, backend, tls, idle_timeout).await {
+                    let served =
+                        serve_connection(stream, backend, tls, require_tls, idle_timeout).await;
+                    match served {
                         Ok(end) => log_connection_close(end),
                         Err(error) => log_connection_end(&error),
                     }
@@ -566,6 +592,7 @@ async fn serve_connection(
     stream: TcpStream,
     backend: Backend,
     tls: Option<WireTls>,
+    require_tls: bool,
     idle_timeout: Duration,
 ) -> io::Result<ConnectionEnd> {
     // Small response packets must not wait for acknowledgements of earlier
@@ -596,7 +623,11 @@ async fn serve_connection(
         // A required-TLS listener drops a plaintext client after the
         // greeting rather than serve it unencrypted; MySQL clients report
         // the closed connection as "server requires secure transport".
-        (pintail_protocol::InitialResponse::Full(_), Some(tls)) if tls.required => {
+        //
+        // Decided by the requirement alone, never by whether a certificate
+        // is present: a listener holding the requirement and no certificate
+        // has nothing to encrypt with, and must still not log this client in.
+        (pintail_protocol::InitialResponse::Full(_), _) if require_tls => {
             Ok(ConnectionEnd::TlsRequired)
         }
         (pintail_protocol::InitialResponse::Full(response), _) => {
@@ -6332,4 +6363,105 @@ fn outer_order_by(sql: &str) -> bool {
         pintail_sql::parse_statement(sql),
         Ok(sqlparser::ast::Statement::Query(query)) if query.order_by.is_some()
     )
+}
+
+#[cfg(test)]
+mod required_tls_tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::{TcpListener, TcpStream},
+    };
+
+    use super::{Backend, ConnectionEnd, WireLimits, WireOptions, serve_connection};
+
+    /// A plaintext login for `analytics` in the 4.1 protocol: the packet a
+    /// client sends when it has not asked for TLS.
+    fn plaintext_login() -> Vec<u8> {
+        // CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH.
+        let capabilities: u32 = 0x0000_0200 | 0x0000_8000 | 0x0008_0000;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&capabilities.to_le_bytes());
+        payload.extend_from_slice(&0x0100_0000_u32.to_le_bytes());
+        payload.push(45);
+        payload.extend_from_slice(&[0; 23]);
+        payload.extend_from_slice(b"analytics\0");
+        payload.push(20);
+        payload.extend_from_slice(&[7; 20]);
+        payload.extend_from_slice(b"mysql_native_password\0");
+        let length = u32::try_from(payload.len()).expect("a short packet");
+        let mut packet = length.to_le_bytes()[..3].to_vec();
+        packet.push(1);
+        packet.extend_from_slice(&payload);
+        packet
+    }
+
+    /// The requirement holds on its own. A connection that reaches the login
+    /// step unencrypted is closed without an answer even when the listener
+    /// has no certificate at all - the state in which nothing else stood
+    /// between a plaintext client and a session.
+    #[tokio::test]
+    async fn a_required_tls_connection_without_a_certificate_never_logs_in() {
+        let directory = tempfile::tempdir().expect("wire data directory");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let backend = Backend::new(
+            directory.path(),
+            &directory.path().join("meta.db"),
+            1024,
+            WireLimits::default(),
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            serve_connection(stream, backend, None, true, Duration::from_secs(5)).await
+        });
+
+        let mut client = TcpStream::connect(address).await.expect("connect");
+        // The greeting: one packet, read whole before answering it.
+        let mut header = [0_u8; 4];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("greeting header");
+        let length =
+            usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+        let mut greeting = vec![0_u8; length];
+        client.read_exact(&mut greeting).await.expect("greeting");
+        client
+            .write_all(&plaintext_login())
+            .await
+            .expect("send the plaintext login");
+
+        let end = server.await.expect("connection task").expect("connection");
+        assert_eq!(end, ConnectionEnd::TlsRequired);
+        // Nothing follows the greeting: no OK packet, no auth exchange.
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.expect("read to close");
+        assert!(rest.is_empty(), "the server answered a plaintext login");
+    }
+
+    /// A listener told to require TLS and given no certificate cannot serve
+    /// anyone correctly, so it refuses to run rather than accept.
+    #[tokio::test]
+    async fn a_required_tls_listener_without_a_certificate_does_not_start() {
+        let directory = tempfile::tempdir().expect("wire data directory");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let outcome = super::serve_until_configured(
+            listener,
+            directory.path(),
+            directory.path().join("meta.db"),
+            WireOptions {
+                query_memory_limit: 1024,
+                tls: None,
+                require_tls: true,
+                idle_timeout: Duration::from_secs(5),
+                limits: WireLimits::default(),
+            },
+            std::future::pending(),
+        )
+        .await;
+        let error = outcome.expect_err("the listener must not start");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

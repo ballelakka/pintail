@@ -2303,6 +2303,7 @@ async fn serve_with_limits(
             pintail_wire::WireOptions {
                 query_memory_limit: pintail_wire::DEFAULT_QUERY_MEMORY_LIMIT,
                 tls: None,
+                require_tls: false,
                 idle_timeout: Duration::from_secs(30),
                 limits,
             },

@@ -193,6 +193,10 @@ async fn run() -> Result<()> {
         WireOptions {
             query_memory_limit: config.query_memory_limit_bytes(),
             tls: wire_tls,
+            // Stated on its own as well as inside the certificate policy, so
+            // the listener refuses plaintext even if it were ever handed no
+            // certificate.
+            require_tls: config.wire_require_tls(),
             idle_timeout: config.wire_idle_timeout(),
             limits: config.wire_limits(),
         },
