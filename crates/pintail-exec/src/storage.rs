@@ -1013,10 +1013,6 @@ struct PrewhereSpec {
     /// this index: rows it rejects are not decoded. The join's own key
     /// filter still tests every row, so this only narrows the decode.
     membership: Option<(usize, crate::execution::IntegerMembership)>,
-    /// Whether the scan projects a wide column. Merging nearby surviving
-    /// runs then decodes wide values for every row between them that the
-    /// predicates rejected, which costs more than the merge saves.
-    wide_projection: bool,
 }
 
 /// A join key span pushed into a scan on a column that is not the table's
@@ -1246,7 +1242,6 @@ impl SnapshotStream {
         if !is_integer_type(data_type) {
             return None;
         }
-        let wide_projection = self.types.iter().copied().any(is_wide_prewhere_type);
         let spec = self.prewhere.get_or_insert_with(|| PrewhereSpec {
             predicate_ids: Vec::new(),
             predicates: Vec::new(),
@@ -1257,7 +1252,6 @@ impl SnapshotStream {
             complete: true,
             runtime_range: None,
             membership: None,
-            wide_projection,
         });
         let index = if let Some(index) = spec.predicate_ids.iter().position(|id| *id == column_id) {
             index
@@ -2184,14 +2178,6 @@ fn build_prewhere_spec(
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
     let predicates = crate::expression::pair_column_ranges(predicates);
-    let wide_projection = scan.projected_column_ids.iter().any(|id| {
-        snapshot
-            .schema()
-            .columns()
-            .iter()
-            .find(|column| column.id() == *id)
-            .is_some_and(|column| is_wide_prewhere_type(column.data_type()))
-    });
     Some(PrewhereSpec {
         predicate_ids,
         predicates,
@@ -2202,7 +2188,6 @@ fn build_prewhere_spec(
         complete,
         runtime_range: None,
         membership: None,
-        wide_projection,
     })
 }
 
@@ -2669,17 +2654,26 @@ fn runtime_mask(
 }
 
 /// Evaluates the compiled predicates over one chunk's predicate columns and
-/// returns the surviving row ranges (coalesced), or `None` when the chunk
+/// returns the surviving row ranges exactly, or `None` when the chunk
 /// cannot or need not be restricted.
+///
+/// The ranges are the mask's own runs, never merged across rejected rows.
+/// Merging runs less than a block apart used to turn any scattered filter
+/// into near-full coverage: one row in a hundred, or one in ten, kept
+/// ranges over almost every row, the scan gave up on filter-first for the
+/// rest of the table, and every projected column was decoded, adopted and
+/// tested for every row. The store reads exact ranges a block at a time
+/// and puts only their rows in the output, so the columns the filter does
+/// not test cost their selected rows rather than all of them.
 fn prewhere_ranges(
     spec: &PrewhereSpec,
     columns: &[DecodedColumn],
     row_count: usize,
     exact_ranges: bool,
 ) -> Result<Option<pintail_store::PrewhereRanges>, String> {
-    /// Runs separated by fewer than this many rows merge, so near-adjacent
-    /// survivors decode as one block-friendly region.
-    const COALESCE_GAP: usize = 1024;
+    /// A chunk keeping at least this share of its rows (in percent)
+    /// decodes whole: the selection would save almost nothing.
+    const DENSE_PERCENT: usize = 90;
     // A join's keys that already left a few rows in the chunk decide the
     // decode alone: testing the scan's own predicates over every row costs
     // more than the Filters above testing them over the few left.
@@ -2702,9 +2696,6 @@ fn prewhere_ranges(
     };
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let mut row = 0;
-    // Whether a merge took in rows the mask rejected: such ranges still
-    // restrict the decode, but a Filter above must test their rows.
-    let mut coalesced = false;
     while row < row_count {
         if !mask.is_selected(row) {
             row += 1;
@@ -2714,17 +2705,7 @@ fn prewhere_ranges(
         while row < row_count && mask.is_selected(row) {
             row += 1;
         }
-        match ranges.last_mut() {
-            Some(last)
-                if !exact_ranges
-                    && !spec.wide_projection
-                    && start.saturating_sub(last.end) < COALESCE_GAP =>
-            {
-                last.end = row;
-                coalesced = true;
-            }
-            _ => ranges.push(start..row),
-        }
+        ranges.push(start..row);
     }
     if ranges.is_empty() {
         return Ok(Some(pintail_store::PrewhereRanges {
@@ -2732,17 +2713,13 @@ fn prewhere_ranges(
             exact: true,
         }));
     }
-    // Two-phase decode reads the predicate columns twice, so it only pays
-    // off when it skips real bytes. Scattered survivors coalesce into
-    // near-full coverage (Q5's uniform date filter regressed 2x this way);
-    // above 90% coverage, plain decode wins.
     let selected: usize = ranges.iter().map(std::iter::ExactSizeIterator::len).sum();
-    if selected.saturating_mul(10) >= row_count.saturating_mul(9) {
+    if selected.saturating_mul(100) >= row_count.saturating_mul(DENSE_PERCENT) {
         return Ok(None);
     }
     Ok(Some(pintail_store::PrewhereRanges {
         ranges,
-        exact: !coalesced && spec.complete && !spec.predicates.is_empty() && predicates_applied,
+        exact: spec.complete && !spec.predicates.is_empty() && predicates_applied,
     }))
 }
 

@@ -3375,8 +3375,16 @@ pub(crate) fn read_projected_column_ranges(
             // Block-relative intersections of the requested ranges, clamped
             // to the target block span (the last block may be shorter; row
             // loops clamp naturally).
+            // Only the ranges from the cursor on can touch this block, and
+            // they stop at the first one starting past it: a selection kept
+            // as thousands of single-row ranges must not be walked whole
+            // for every block of every column.
+            let touching = ranges[range_cursor..]
+                .iter()
+                .take_while(|range| range.start < block_limit)
+                .count();
             let block_ranges = || {
-                ranges
+                ranges[range_cursor..range_cursor + touching]
                     .iter()
                     .filter(|range| block_start < range.end && block_limit > range.start)
                     .map(|range| {

@@ -50,6 +50,7 @@ mod json_bin_collation;
 mod key_lookup_join;
 mod key_order_scan;
 mod late_materialization_cost;
+mod late_materialization_exact;
 mod left_join_top_k;
 mod legacy_utf8_collations;
 mod lenient_date_parity;
