@@ -616,6 +616,16 @@ pub(super) fn bind_scalar_function(
         "TO_DAYS" if args.len() == 1 => ScalarFunction::ToDays,
         "FROM_DAYS" if args.len() == 1 => ScalarFunction::FromDays,
         "YEARWEEK" if args.len() == 1 => ScalarFunction::YearWeek,
+        // A written mode stays an argument; only a constant one is taken.
+        "YEARWEEK"
+            if args.len() == 2
+                && matches!(
+                    args[1].kind,
+                    BoundExprKind::Literal(Value::Int64(0..=7) | Value::UInt64(0..=7))
+                ) =>
+        {
+            ScalarFunction::YearWeek
+        }
         "TIME_TO_SEC" if args.len() == 1 => ScalarFunction::TimeToSec,
         "SEC_TO_TIME" if args.len() == 1 => ScalarFunction::SecToTime,
         "ADDTIME" if args.len() == 2 => ScalarFunction::AddTime,
@@ -2368,6 +2378,24 @@ pub(super) fn bind_scalar(
             nullable: false,
             kind: BoundExprKind::Literal(Value::Boolean(
                 crate::session_parse_mode().allow_invalid_dates,
+            )),
+        });
+    }
+    // DATE_FORMAT of a date written as text reads it under the session's
+    // zero-date policy: '0000-00-00' is NULL under NO_ZERO_DATE, and a day
+    // past its month's end is a date only under ALLOW_INVALID_DATES. A TIME
+    // argument is no date, and takes the statement's date in this place.
+    if function == ScalarFunction::DateFormat
+        && !matches!(args[0].data_type, Some(DataType::Time64 { .. }))
+    {
+        let mode = crate::session_parse_mode();
+        // Signed, so it is never read as the unsigned calendar locale the
+        // planner puts before it.
+        args.push(BoundExpr {
+            data_type: Some(DataType::Int64),
+            nullable: false,
+            kind: BoundExprKind::Literal(Value::Int64(
+                i64::from(mode.no_zero_date) | (i64::from(mode.allow_invalid_dates) << 2),
             )),
         });
     }

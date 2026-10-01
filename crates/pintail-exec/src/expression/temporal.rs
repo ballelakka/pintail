@@ -12,9 +12,11 @@ use pintail_types::Value;
 use super::scalar_string;
 use crate::ExecError;
 
-/// The first two months of year zero precede its omitted leap day.
+/// `MySQL`'s weekday of a date, 0 for Monday, counted from [`calc_daynr`]
+/// so the year zero has no leap day, as in `MySQL`.
 pub(super) fn mysql_weekday(date: NaiveDate) -> u32 {
-    (date.weekday().num_days_from_monday() + u32::from(date.year() == 0 && date.month() <= 2)) % 7
+    let [year, month, day] = date_fields(date);
+    calc_weekday(calc_daynr(year, month, day), false)
 }
 
 pub(super) fn parse_mysql_datetime(value: &str) -> Result<NaiveDateTime, ExecError> {
@@ -190,40 +192,34 @@ pub(super) fn date_part(value: NaiveDateTime, part: DatePart) -> u64 {
         DatePart::DayOfWeek => u64::from((mysql_weekday(value.date()) + 1) % 7 + 1),
         // MySQL WEEKDAY: 0 = Monday .. 6 = Sunday.
         DatePart::WeekDay => u64::from(mysql_weekday(value.date())),
-        DatePart::DayOfYear => u64::from(value.ordinal()),
-        DatePart::Week => mysql_week_mode0(value.date()),
-        DatePart::IsoWeek => u64::from(value.date().iso_week().week()),
+        DatePart::DayOfYear => {
+            let [year, month, day] = date_fields(value.date());
+            u64::try_from(calc_daynr(year, month, day) - calc_daynr(year, 1, 1) + 1).unwrap_or(0)
+        }
+        DatePart::Week => u64::from(mysql_calc_week(value.date(), 0).1),
+        DatePart::IsoWeek => u64::from(mysql_calc_week(value.date(), 3).1),
         DatePart::WeekMode(mode) => u64::from(mysql_calc_week(value.date(), u32::from(mode)).1),
     }
 }
 
-/// `MySQL` `WEEK` default mode 0: Sunday-start weeks numbered 0-53. Week 1
-/// begins on the year's first Sunday; days before it are week 0, and a
-/// year that starts on Sunday starts in week 1.
-fn mysql_week_mode0(date: chrono::NaiveDate) -> u64 {
-    let january_first = date.with_ordinal(1).expect("ordinal 1 is valid");
-    let offset = u64::from(january_first.weekday().num_days_from_sunday());
-    let week = (u64::from(date.ordinal()) - 1 + offset) / 7;
-    if offset == 0 { week + 1 } else { week }
+/// A date's year, month and day as `MySQL`'s day counting reads them.
+fn date_fields(date: NaiveDate) -> [u32; 3] {
+    [
+        u32::try_from(date.year()).unwrap_or(0),
+        date.month(),
+        date.day(),
+    ]
 }
 
-/// `MySQL` `YEARWEEK` default mode 0: `year * 100 + week`, where dates in
-/// week 0 report the final week of the previous year instead.
-pub(super) fn mysql_yearweek(date: chrono::NaiveDate) -> u64 {
-    let week = mysql_week_mode0(date);
-    if week > 0 {
-        return u64::try_from(date.year()).unwrap_or(0) * 100 + week;
-    }
-    let previous_december =
-        chrono::NaiveDate::from_ymd_opt(date.year() - 1, 12, 31).expect("december 31 is valid");
-    let january_first = previous_december
-        .with_ordinal(1)
-        .expect("ordinal 1 is valid");
-    let offset = u64::from(january_first.weekday().num_days_from_sunday());
-    // Count the date as a continuation of the previous year's weeks.
-    let days = u64::from(previous_december.ordinal()) + u64::from(date.ordinal()) - 1;
-    let week = (days + offset) / 7 + u64::from(offset == 0);
-    u64::try_from(date.year() - 1).unwrap_or(0) * 100 + week
+/// `MySQL` `YEARWEEK(date, mode)`: `year * 100 + week` of the week the
+/// date falls in, counted as a week of the year that holds it, so early
+/// January can belong to the previous year's last week.
+pub(super) fn mysql_yearweek(date: NaiveDate, mode: u32) -> u64 {
+    let [year, month, day] = date_fields(date);
+    let (year, week) = calc_week_fields(year, month, day, week_mode(mode) | WEEK_YEAR);
+    // MySQL multiplies the year in 32 bits, so the year before the year
+    // zero (which wraps) wraps again here.
+    u64::from(year.wrapping_mul(100)) + u64::from(week)
 }
 
 /// Days between year 0 and the Unix epoch in `MySQL`'s `TO_DAYS` calendar.
@@ -565,65 +561,94 @@ const fn week_mode(mode: u32) -> u32 {
     }
 }
 
-const fn days_in_year(year: i32) -> i32 {
-    if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+/// `MySQL`'s `calc_week` of a date under a `WEEK()` mode, returning
+/// `(year, week)`.
+///
+/// Ported rather than approximated. The four modes disagree about both the
+/// first day of the week and whether week 1 must contain four days of the new
+/// year, and chrono's ISO week matches only mode 3. Counting from
+/// [`calc_daynr`] rather than chrono's calendar also keeps the year zero
+/// `MySQL`'s: chrono gives it a leap day, `MySQL` does not.
+fn mysql_calc_week(date: NaiveDate, mode: u32) -> (u32, u32) {
+    let [year, month, day] = date_fields(date);
+    calc_week_fields(year, month, day, week_mode(mode))
+}
+
+/// `MySQL`'s day number of a calendar written as fields (`calc_daynr`),
+/// whether or not a calendar holds it: a zero day counts as the last day
+/// of the month before, a zero month as the December before, and the year
+/// zero has no leap day. `2024-02-00` is January 31st; `0000-00-xx` is day
+/// zero.
+pub(super) fn calc_daynr(year: u32, month: u32, day: u32) -> i64 {
+    if year == 0 && month == 0 {
+        return 0;
+    }
+    let mut year = i64::from(year);
+    let month = i64::from(month);
+    let mut days = 365 * year + 31 * (month - 1) + i64::from(day);
+    if month <= 2 {
+        year -= 1;
+    } else {
+        days -= (month * 4 + 23) / 10;
+    }
+    // Division truncates toward zero, as the C it mirrors does, which is
+    // what leaves the year zero without a leap day.
+    let centuries = ((year / 100 + 1) * 3) / 4;
+    days + year / 4 - centuries
+}
+
+/// `MySQL`'s `calc_weekday`: 0 is Monday, or Sunday when `sunday_first`.
+fn calc_weekday(daynr: i64, sunday_first: bool) -> u32 {
+    u32::try_from((daynr + 5 + i64::from(sunday_first)).rem_euclid(7)).unwrap_or(0)
+}
+
+/// `MySQL`'s `calc_days_in_year`, under which the year zero is not leap.
+fn calc_days_in_year(year: u32) -> u32 {
+    if year.is_multiple_of(4)
+        && (!year.is_multiple_of(100) || (year.is_multiple_of(400) && year != 0))
+    {
         366
     } else {
         365
     }
 }
 
-/// `MySQL`'s `calc_week`, returning `(year, week)`.
-///
-/// Ported rather than approximated. The four modes disagree about both the
-/// first day of the week and whether week 1 must contain four days of the new
-/// year, and chrono's ISO week matches only mode 3 — so `%U %u %V %v` cannot
-/// be served by borrowing another library's week number. The paired year
-/// (`%X`, `%x`) is why this returns the year too: a date in early January can
-/// belong to the last week of the previous year.
-fn mysql_calc_week(date: NaiveDate, mode: u32) -> (i32, u32) {
-    let flags = week_mode(mode);
+/// `MySQL`'s `calc_week` over calendar fields and raw week flags,
+/// returning `(year, week)`, with its unsigned arithmetic kept: a date
+/// before its own year's first day (a zero month) counts a wrapped day
+/// difference, and the year before the year zero wraps too. `MySQL` prints
+/// what that arithmetic gives, so this gives the same.
+fn calc_week_fields(year: u32, month: u32, day: u32, flags: u32) -> (u32, u32) {
     let monday_first = flags & WEEK_MONDAY_FIRST != 0;
     let mut week_year = flags & WEEK_YEAR != 0;
     let first_weekday = flags & WEEK_FIRST_WEEKDAY != 0;
-
-    let daynr = date.num_days_from_ce();
-    let mut year = date.year();
-    let first = NaiveDate::from_ymd_opt(year, 1, 1).expect("january 1 is valid");
-    let mut first_daynr = first.num_days_from_ce();
-    // MySQL's `calc_weekday`: 0 is Sunday under a Sunday-first mode and
-    // Monday otherwise.
-    let mut weekday = if monday_first {
-        first.weekday().num_days_from_monday()
-    } else {
-        first.weekday().num_days_from_sunday()
-    };
-
-    if date.month() == 1 && date.day() <= 7 - weekday {
+    let daynr = calc_daynr(year, month, day);
+    let mut first_daynr = calc_daynr(year, 1, 1);
+    let mut weekday = calc_weekday(first_daynr, !monday_first);
+    let mut year = year;
+    if month == 1 && day <= 7 - weekday {
         if !week_year && ((first_weekday && weekday != 0) || (!first_weekday && weekday >= 4)) {
             return (year, 0);
         }
         week_year = true;
-        year -= 1;
-        let length = days_in_year(year);
-        first_daynr -= length;
-        weekday = (weekday + 53 * 7 - u32::try_from(length).unwrap_or(365)) % 7;
+        year = year.wrapping_sub(1);
+        let length = calc_days_in_year(year);
+        first_daynr -= i64::from(length);
+        weekday = (weekday + 53 * 7 - length) % 7;
     }
-
-    let offset = i32::try_from(weekday).unwrap_or(0);
-    let days = if (first_weekday && weekday != 0) || (!first_weekday && weekday >= 4) {
-        daynr - (first_daynr + (7 - offset))
+    let since = if (first_weekday && weekday != 0) || (!first_weekday && weekday >= 4) {
+        daynr - (first_daynr + i64::from(7 - weekday))
     } else {
-        daynr - (first_daynr - offset)
+        daynr - (first_daynr - i64::from(weekday))
     };
-
+    let days = u32::try_from(since.rem_euclid(1 << 32)).unwrap_or(0);
     if week_year && days >= 52 * 7 {
-        weekday = (weekday + u32::try_from(days_in_year(year)).unwrap_or(365)) % 7;
+        weekday = (weekday + calc_days_in_year(year)) % 7;
         if (!first_weekday && weekday < 4) || (first_weekday && weekday == 0) {
-            return (year + 1, 1);
+            return (year.wrapping_add(1), 1);
         }
     }
-    (year, u32::try_from(days / 7 + 1).unwrap_or(0))
+    (year, days / 7 + 1)
 }
 
 /// `MySQL`'s ordinal suffix for `%D`: 11th/12th/13th are the exceptions to
@@ -662,35 +687,54 @@ pub(super) fn mysql_date_format_locale(
     format: &str,
     locale: &crate::calendar_locale::CalendarLocale,
 ) -> String {
-    mysql_date_format_fields(
-        value,
-        (value.year(), value.month(), value.day()),
-        format,
-        locale,
-    )
+    let calendar = [
+        u32::try_from(value.year()).unwrap_or(0),
+        value.month(),
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+        value.and_utc().timestamp_subsec_micros(),
+    ];
+    // Only a zero month (or a zero year and month) answers NULL, and a
+    // date-time has neither.
+    mysql_date_format_calendar(calendar, format, locale).unwrap_or_default()
 }
 
-/// `DATE_FORMAT` with the year, month and day written as `fields` rather
-/// than read from `value`. A stored date a calendar rejects - February
-/// 30th - prints its own parts, while weekday and week directives read
-/// `value`, the day it counts as.
-pub(super) fn mysql_date_format_fields(
-    value: NaiveDateTime,
-    (year, month, day): (i32, u32, u32),
+/// `DATE_FORMAT` of calendar fields - year, month, day, hour, minute,
+/// second, microsecond - as `MySQL` formats a date it holds as fields
+/// rather than as a day: a stored February 30th prints its own parts, and
+/// a zero day or month prints as zero while the weekday, week and
+/// day-of-year directives count from the day [`calc_daynr`] gives it.
+/// `2024-02-00` is a Wednesday in week 5 because January 31st is.
+///
+/// `None` (SQL NULL) where `MySQL` refuses a directive: a month name of a
+/// zero month, and a weekday of a date whose year and month are both zero.
+pub(super) fn mysql_date_format_calendar(
+    [year, month, day, hour, minute, second, micros]: [u32; 7],
     format: &str,
     locale: &crate::calendar_locale::CalendarLocale,
-) -> String {
+) -> Option<String> {
     use std::fmt::Write as _;
+
+    // Digits left-padded with zeros to `width`, the padding going before a
+    // sign as `MySQL`'s does: a day of year of -5 prints `0-5`.
+    fn padded(output: &mut String, value: impl std::fmt::Display, width: usize) {
+        let text = value.to_string();
+        for _ in text.len()..width {
+            output.push('0');
+        }
+        output.push_str(&text);
+    }
 
     let mut output = String::with_capacity(format.len());
     let mut characters = format.chars();
-    let hour12 = match value.hour() % 12 {
-        0 => 12,
-        other => other,
-    };
-    let meridiem = if value.hour() < 12 { "AM" } else { "PM" };
-    // Writing into the buffer rather than building a String per directive
-    // keeps a row-loop format free of per-directive allocation.
+    let hour12 = (hour % 24 + 11) % 12 + 1;
+    let meridiem = if hour % 24 < 12 { "AM" } else { "PM" };
+    let daynr = || calc_daynr(year, month, day);
+    let weekday =
+        |sunday_first: bool| (month != 0 || year != 0).then(|| calc_weekday(daynr(), sunday_first));
+    let week = |flags: u32| calc_week_fields(year, month, day, flags);
     while let Some(character) = characters.next() {
         if character != '%' {
             output.push(character);
@@ -700,76 +744,86 @@ pub(super) fn mysql_date_format_fields(
             output.push('%');
             break;
         };
-        let written = match specifier {
-            'a' => {
-                output.push_str(locale.short_days[mysql_weekday(value.date()) as usize]);
-                Ok(())
+        match specifier {
+            'a' => output.push_str(locale.short_days[weekday(false)? as usize]),
+            'W' => output.push_str(locale.days[weekday(false)? as usize]),
+            'w' => padded(&mut output, weekday(true)?, 1),
+            'b' => output.push_str(locale.short_months[month.checked_sub(1)? as usize]),
+            'M' => output.push_str(locale.months[month.checked_sub(1)? as usize]),
+            'c' => padded(&mut output, month, 1),
+            'm' => padded(&mut output, month, 2),
+            'D' => {
+                padded(&mut output, day, 1);
+                output.push_str(ordinal_suffix(day));
             }
-            'b' => {
-                output.push_str(locale.short_months[month.saturating_sub(1) as usize]);
-                Ok(())
+            'd' => padded(&mut output, day, 2),
+            'e' => padded(&mut output, day, 1),
+            'f' => padded(&mut output, micros, 6),
+            'H' => padded(&mut output, hour, 2),
+            'h' | 'I' => padded(&mut output, hour12, 2),
+            'i' => padded(&mut output, minute, 2),
+            'j' => padded(&mut output, daynr() - calc_daynr(year, 1, 1) + 1, 3),
+            'k' => padded(&mut output, hour, 1),
+            'l' => padded(&mut output, hour12, 1),
+            'p' => output.push_str(meridiem),
+            'r' => {
+                // Writing into a String cannot fail.
+                let _ = write!(output, "{hour12:02}:{minute:02}:{second:02} {meridiem}");
             }
-            'c' => write!(output, "{month}"),
-            'D' => write!(output, "{day}{}", ordinal_suffix(day)),
-            'd' => write!(output, "{day:02}"),
-            'e' => write!(output, "{day}"),
-            'f' => write!(output, "{:06}", value.and_utc().timestamp_subsec_micros()),
-            'H' => write!(output, "{:02}", value.hour()),
-            'h' | 'I' => write!(output, "{hour12:02}"),
-            'i' => write!(output, "{:02}", value.minute()),
-            'j' => write!(output, "{:03}", value.ordinal()),
-            'k' => write!(output, "{}", value.hour()),
-            'l' => write!(output, "{hour12}"),
-            'M' => {
-                output.push_str(locale.months[month.saturating_sub(1) as usize]);
-                Ok(())
+            'S' | 's' => padded(&mut output, second, 2),
+            'T' => {
+                let _ = write!(output, "{hour:02}:{minute:02}:{second:02}");
             }
-            'm' => write!(output, "{month:02}"),
-            'p' => {
-                output.push_str(meridiem);
-                Ok(())
-            }
-            'r' => write!(
-                output,
-                "{hour12:02}:{:02}:{:02} {meridiem}",
-                value.minute(),
-                value.second()
-            ),
-            'S' | 's' => write!(output, "{:02}", value.second()),
-            'T' => write!(
-                output,
-                "{:02}:{:02}:{:02}",
-                value.hour(),
-                value.minute(),
-                value.second()
-            ),
-            'U' => write!(output, "{:02}", mysql_calc_week(value.date(), 0).1),
-            'u' => write!(output, "{:02}", mysql_calc_week(value.date(), 1).1),
-            'V' => write!(output, "{:02}", mysql_calc_week(value.date(), 2).1),
-            'v' => write!(output, "{:02}", mysql_calc_week(value.date(), 3).1),
-            'W' => {
-                output.push_str(locale.days[mysql_weekday(value.date()) as usize]);
-                Ok(())
-            }
-            'w' => write!(output, "{}", (mysql_weekday(value.date()) + 1) % 7),
-            'X' => write!(output, "{:04}", mysql_calc_week(value.date(), 2).0),
-            'x' => write!(output, "{:04}", mysql_calc_week(value.date(), 3).0),
-            'Y' => write!(output, "{year:04}"),
-            'y' => write!(output, "{:02}", year.rem_euclid(100)),
-            '%' => {
-                output.push('%');
-                Ok(())
-            }
-            other => {
-                output.push(other);
-                Ok(())
-            }
-        };
-        // Writing into a String is infallible; the Result exists only because
-        // fmt::Write is generic over sinks that can fail.
-        debug_assert!(written.is_ok(), "writing into a String cannot fail");
+            'U' => padded(&mut output, week(WEEK_FIRST_WEEKDAY).1, 2),
+            'u' => padded(&mut output, week(WEEK_MONDAY_FIRST).1, 2),
+            'V' => padded(&mut output, week(WEEK_YEAR | WEEK_FIRST_WEEKDAY).1, 2),
+            'v' => padded(&mut output, week(WEEK_YEAR | WEEK_MONDAY_FIRST).1, 2),
+            'X' => padded(&mut output, week(WEEK_YEAR | WEEK_FIRST_WEEKDAY).0, 4),
+            'x' => padded(&mut output, week(WEEK_YEAR | WEEK_MONDAY_FIRST).0, 4),
+            'Y' => padded(&mut output, year, 4),
+            'y' => padded(&mut output, year % 100, 2),
+            other => output.push(other),
+        }
     }
-    output
+    Some(output)
+}
+
+/// The calendar fields of a stored date or date-time spelled as stored:
+/// `YYYY-MM-DD` with an optional ` HH:MM:SS` and fraction, where a month
+/// or day may be zero or a day past its month's end. `None` for any other
+/// spelling.
+pub(super) fn stored_calendar(text: &str) -> Option<[u32; 7]> {
+    let bytes = text.as_bytes();
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        let digits = bytes.get(range)?;
+        digits.iter().all(u8::is_ascii_digit).then(|| {
+            digits
+                .iter()
+                .fold(0, |value, digit| value * 10 + u32::from(digit - b'0'))
+        })
+    };
+    if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let mut calendar = [number(0..4)?, number(5..7)?, number(8..10)?, 0, 0, 0, 0];
+    if bytes.len() > 10 {
+        if bytes.len() < 19 || bytes[10] != b' ' || bytes[13] != b':' || bytes[16] != b':' {
+            return None;
+        }
+        calendar[3] = number(11..13)?;
+        calendar[4] = number(14..16)?;
+        calendar[5] = number(17..19)?;
+        if bytes.len() > 19 {
+            let fraction = &bytes[20..];
+            if bytes[19] != b'.' || fraction.is_empty() || fraction.len() > 6 {
+                return None;
+            }
+            let digits = number(20..bytes.len())?;
+            calendar[6] = digits * 10_u32.pow(u32::try_from(6 - fraction.len()).ok()?);
+        }
+    }
+    let [_, month, day, hour, minute, second, _] = calendar;
+    (month <= 12 && day <= 31 && hour <= 23 && minute <= 59 && second <= 59).then_some(calendar)
 }
 
 /// The date and time `MySQL` reads from an integer given where a date is

@@ -150,6 +150,13 @@ pub(super) fn date_format_column(
     // The planner appends the session's calendar locale, which names the
     // days and months; a time argument takes a statement date as well,
     // and that is row evaluation's.
+    // Last comes the binder's zero-date policy (signed), which decides
+    // only how a date written as text reads; a packed temporal holds a
+    // real instant in every row, so no row here depends on it.
+    let args = match args {
+        [rest @ .., CompiledExpr::Literal(Value::Int64(_))] if rest.len() >= 2 => rest,
+        args => args,
+    };
     let (argument, format, locale) = match args {
         [argument, format] => (argument, format, 0),
         [
@@ -933,6 +940,24 @@ mod tests {
                         agrees_with_rows(&expression, &batch, DataType::Utf8),
                         "{format:?} in locale {locale} over {fsp:?} has a kernel"
                     );
+                    // And with the zero-date policy after it, which no
+                    // packed row depends on.
+                    for policy in [0_i64, 1, 4, 5] {
+                        let expression = scalar(
+                            ScalarFunction::DateFormat,
+                            vec![
+                                CompiledExpr::Column(0),
+                                CompiledExpr::Literal(Value::Utf8(format.to_owned())),
+                                CompiledExpr::Literal(Value::UInt64(locale)),
+                                CompiledExpr::Literal(Value::Int64(policy)),
+                            ],
+                            DataType::Utf8,
+                        );
+                        assert!(
+                            agrees_with_rows(&expression, &batch, DataType::Utf8),
+                            "{format:?} with policy {policy} over {fsp:?} has a kernel"
+                        );
+                    }
                 }
             }
             // The format has to be one constant for every row; a column in

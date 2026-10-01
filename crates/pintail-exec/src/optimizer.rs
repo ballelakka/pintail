@@ -1744,14 +1744,23 @@ fn capture_scalar_session(function: ScalarFunction, args: &mut Vec<BoundExpr>) {
         ScalarFunction::DateFormat => Some(2),
         _ => None,
     };
-    if locale_arity == Some(args.len()) {
-        args.push(BoundExpr {
-            kind: BoundExprKind::Literal(Value::UInt64(u64::from(
-                crate::calendar_locale::session_locale_id(),
-            ))),
-            data_type: Some(DataType::UInt8),
-            nullable: false,
-        });
+    // The binder leaves the session's zero-date policy after DATE_FORMAT's
+    // format (a signed literal); the locale goes before it.
+    let before_policy = function == ScalarFunction::DateFormat
+        && args.len() == 3
+        && args[2].data_type == Some(DataType::Int64);
+    if locale_arity == Some(args.len()) || before_policy {
+        let at = locale_arity.unwrap_or(args.len());
+        args.insert(
+            at,
+            BoundExpr {
+                kind: BoundExprKind::Literal(Value::UInt64(u64::from(
+                    crate::calendar_locale::session_locale_id(),
+                ))),
+                data_type: Some(DataType::UInt8),
+                nullable: false,
+            },
+        );
     }
     if function == ScalarFunction::DateFormat
         && args.len() == 3

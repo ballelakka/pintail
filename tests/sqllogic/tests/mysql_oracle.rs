@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "support/oracle_boundaries.rs"]
 mod oracle_boundaries;
+#[path = "support/oracle_calendar.rs"]
+mod oracle_calendar;
 #[path = "support/oracle_candidates.rs"]
 mod oracle_candidates;
 #[path = "support/oracle_ledger.rs"]
@@ -33,6 +35,8 @@ const DATABASE_ID: DatabaseId = DatabaseId::new(1);
 const EVENTS_ID: TableId = TableId::new(1);
 const USERS_ID: TableId = TableId::new(2);
 const ORDERS_ID: TableId = TableId::new(3);
+/// Dates no calendar holds; see `oracle_calendar`.
+const CALENDAR_ID: TableId = TableId::new(5);
 const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 /// Keep each mysql-client stdin/stdout exchange below pipe backpressure.
 /// The database instance remains shared; only the lightweight client process
@@ -40,7 +44,7 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 const FUZZ_MYSQL_BATCH_CASES: usize = 1_000;
 /// Generated parametric loops + hand-written edges + typed multi-table diversify cases.
 /// Prefer `bun run scripts/oracle-coverage.ts` over this count when judging diversity.
-const EXPECTED_CASES: usize = 1948;
+const EXPECTED_CASES: usize = 2070;
 /// orders.status declaration order - deliberately disagrees with the
 /// alphabetical order at every adjacent pair.
 const ENUM_LABELS: [&str; 5] = ["pending", "processing", "shipped", "delivered", "cancelled"];
@@ -387,6 +391,7 @@ fn run_oracle() -> Result<(), String> {
     let mysql = MysqlContainer::start()?;
     mysql.query_batch(FIXTURE_SQL)?;
     mysql.query_batch(oracle_boundaries::SQL)?;
+    mysql.query_batch(&oracle_calendar::sql())?;
 
     let events_directory =
         tempfile::tempdir().map_err(|error| format!("events tempdir: {error}"))?;
@@ -433,6 +438,17 @@ fn run_oracle() -> Result<(), String> {
     bounds
         .ingest(oracle_boundaries::rows())
         .expect("boundary rows");
+    let calendar_directory = tempfile::tempdir().expect("calendar directory");
+    let mut calendar = TableStore::open(
+        calendar_directory.path(),
+        oracle_calendar::schema(),
+        StoreOptions::default(),
+    )
+    .expect("calendar store");
+    calendar
+        .ingest(oracle_calendar::rows())
+        .expect("calendar rows");
+    let calendar_snapshot = calendar.snapshot();
     let bounds_snapshot = bounds.snapshot();
     let events_snapshot = events.snapshot();
     let users_snapshot = users.snapshot();
@@ -443,6 +459,7 @@ fn run_oracle() -> Result<(), String> {
         (DATABASE_ID, USERS_ID, &users_snapshot),
         (DATABASE_ID, ORDERS_ID, &orders_snapshot),
         (DATABASE_ID, TableId::new(4), &bounds_snapshot),
+        (DATABASE_ID, CALENDAR_ID, &calendar_snapshot),
     ])
     .map_err(|error| format!("create snapshot provider: {error}"))?;
 
@@ -1438,6 +1455,7 @@ fn oracle_cases() -> Vec<OracleCase> {
     }
     cases.extend(hand_written_cases());
     cases.extend(oracle_boundaries::cases());
+    cases.extend(oracle_calendar::cases());
     for corpus in [
         include_str!("support/oracle_reviewed_cases.json"),
         include_str!("support/oracle_seed_cases.json"),
@@ -5076,8 +5094,21 @@ fn catalog(
     .map_err(|e| e.to_string())?
     .with_key_columns([1])
     .map_err(|e| e.to_string())?;
-    let database = DatabaseEntry::new(DATABASE_ID, "app", [events, users, orders, bounds])
-        .map_err(|error| error.to_string())?;
+    let calendar = TableEntry::new(
+        CALENDAR_ID,
+        oracle_calendar::TABLE,
+        oracle_calendar::schema(),
+        TableStatistics::with_row_count(oracle_calendar::row_count()),
+    )
+    .map_err(|e| e.to_string())?
+    .with_key_columns([1])
+    .map_err(|e| e.to_string())?;
+    let database = DatabaseEntry::new(
+        DATABASE_ID,
+        "app",
+        [events, users, orders, bounds, calendar],
+    )
+    .map_err(|error| error.to_string())?;
     CatalogSnapshot::new([database]).map_err(|error| error.to_string())
 }
 

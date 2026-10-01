@@ -3667,28 +3667,46 @@ fn evaluate_eager_scalar_inner(
             ))
         }
         ScalarFunction::DateFormat => {
+            // After the format come the planner's calendar locale (unsigned)
+            // and either a TIME argument's statement date (text) or, for
+            // any other argument, the binder's zero-date policy (signed).
+            let extras = values.get(2..).unwrap_or_default();
+            let statement_date = extras.iter().find(|extra| matches!(extra, Value::Utf8(_)));
+            let policy = extras
+                .iter()
+                .find_map(|extra| match extra {
+                    Value::Int64(policy) => u64::try_from(*policy).ok(),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let source = argument_types.first().copied().flatten();
             let calendar = cast_temporal_carrier(
                 &values[0],
-                argument_types.first().copied().flatten(),
+                source,
                 DataType::DateTime64 { fsp: 6 },
-                values.get(3),
+                statement_date,
             );
             let text = scalar_string(calendar.as_ref().unwrap_or(&values[0]))?;
-            let (value, fields) = match parse_mysql_datetime(&text) {
-                Ok(value) => (value, (value.year(), value.month(), value.day())),
-                // A stored date a calendar rejects prints its own parts and
-                // counts weekdays from the day it runs into.
-                Err(error) if stored_temporal(argument_types, 0) => {
-                    let value = stored_datetime(&text).map_err(|_| error)?;
-                    let part = |range: std::ops::Range<usize>| {
-                        text.get(range)
-                            .and_then(|digits| digits.parse::<u32>().ok())
-                            .ok_or(ExecError::InvalidDateTime)
-                    };
-                    let year = i32::try_from(part(0..4)?).map_err(|_| ExecError::InvalidDateTime)?;
-                    (value, (year, part(5..7)?, part(8..10)?))
-                }
-                Err(error) => return Err(error),
+            let fields = match parse_mysql_datetime(&text) {
+                Ok(value) => [
+                    u32::try_from(value.year()).map_err(|_| ExecError::InvalidDateTime)?,
+                    value.month(),
+                    value.day(),
+                    value.hour(),
+                    value.minute(),
+                    value.second(),
+                    value.and_utc().timestamp_subsec_micros(),
+                ],
+                // MySQL formats a date it holds as fields: a stored
+                // February 30th, and a zero day or month written anywhere,
+                // print their own parts.
+                Err(error) => partial_calendar(
+                    &text,
+                    stored_temporal(argument_types, 0),
+                    calendar.is_none() && matches!(values[0], Value::Utf8(_)),
+                    policy,
+                )
+                .ok_or(error)?,
             };
             let format = scalar_string(&values[1])?;
             let locale = if values.len() > 2 {
@@ -3696,9 +3714,8 @@ fn evaluate_eager_scalar_inner(
             } else {
                 crate::calendar_locale::locale(0)
             };
-            Ok(Value::Utf8(temporal::mysql_date_format_fields(
-                value, fields, &format, locale,
-            )))
+            Ok(temporal::mysql_date_format_calendar(fields, &format, locale)
+                .map_or(Value::Null, Value::Utf8))
         }
         ScalarFunction::DateInterval { unit, subtract } => {
             let input = scalar_string(&values[0])?;
@@ -3807,6 +3824,12 @@ fn evaluate_eager_scalar_inner(
                 date[5..7]
                     .parse::<usize>()
                     .map_err(|_| ExecError::InvalidDateTime)?
+            } else if let Some([_, month, ..]) = matches!(values[0], Value::Int64(_) | Value::UInt64(_))
+                .then(|| temporal::numeric_calendar(text.parse().ok()?))
+                .flatten()
+            {
+                // A packed number keeps a zero day: 20240200 is February.
+                month as usize
             } else {
                 parse_mysql_datetime(&text)?.month() as usize
             };
@@ -3844,13 +3867,13 @@ fn evaluate_eager_scalar_inner(
             return Ok(Value::Utf8(format!("{year:04}-{month:02}-{days:02}")));
         }
         ScalarFunction::ToDays => {
-            let value = parse_mysql_datetime(&scalar_string(&values[0])?)?.date();
-            let days = value
-                .signed_duration_since(
-                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid"),
-                )
-                .num_days()
-                + TO_DAYS_EPOCH_OFFSET;
+            // MySQL's own day count, in which the year zero has no leap day.
+            let value = counted_date(values, argument_types)?;
+            let days = temporal::calc_daynr(
+                u32::try_from(value.year()).map_err(|_| ExecError::InvalidDateTime)?,
+                value.month(),
+                value.day(),
+            );
             Ok(Value::UInt64(u64::try_from(days).unwrap_or(0)))
         }
         ScalarFunction::FromDays => {
@@ -3869,8 +3892,13 @@ fn evaluate_eager_scalar_inner(
             Ok(Value::Utf8(date.format("%Y-%m-%d").to_string()))
         }
         ScalarFunction::YearWeek => {
-            let value = parse_mysql_datetime(&scalar_string(&values[0])?)?.date();
-            Ok(Value::UInt64(mysql_yearweek(value)))
+            let value = counted_date(values, argument_types)?;
+            // The binder keeps a written mode; YEARWEEK(date) is mode 0.
+            let mode = match values.get(1) {
+                Some(mode) => u32::try_from(mysql_i64(mode)?.rem_euclid(8)).unwrap_or(0),
+                None => 0,
+            };
+            Ok(Value::UInt64(mysql_yearweek(value, mode)))
         }
         ScalarFunction::TimeToSec => {
             let Some(time) = cast_mysql_time(&scalar_string(&values[0])?, 6) else {
@@ -4648,6 +4676,58 @@ fn stored_datetime(text: &str) -> Result<NaiveDateTime, ExecError> {
         None => chrono::NaiveTime::MIN,
     };
     Ok(date.and_time(time))
+}
+
+/// The date a day-counting function counts from: a stored date past its
+/// month's end counts as the day it runs into, as `MySQL` counts a stored
+/// February 30th.
+fn counted_date(
+    values: &[Value],
+    argument_types: &[Option<DataType>],
+) -> Result<chrono::NaiveDate, ExecError> {
+    let text = scalar_string(&values[0])?;
+    match parse_mysql_datetime(&text) {
+        Ok(value) => Ok(value.date()),
+        Err(error) if stored_temporal(argument_types, 0) => stored_datetime(&text)
+            .map(|value| value.date())
+            .map_err(|_| error),
+        Err(error) => Err(error),
+    }
+}
+
+/// The calendar fields of a date no calendar holds, as `MySQL` keeps them
+/// for `DATE_FORMAT`: a zero month or day in any spelling it reads as a
+/// date (`2024-02-00`, `20240200`), and a day past its month's end when
+/// stored (only `ALLOW_INVALID_DATES` could have written it) or written
+/// under `ALLOW_INVALID_DATES` (policy bit 2). A zero date written as text
+/// is refused under `NO_ZERO_DATE` (bit 0); the number zero, and a stored
+/// zero date, are not. Year, month, day, hour, minute, second and
+/// microsecond; `None` for anything else.
+fn partial_calendar(text: &str, stored: bool, written: bool, policy: u64) -> Option<[u32; 7]> {
+    let text = text.trim();
+    let calendar = temporal::stored_calendar(text).or_else(|| {
+        let parts = if text.bytes().all(|byte| byte.is_ascii_digit()) {
+            temporal::numeric_calendar(text.parse().ok()?)
+        } else {
+            temporal::loose_calendar(text)
+        };
+        parts
+            .filter(|[_, month, day, ..]| *month == 0 || *day == 0)
+            .map(|[year, month, day, hour, minute, second]| {
+                [year, month, day, hour, minute, second, 0]
+            })
+    })?;
+    let [year, month, day, ..] = calendar;
+    // Zero only when the clock is zero too: '0000-00-00 10:11:12' formats.
+    if written && policy & 1 != 0 && calendar.iter().all(|part| *part == 0) {
+        return None;
+    }
+    (stored
+        || policy & 4 != 0
+        || month == 0
+        || day == 0
+        || mysql_month_days(year, month).is_some_and(|days| day <= days))
+    .then_some(calendar)
 }
 
 fn mysql_month_days(year: u32, month: u32) -> Option<u32> {
@@ -9616,6 +9696,70 @@ mod tests {
             .expect("time");
         assert_eq!(mysql_date_format(value, "%x-%v"), "2020-53");
         assert_eq!(mysql_date_format(value, "%u"), "00");
+    }
+
+    #[test]
+    fn date_format_counts_zero_parts_from_mysql_day_numbers() {
+        // Answers read from MySQL 8.4 for stored dates with zero parts.
+        let format = |date: &str, pattern: &str| {
+            let calendar = super::temporal::stored_calendar(date).expect("fields");
+            super::temporal::mysql_date_format_calendar(
+                calendar,
+                pattern,
+                crate::calendar_locale::locale(0),
+            )
+        };
+        // 2024-02-00 is January 31st for every counted directive.
+        assert_eq!(
+            format("2024-02-00", "%x-%v %a").as_deref(),
+            Some("2024-05 Wed")
+        );
+        assert_eq!(
+            format("2024-02-00", "%Y|%a|%j").as_deref(),
+            Some("2024|Wed|031")
+        );
+        assert_eq!(
+            format("2024-02-00", "%D %e %c %b").as_deref(),
+            Some("0th 0 2 Feb")
+        );
+        // A zero month counts back into the year before, and the unsigned
+        // day difference MySQL keeps prints as it does.
+        assert_eq!(
+            format("2024-00-15", "%Y|%a|%j").as_deref(),
+            Some("2024|Fri|-16")
+        );
+        assert_eq!(
+            format("2024-00-15", "%U|%u|%V|%v|%X|%x|%w|%W").as_deref(),
+            Some("613566754|613566755|613566754|01|2024|2025|5|Friday")
+        );
+        assert_eq!(
+            format("2023-01-00", "%U|%u|%V|%v|%X|%x|%j").as_deref(),
+            Some("52|00|52|52|2022|2022|000")
+        );
+        assert_eq!(
+            format("0001-00-00", "%Y|%a|%j|%x-%v|%X-%V|%U|%u").as_deref(),
+            Some("0001|Thu|-31|0002-01|0001-613566752|613566752|613566753")
+        );
+        assert_eq!(
+            format("0000-01-00", "%Y-%m-%d|%a|%j").as_deref(),
+            Some("0000-01-00|Sat|000")
+        );
+        assert_eq!(
+            format("0000-01-03", "%U|%u|%V|%v|%X|%x|%j").as_deref(),
+            Some("01|01|01|01|0000|0000|003")
+        );
+        // Fields print as stored, a zero date included; a month name of a
+        // zero month and a weekday of a zero year and month are NULL.
+        assert_eq!(
+            format("0000-00-00 00:00:00", "%Y-%m-%d %T").as_deref(),
+            Some("0000-00-00 00:00:00")
+        );
+        assert_eq!(format("2024-00-15", "%M"), None);
+        assert_eq!(format("0000-00-05", "%a"), None);
+        assert_eq!(
+            format("2024-02-00 23:59:59.999", "%f").as_deref(),
+            Some("999000")
+        );
     }
 
     #[test]
