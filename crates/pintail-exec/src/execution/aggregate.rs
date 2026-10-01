@@ -1493,6 +1493,101 @@ impl AggregateState {
         Ok(())
     }
 
+    /// Folds `observations`, in row order, into a double SUM, AVG,
+    /// `STDDEV`/`VARIANCE` or an integer `BIT_*`, with exactly the
+    /// operations the per-row update performs one row at a time: the same
+    /// additions in the same order, so the result is the same to the bit.
+    /// `Ok(false)`, with nothing applied, for any other state.
+    ///
+    /// A non-finite running value is an overflow there as soon as it
+    /// appears; here it is caught once the batch is folded, which errors
+    /// the same query, since a non-finite double never returns to finite
+    /// by adding finite values to it or by Welford's update.
+    pub(super) fn fold_observations(
+        &mut self,
+        observations: impl Iterator<Item = f64>,
+    ) -> Result<bool, ExecError> {
+        if self.seen.is_some() {
+            return Ok(false);
+        }
+        match &mut self.value {
+            AggregateValue::Sum(sum) => {
+                let mut total = match sum.as_ref() {
+                    Some(value) => mysql_f64(value)?,
+                    None => 0.0,
+                };
+                let mut any = false;
+                for observation in observations {
+                    total += observation;
+                    any = true;
+                }
+                if any {
+                    if !total.is_finite() {
+                        return Err(ExecError::NumericOverflow);
+                    }
+                    *sum = Some(Value::float64(total));
+                }
+            }
+            AggregateValue::Average { sum, count } => {
+                let mut total = *sum;
+                let mut rows = *count;
+                for observation in observations {
+                    total += observation;
+                    rows += 1;
+                }
+                if !total.is_finite() {
+                    return Err(ExecError::NumericOverflow);
+                }
+                *sum = total;
+                *count = rows;
+            }
+            AggregateValue::Moments {
+                count, mean, m2, ..
+            } => {
+                let (mut rows, mut running_mean, mut running_m2) = (*count, *mean, *m2);
+                for observation in observations {
+                    rows += 1;
+                    #[allow(clippy::cast_precision_loss)]
+                    let n = rows as f64;
+                    let delta = observation - running_mean;
+                    running_mean += delta / n;
+                    running_m2 = delta.mul_add(observation - running_mean, running_m2);
+                }
+                if !running_mean.is_finite() || !running_m2.is_finite() {
+                    return Err(ExecError::NumericOverflow);
+                }
+                (*count, *mean, *m2) = (rows, running_mean, running_m2);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Folds integer bit patterns into a `BIT_AND`/`BIT_OR`/`BIT_XOR`, as
+    /// the per-row update does with each row's `BIGINT UNSIGNED` reading.
+    /// `Ok(false)`, with nothing applied, for any other state.
+    pub(super) fn fold_bits(
+        &mut self,
+        function: AggregateFunction,
+        bits: impl Iterator<Item = u64>,
+    ) -> bool {
+        if self.seen.is_some() {
+            return false;
+        }
+        let AggregateValue::BitFold { accumulator, seen } = &mut self.value else {
+            return false;
+        };
+        for value in bits {
+            *accumulator = match function {
+                AggregateFunction::BitAnd => *accumulator & value,
+                AggregateFunction::BitXor => *accumulator ^ value,
+                _ => *accumulator | value,
+            };
+            *seen = true;
+        }
+        true
+    }
+
     /// Packed signed SUM keeps the same checked arithmetic and NULL state.
     pub(super) fn add_dense_signed(&mut self, amount: i64) -> Result<(), ExecError> {
         match &mut self.value {

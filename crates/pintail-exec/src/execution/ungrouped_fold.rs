@@ -27,8 +27,9 @@ use super::aggregate::{
 use super::packed_fold::{FoldRows, fold_rows};
 use super::{ExecError, MemoryTracker};
 use crate::RecordBatch;
-use crate::array::ValidityMask;
+use crate::array::{StrColumn, ValidityMask};
 use crate::batch::{DecimalUnits, TypedValues};
+use crate::collation::Collation;
 
 /// Widest decimal-average widening folded as one partial total: an `i64`
 /// unit times `10^19` still fits `i128`.
@@ -164,6 +165,23 @@ fn for_valid<T: Copy>(
     }
 }
 
+/// The valid rows of `rows`' values, in row order.
+fn valid_values<'a, T: Copy>(
+    rows: &'a FoldRows<'a>,
+    values: &'a [T],
+    validity: &'a ValidityMask,
+) -> impl Iterator<Item = T> + 'a {
+    let (span, picked) = match rows {
+        FoldRows::Span(span) => (Some(span.clone()), None),
+        FoldRows::Picked(picked) => (None, Some(*picked)),
+    };
+    span.into_iter()
+        .flatten()
+        .chain(picked.into_iter().flatten().map(|row| *row as usize))
+        .filter(move |row| validity.is_valid(*row))
+        .map(move |row| values[row])
+}
+
 /// The sum of the valid rows' units and how many there were.
 fn unit_total(rows: &FoldRows<'_>, units: &[i64], validity: &ValidityMask) -> (i128, u64) {
     let mut total = 0_i128;
@@ -216,7 +234,7 @@ fn fold_column(
     memory: &MemoryTracker,
 ) -> Result<bool, ExecError> {
     if aggregate.distinct {
-        return Ok(false);
+        return fold_distinct_text(batch, rows, aggregate, state, memory);
     }
     let Some(expression) = &aggregate.expr else {
         if aggregate.function == AggregateFunction::Count {
@@ -379,6 +397,363 @@ fn fold_column(
             }
             Ok(true)
         }
+        // A double SUM or AVG adds each row's double in row order, and
+        // STDDEV/VARIANCE take Welford's step per row over the double the
+        // per-row update reads from an integer or a double: folded here in
+        // the same order with the same operations.
+        (AggregateFunction::Sum | AggregateFunction::Average, TypedValues::Float64(values))
+            if aggregate_uses_float(aggregate) =>
+        {
+            state.fold_observations(valid_values(rows, values, validity))
+        }
+        (AggregateFunction::StdDev { .. } | AggregateFunction::Variance { .. }, _) =>
+        {
+            #[allow(clippy::cast_precision_loss)]
+            match typed {
+                TypedValues::Float64(values) => {
+                    state.fold_observations(valid_values(rows, values, validity))
+                }
+                TypedValues::Int64(values) if plain_integer => state.fold_observations(
+                    valid_values(rows, values, validity).map(|value| value as f64),
+                ),
+                TypedValues::UInt64(values) if plain_integer => state.fold_observations(
+                    valid_values(rows, values, validity).map(|value| value as f64),
+                ),
+                _ => Ok(false),
+            }
+        }
+        // BIT_AND/OR/XOR read a row as BIGINT UNSIGNED: a negative signed
+        // integer by its two's-complement bits.
+        (
+            AggregateFunction::BitAnd | AggregateFunction::BitOr | AggregateFunction::BitXor,
+            TypedValues::Int64(values),
+        ) if plain_integer => Ok(state.fold_bits(
+            aggregate.function,
+            valid_values(rows, values, validity)
+                .map(|value| u64::from_ne_bytes(value.to_ne_bytes())),
+        )),
+        (
+            AggregateFunction::BitAnd | AggregateFunction::BitOr | AggregateFunction::BitXor,
+            TypedValues::UInt64(values),
+        ) if plain_integer => {
+            Ok(state.fold_bits(aggregate.function, valid_values(rows, values, validity)))
+        }
+        // MIN/MAX over text, under the aggregate's collation: the per-row
+        // update keeps the first row whose value no later row beats, which
+        // is the winner here too, and it compares that one value with the
+        // state's under the same collation.
+        (AggregateFunction::Minimum | AggregateFunction::Maximum, TypedValues::Utf8(text))
+            if text_extreme_applies(column.data_type(), aggregate) =>
+        {
+            let least = aggregate.function == AggregateFunction::Minimum;
+            let winner = text_extreme_row(rows, text, validity, aggregate.collation, least);
+            if matches!(winner, TextExtreme::Declined) {
+                return Ok(false);
+            }
+            if let TextExtreme::Row(row) = winner {
+                let value = column
+                    .value_owned(row)
+                    .ok_or(ExecError::InvalidBatch("aggregate row outside its batch"))?;
+                state.update_with_number(aggregate, &value, None, memory)?;
+            }
+            Ok(true)
+        }
         _ => Ok(false),
+    }
+}
+
+/// Whether a text MIN/MAX compares the way `text_extreme_row` does: plain
+/// text under a text collation. JSON, decimals and TIME carried as text
+/// have their own orders in the per-row comparison.
+fn text_extreme_applies(column_type: DataType, aggregate: &CompiledAggregate) -> bool {
+    column_type == DataType::Utf8
+        && aggregate.data_type == Some(DataType::Utf8)
+        && aggregate.collation != Collation::Json
+}
+
+/// The first row, per dictionary code, of the valid rows of `rows`, or
+/// `None` when a code is outside the dictionary or the dictionary is too
+/// large next to the rows for a per-code table to pay.
+fn first_row_per_code(
+    rows: &FoldRows<'_>,
+    codes: &[u32],
+    entries: usize,
+    validity: &ValidityMask,
+) -> Option<Vec<u32>> {
+    if entries > rows.len().saturating_mul(4).saturating_add(1_024) {
+        return None;
+    }
+    let mut first = vec![u32::MAX; entries];
+    let mut outside = false;
+    for_valid(rows, codes, validity, |row, code| {
+        match first.get_mut(code as usize) {
+            Some(slot) if *slot == u32::MAX => {
+                *slot = u32::try_from(row).unwrap_or(u32::MAX - 1);
+            }
+            Some(_) => {}
+            None => outside = true,
+        }
+    });
+    (!outside).then_some(first)
+}
+
+/// What a text MIN/MAX fold found over one batch's rows.
+enum TextExtreme {
+    /// Text that is not UTF-8: the per-row update reads it its own way.
+    Declined,
+    /// Every row was NULL.
+    AllNull,
+    /// The row holding the extreme.
+    Row(usize),
+}
+
+/// The row the per-row MIN (`least`) or MAX update would keep over `rows`
+/// of a text column: the first row, in row order, of the values no other
+/// value beats under `collation`.
+///
+/// A coded column compares each distinct entry present once rather than
+/// every row: among entries that tie under the collation (`'a'` and `'A'`
+/// under a case-insensitive one) the winner is the one whose first row
+/// comes first, exactly the row the per-row loop would have kept.
+fn text_extreme_row(
+    rows: &FoldRows<'_>,
+    column: &StrColumn,
+    validity: &ValidityMask,
+    collation: Collation,
+    least: bool,
+) -> TextExtreme {
+    let wins = |ordering: std::cmp::Ordering| {
+        if least {
+            ordering.is_lt()
+        } else {
+            ordering.is_gt()
+        }
+    };
+    if let Some((codes, entries)) = column.dictionary()
+        && let Some(first) = first_row_per_code(rows, codes, entries.len(), validity)
+    {
+        let mut best: Option<(usize, u32)> = None;
+        for (code, row) in first.iter().copied().enumerate() {
+            if row == u32::MAX {
+                continue;
+            }
+            best = match best {
+                None => Some((code, row)),
+                Some((best_code, best_row)) => {
+                    let ordering = super::compare_collated_text(
+                        &entries[code],
+                        &entries[best_code],
+                        collation,
+                    );
+                    if wins(ordering) || (ordering.is_eq() && row < best_row) {
+                        Some((code, row))
+                    } else {
+                        Some((best_code, best_row))
+                    }
+                }
+            };
+        }
+        return best.map_or(TextExtreme::AllNull, |(_, row)| {
+            TextExtreme::Row(row as usize)
+        });
+    }
+    let views = column.views();
+    let heap = column.heap();
+    let ascii_ranks = printable_ascii_ranks(collation);
+    let mut best: Option<(usize, String)> = None;
+    let mut invalid = false;
+    let mut visit = |row: usize| {
+        views[row].with_bytes(heap, |bytes| {
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                invalid = true;
+                return;
+            };
+            let better = match &best {
+                None => true,
+                Some((_, current)) => wins(
+                    ascii_ranks
+                        .and_then(|ranks| ranked_ascii_order(text, current, ranks))
+                        .unwrap_or_else(|| super::compare_collated_text(text, current, collation)),
+                ),
+            };
+            if better {
+                best = Some((row, text.to_owned()));
+            }
+        });
+    };
+    match rows {
+        FoldRows::Span(span) => span
+            .clone()
+            .filter(|row| validity.is_valid(*row))
+            .for_each(&mut visit),
+        FoldRows::Picked(picked) => picked
+            .iter()
+            .map(|row| *row as usize)
+            .filter(|row| validity.is_valid(*row))
+            .for_each(&mut visit),
+    }
+    if invalid {
+        return TextExtreme::Declined;
+    }
+    best.map_or(TextExtreme::AllNull, |(row, _)| TextExtreme::Row(row))
+}
+
+/// Each printable ASCII character's place in `collation`'s order, for a
+/// collation where two printable ASCII strings compare as the sequences of
+/// those places, the shorter first on a common prefix: `utf8mb4_0900_ai_ci`,
+/// which weighs every printable ASCII character with one primary weight
+/// (none is ignorable and none starts a contraction in the root order) and
+/// pads nothing. Built once from the collation's own comparison of the
+/// single characters; `None` for any other collation, or if a character
+/// turns out ignorable.
+pub(super) fn printable_ascii_ranks(collation: Collation) -> Option<&'static [u8; 128]> {
+    static AI_CI: std::sync::OnceLock<Option<[u8; 128]>> = std::sync::OnceLock::new();
+    if collation != Collation::Utf8mb40900AiCi {
+        return None;
+    }
+    AI_CI
+        .get_or_init(|| {
+            let text = |byte: u8| char::from(byte).to_string();
+            let mut printable: Vec<u8> = (0x20..0x7f).collect();
+            if printable
+                .iter()
+                .any(|byte| super::compare_collated_text(&text(*byte), "", collation).is_eq())
+            {
+                return None;
+            }
+            printable.sort_by(|left, right| {
+                super::compare_collated_text(&text(*left), &text(*right), collation)
+            });
+            let mut ranks = [0_u8; 128];
+            let mut rank = 0_u8;
+            for pair in 0..printable.len() {
+                if pair > 0
+                    && super::compare_collated_text(
+                        &text(printable[pair - 1]),
+                        &text(printable[pair]),
+                        collation,
+                    )
+                    .is_ne()
+                {
+                    rank += 1;
+                }
+                ranks[usize::from(printable[pair])] = rank;
+            }
+            Some(ranks)
+        })
+        .as_ref()
+}
+
+/// `left` against `right` by `ranks` when both are printable ASCII;
+/// `None` otherwise, for the collation's own comparison to decide.
+pub(super) fn ranked_ascii_order(
+    left: &str,
+    right: &str,
+    ranks: &[u8; 128],
+) -> Option<std::cmp::Ordering> {
+    let printable = |text: &str| text.bytes().all(|byte| (0x20..0x7f).contains(&byte));
+    if !printable(left) || !printable(right) {
+        return None;
+    }
+    for (left, right) in left.bytes().zip(right.bytes()) {
+        let ordering = ranks[usize::from(left)].cmp(&ranks[usize::from(right)]);
+        if ordering.is_ne() {
+            return Some(ordering);
+        }
+    }
+    Some(left.len().cmp(&right.len()))
+}
+
+/// `COUNT(DISTINCT text)` over a dictionary-coded column: each entry
+/// present among the valid rows enters the distinct set once per batch,
+/// through the same insert the per-row update makes, instead of once per
+/// row. `false`, with nothing applied, for every other distinct shape.
+fn fold_distinct_text(
+    batch: &RecordBatch,
+    rows: &FoldRows<'_>,
+    aggregate: &CompiledAggregate,
+    state: &mut AggregateState,
+    memory: &MemoryTracker,
+) -> Result<bool, ExecError> {
+    if aggregate.function != AggregateFunction::Count {
+        return Ok(false);
+    }
+    let Some(column) = aggregate
+        .expr
+        .as_ref()
+        .and_then(super::CompiledExpr::column_index)
+        .and_then(|column| batch.column(column))
+    else {
+        return Ok(false);
+    };
+    if column.data_type() != DataType::Utf8 {
+        return Ok(false);
+    }
+    let Some((TypedValues::Utf8(text), validity)) = column.typed() else {
+        return Ok(false);
+    };
+    let Some((codes, entries)) = text.dictionary() else {
+        return Ok(false);
+    };
+    let Some(first) = first_row_per_code(rows, codes, entries.len(), validity) else {
+        return Ok(false);
+    };
+    for row in first.into_iter().filter(|row| *row != u32::MAX) {
+        let value = column
+            .value_owned(row as usize)
+            .ok_or(ExecError::InvalidBatch("aggregate row outside its batch"))?;
+        state.update_with_number(aggregate, &value, None, memory)?;
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Collation, printable_ascii_ranks, ranked_ascii_order};
+
+    /// The rank table orders printable ASCII exactly as the collation does,
+    /// over strings drawn to collide: case pairs, punctuation, digits,
+    /// spaces inside and at the end, and shared prefixes.
+    #[test]
+    fn ascii_ranks_agree_with_the_collation() {
+        let collation = Collation::Utf8mb40900AiCi;
+        let ranks = printable_ascii_ranks(collation).expect("ranks");
+        let mut seed = 0x1234_5678_u64;
+        let mut next = || {
+            seed = crate::batch::mix64(seed);
+            seed
+        };
+        let alphabet: Vec<u8> = (0x20..0x7f).collect();
+        let draw = |next: &mut dyn FnMut() -> u64| {
+            let length = usize::try_from(next() % 7).expect("small");
+            (0..length)
+                .map(|_| {
+                    let pick = next();
+                    // Half the characters from a narrow set, so strings tie
+                    // and share prefixes often.
+                    if pick.is_multiple_of(2) {
+                        char::from(b"aAbB -_.0"[usize::try_from(pick / 2 % 9).expect("small")])
+                    } else {
+                        char::from(
+                            alphabet
+                                [usize::try_from(pick / 2 % alphabet.len() as u64).expect("small")],
+                        )
+                    }
+                })
+                .collect::<String>()
+        };
+        for _ in 0..200_000 {
+            let left = draw(&mut next);
+            let right = draw(&mut next);
+            assert_eq!(
+                ranked_ascii_order(&left, &right, ranks),
+                Some(super::super::compare_collated_text(
+                    &left, &right, collation
+                )),
+                "{left:?} vs {right:?}"
+            );
+        }
+        assert_eq!(ranked_ascii_order("é", "e", ranks), None);
+        assert!(printable_ascii_ranks(Collation::Utf8mb4Bin).is_none());
     }
 }
