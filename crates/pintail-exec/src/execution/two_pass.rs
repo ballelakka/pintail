@@ -2870,8 +2870,15 @@ fn apply_two_pass_lane(
 const DENSE_DATE_YEAR_BASE: u64 = 1900;
 /// Year ordinals run 1..=256, so 1900 through 2155.
 const DENSE_DATE_YEAR_SIDE: usize = 257;
-/// Every other supported part is under 60, so `(value + 1)` fits here.
-const DENSE_DATE_SMALL_SIDE: usize = 64;
+/// The other parts by their own bound, `(value + 1)` ids plus the NULL
+/// ordinal: month up to 12, day up to 31, hour up to 23, minute and second
+/// up to 59. One side for all of them made a YEAR/MONTH table four and a
+/// half times the slots it can use, and every partial of a window is
+/// allocated, committed and merged across all of them.
+const DENSE_DATE_MONTH_SIDE: usize = 14;
+const DENSE_DATE_DAY_SIDE: usize = 33;
+const DENSE_DATE_HOUR_SIDE: usize = 25;
+const DENSE_DATE_SIXTY_SIDE: usize = 61;
 /// Largest date-part table built. Merging walks every slot whether or not
 /// it is occupied, so the table stays small enough that walking it costs
 /// less than the buckets it replaces.
@@ -2881,9 +2888,10 @@ const DENSE_DATE_SLOT_CAP: usize = 1 << 16;
 const fn dense_date_side(part: DatePart) -> Option<usize> {
     match part {
         DatePart::Year => Some(DENSE_DATE_YEAR_SIDE),
-        DatePart::Month | DatePart::Day | DatePart::Hour | DatePart::Minute | DatePart::Second => {
-            Some(DENSE_DATE_SMALL_SIDE)
-        }
+        DatePart::Month => Some(DENSE_DATE_MONTH_SIDE),
+        DatePart::Day => Some(DENSE_DATE_DAY_SIDE),
+        DatePart::Hour => Some(DENSE_DATE_HOUR_SIDE),
+        DatePart::Minute | DatePart::Second => Some(DENSE_DATE_SIXTY_SIDE),
         _ => None,
     }
 }
