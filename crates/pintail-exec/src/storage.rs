@@ -523,53 +523,37 @@ impl ScanProvider for SnapshotScanProvider<'_> {
             }
         }
         let value_bounds = sma_column_bounds(&scan.predicates);
-        let mut streamed = if unique_keys.is_none() {
-            snapshot
-                .scan_projected_range_stream_pruned(
-                    &start,
-                    &end,
-                    &physical_column_ids,
-                    &value_bounds,
-                )
-                .map_err(|error| ExecError::Source(error.to_string()))?
+        // Every range streams unless unique-key visibility needs all of its
+        // rows at once. A range under 64K rows with memtable rows used to be
+        // materialized whole instead: every segment row's key decoded into
+        // an ordered map to pick the newest version, then every value built
+        // as a row and turned back into columns. That took about 12 ms for
+        // 20,000 rows, where the stream decodes the segment by column, masks
+        // the rows the memtable supersedes and appends the memtable's own.
+        let streamed = if unique_keys.is_none() {
+            Some(
+                snapshot
+                    .scan_projected_range_stream_unbuffered(
+                        &start,
+                        &end,
+                        &physical_column_ids,
+                        &value_bounds,
+                    )
+                    .map_err(|error| ExecError::Source(error.to_string()))?,
+            )
         } else {
             None
         };
         let mut projected = None;
         if streamed.is_none() {
-            // A small range the store would rather materialize holds its
-            // rows until the scan ends, so it may take only part of the
-            // budget: a scan that took all of it left nothing for the scan
-            // beside it or for the operator above, and a sort that spills
-            // still needs room for the row it is placing. Past that share
-            // the range streams, as a large one always does. Unique-key
-            // visibility needs every row at once, so it keeps the whole.
-            let budget = memory_limit - stream_overhead;
-            let share = if unique_keys.is_none() {
-                budget / 2
-            } else {
-                budget
-            };
             match snapshot.scan_projected_range_bounded_pruned(
                 &start,
                 &end,
                 &physical_column_ids,
-                share,
+                memory_limit - stream_overhead,
                 &value_bounds,
             ) {
                 Ok(rows) => projected = Some(rows),
-                Err(StoreError::MemoryLimitExceeded { .. }) if unique_keys.is_none() => {
-                    streamed = Some(
-                        snapshot
-                            .scan_projected_range_stream_unbuffered(
-                                &start,
-                                &end,
-                                &physical_column_ids,
-                                &value_bounds,
-                            )
-                            .map_err(|error| ExecError::Source(error.to_string()))?,
-                    );
-                }
                 Err(StoreError::MemoryLimitExceeded {
                     used, requested, ..
                 }) => {
@@ -3416,12 +3400,12 @@ mod tests {
         );
     }
 
-    /// A small table whose rows are still in the memtable is materialized
-    /// when its scan opens, and that row set used to take whatever budget the
-    /// query had left. Under a tight ceiling it took nearly all of it: the
-    /// scan beside it could not reserve its own few bytes, and a sort above
-    /// a cross join failed before it could spill. Past half the budget the
-    /// range streams instead.
+    /// A small table whose rows are still in the memtable was once
+    /// materialized when its scan opened, and that row set took whatever
+    /// budget the query had left. Under a tight ceiling it took nearly all of
+    /// it: the scan beside it could not reserve its own few bytes, and a sort
+    /// above a cross join failed before it could spill. The range streams
+    /// now, as a large one does.
     #[test]
     fn a_materialized_memtable_scan_leaves_the_query_room_to_spill() {
         fn wide_scan(plan: &crate::LogicalPlan) -> Option<crate::Scan> {
@@ -3498,23 +3482,20 @@ mod tests {
             .expect("bind query");
         let plan = Optimizer::optimize(LogicalPlanner::plan(bound));
         let scan = wide_scan(&plan).expect("the plan scans the wide table");
-        // What the wide scan holds once open with room to spare.
+        // The memtable's text alone; the open stream holds none of it, even
+        // with room to spare.
+        let text = 3000 * "a memtable row long enough to matter 1000".len();
         let held = provider
             .open_scan(&scan, usize::MAX)
             .expect("open scan")
             .retained_bytes();
-        // A budget that admits that row set and nothing opened after it:
-        // the scan streams instead and leaves the rest of the query at
-        // least half.
-        let tight = held + 16;
-        let opened = provider.open_scan(&scan, tight).expect("open scan");
         assert!(
-            opened.retained_bytes() <= tight / 2,
-            "a scan opened under {tight} bytes holds {}",
-            opened.retained_bytes()
+            held <= text / 4,
+            "a scan of {text} bytes of memtable text holds {held} once open"
         );
-        // The streamed range still answers the query, spilling the sort.
-        let values = execute_values_with_limit(sql, &catalog, &provider, held * 2);
+        // The streamed range still answers the query under a budget about
+        // the size of its rows, spilling the sort.
+        let values = execute_values_with_limit(sql, &catalog, &provider, text * 2);
         assert_eq!(values.len(), 60_000);
         assert_eq!(values[0], Value::UInt64(1));
         assert_eq!(values[59_999], Value::UInt64(3000));
@@ -4733,20 +4714,18 @@ mod tests {
         .expect("hash plan");
         let mut execution = Execution::start(physical, &provider, 64 * 1024, Collation::default())
             .expect("hash execution");
-        let batch = execution
-            .next_batch()
-            .expect("hash pull")
-            .expect("hash batch");
-        let rows = batch
-            .selection()
-            .selected_rows()
-            .map(|row| {
+        // No ORDER BY, so the row order is the join's own and moves with
+        // how its inputs arrive under this small a budget: compare the set.
+        let mut rows = Vec::new();
+        while let Some(batch) = execution.next_batch().expect("hash pull") {
+            rows.extend(batch.selection().selected_rows().map(|row| {
                 (
                     batch.column(0).expect("event").value(row).cloned(),
                     batch.column(1).expect("user").value(row).cloned(),
                 )
-            })
-            .collect::<Vec<_>>();
+            }));
+        }
+        rows.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
         assert_eq!(
             rows,
             [
