@@ -74,8 +74,10 @@ pub(super) enum LaneInput<'a> {
     Skip,
     /// COUNT(*): the slot's row count is the lane's.
     Count,
-    /// Scaled decimal units that fit 64 bits.
+    /// Signed 64-bit units: scaled decimals, integers, or temporal units.
     Units(&'a [i64], &'a ValidityMask),
+    /// COUNT of a column: the slot's rows less the rows this marks NULL.
+    Presence(&'a ValidityMask),
 }
 
 const SUM: u8 = 0;
@@ -201,6 +203,7 @@ fn keeps_total(lane: Option<PackedLane>) -> bool {
         lane,
         Some(
             PackedLane::Sum { .. }
+                | PackedLane::IntegerSum
                 | PackedLane::Average { .. }
                 | PackedLane::Minimum { .. }
                 | PackedLane::Maximum { .. }
@@ -246,7 +249,10 @@ impl PackedFold {
             .enumerate()
             .map(|(index, lane)| match lane {
                 TwoPassLane::DecimalUnits { column, .. }
-                | TwoPassLane::ExtremeDecimal { column, .. } => *column,
+                | TwoPassLane::ExtremeDecimal { column, .. }
+                | TwoPassLane::Int { column, .. }
+                | TwoPassLane::Exact { column, .. }
+                | TwoPassLane::Temporal { column, .. } => *column,
                 // Never shared: a key past any real column index.
                 _ => usize::MAX - index,
             })
@@ -340,6 +346,35 @@ impl PackedFold {
                 (None, _) => Some(LaneInput::Skip),
                 (Some(PackedLane::Count), _) => Some(LaneInput::Count),
                 (
+                    Some(PackedLane::Present),
+                    TwoPassLane::Present { column } | TwoPassLane::Int { column, .. },
+                ) => batch
+                    .column(*column)
+                    .and_then(crate::ColumnVector::typed)
+                    .map(|(_, validity)| LaneInput::Presence(validity)),
+                (Some(_), TwoPassLane::Int { column, .. } | TwoPassLane::Exact { column, .. }) => {
+                    match batch.column(*column).and_then(crate::ColumnVector::typed) {
+                        Some((TypedValues::Int64(values), validity))
+                            if values.len() >= batch.row_count() =>
+                        {
+                            Some(LaneInput::Units(values, validity))
+                        }
+                        _ => None,
+                    }
+                }
+                // Units only where the column's text is the units' own
+                // spelling; any other batch never reaches a lane.
+                (Some(_), TwoPassLane::Temporal { column, .. }) => {
+                    match batch.column(*column).and_then(crate::ColumnVector::typed) {
+                        Some((TypedValues::Temporal { units, text }, validity))
+                            if text.derived() && units.len() >= batch.row_count() =>
+                        {
+                            Some(LaneInput::Units(units, validity))
+                        }
+                        _ => None,
+                    }
+                }
+                (
                     Some(_),
                     TwoPassLane::DecimalUnits { column, .. }
                     | TwoPassLane::ExtremeDecimal { column, .. },
@@ -365,6 +400,21 @@ impl PackedFold {
         debug_assert_eq!(slots.len(), rows.len());
         for &slot in slots {
             self.counts[slot as usize] += 1;
+        }
+        for (index, input) in inputs.iter().enumerate() {
+            let LaneInput::Presence(validity) = input else {
+                continue;
+            };
+            if validity.no_nulls() {
+                continue;
+            }
+            let slot_count = self.slot_count;
+            let nulls = lane_nulls(&mut self.nulls[index], slot_count);
+            for (row, &slot) in rows.iter().zip(slots) {
+                if !validity.is_valid(row) {
+                    nulls[slot as usize] += 1;
+                }
+            }
         }
         for roles in &self.columns {
             let LaneInput::Units(values, validity) = &inputs[roles.nulls] else {
@@ -421,6 +471,13 @@ impl PackedFold {
         self.counts[slot] += 1;
         for (index, reader) in readers.iter().enumerate() {
             let lane = self.lanes[index];
+            if matches!(lane, Some(PackedLane::Present)) {
+                if reader.bits(row).is_none() {
+                    let slot_count = self.slot_count;
+                    lane_nulls(&mut self.nulls[index], slot_count)[slot] += 1;
+                }
+                continue;
+            }
             if !keeps_total(lane) || self.total_of[index] != index {
                 continue;
             }
@@ -548,6 +605,7 @@ fn filled(len: usize, value: i128) -> Vec<i128> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::two_pass::UnitText;
     use super::{FoldRows, LaneInput, PackedFold, PackedLane, merged_cell};
     use crate::array::ValidityMask;
 
@@ -557,8 +615,12 @@ mod tests {
             scale: 2,
             float_output: false,
         }),
-        Some(PackedLane::Minimum { scale: 2 }),
-        Some(PackedLane::Maximum { scale: 2 }),
+        Some(PackedLane::Minimum {
+            text: UnitText::Decimal { scale: 2 },
+        }),
+        Some(PackedLane::Maximum {
+            text: UnitText::Decimal { scale: 2 },
+        }),
     ];
 
     /// Invented column values: signed units, every seventh row NULL.

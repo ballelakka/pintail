@@ -26,6 +26,7 @@ use rayon::prelude::*;
 
 use crate::collation::Collation;
 
+use crate::expression::CompiledExpr;
 use crate::{RecordBatch, expression::mysql_f64};
 
 /// Finished-row bytes a finalizing partition gathers before charging them.
@@ -60,6 +61,50 @@ pub(super) enum TwoPassLane {
     /// MIN/MAX over a decimal column: i64 scaled units ride the lane;
     /// pass 2 compares units and formats only on replacement.
     ExtremeDecimal { column: usize, scale: u8 },
+    /// COUNT over a column no other lane carries - text, a date, a binary
+    /// string: only whether the row holds a value rides the lane.
+    Present { column: usize },
+    /// MIN/MAX over a DATE or DATETIME column: the packed units ride the
+    /// lane and pass 2 compares them, formatting only on replacement. A
+    /// batch whose column carries no units - one holding a zero date, or
+    /// text as it was written - never reaches a lane: it has no bits to
+    /// ride, and reading it here would answer its rows as NULL. Such a
+    /// batch folds row by row instead (see [`fold_odd_batch`]).
+    Temporal { column: usize, data_type: DataType },
+}
+
+/// The text a temporal unit of `data_type` spells.
+fn temporal_unit_text(units: i128, data_type: DataType) -> Option<String> {
+    let units = i64::try_from(units).ok()?;
+    match data_type {
+        DataType::Date32 => pintail_types::format_date_days(units),
+        DataType::DateTime64 { fsp } => pintail_types::format_datetime_micros(units, fsp),
+        _ => None,
+    }
+}
+
+/// The packed units of a DATE or DATETIME column whose text is the units'
+/// own canonical spelling, which is what lets a lane or a key carry the
+/// units alone and format them back.
+fn derived_temporal_units(
+    batch: &RecordBatch,
+    column: usize,
+) -> Option<(&[i64], &crate::array::ValidityMask)> {
+    let vector = batch.column(column)?;
+    if !matches!(
+        vector.data_type(),
+        DataType::Date32 | DataType::DateTime64 { .. }
+    ) {
+        return None;
+    }
+    match vector.typed()? {
+        (crate::batch::TypedValues::Temporal { units, text }, validity)
+            if text.derived() && units.len() >= batch.row_count() =>
+        {
+            Some((units.as_slice(), validity))
+        }
+        _ => None,
+    }
 }
 
 /// Whether every aggregate fits a scatter lane, and which kind. `None`
@@ -90,6 +135,7 @@ fn decimal_units_at_scale(value: &Value, scale: u8) -> Option<i128> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one arm per aggregate kind
 pub(super) fn two_pass_lanes(
     aggregates: &[CompiledAggregate],
     batch: &RecordBatch,
@@ -98,7 +144,7 @@ pub(super) fn two_pass_lanes(
         // One mask bit per lane plus the key bit.
         return None;
     }
-    aggregates
+    let lanes = aggregates
         .iter()
         .map(|aggregate| {
             if aggregate.distinct {
@@ -162,11 +208,20 @@ pub(super) fn two_pass_lanes(
                                 })
                             }
                             DataType::Decimal { .. } => Some(TwoPassLane::Float { column }),
-                            _ => None,
+                            // A COUNT reads no value, only its presence.
+                            _ => (aggregate.function == AggregateFunction::Count)
+                                .then_some(TwoPassLane::Present { column }),
                         },
                     }
                 }
                 AggregateFunction::Minimum | AggregateFunction::Maximum => {
+                    let data_type = batch.column(column)?.data_type();
+                    if matches!(data_type, DataType::Date32 | DataType::DateTime64 { .. }) {
+                        // Judged on the first batch, like every lane; a
+                        // later batch without units folds row by row.
+                        return derived_temporal_units(batch, column)
+                            .map(|_| TwoPassLane::Temporal { column, data_type });
+                    }
                     if let DataType::Decimal { scale, .. } = batch.column(column)?.data_type() {
                         return Some(TwoPassLane::ExtremeDecimal { column, scale });
                     }
@@ -215,7 +270,21 @@ pub(super) fn two_pass_lanes(
                 | AggregateFunction::JsonObjectAgg => None,
             }
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    // A presence or temporal lane does not bring a COUNT(DISTINCT) query
+    // here that was not here without it: a join report of a few groups
+    // with wide distinct sets ran out of memory on this path under a tight
+    // ceiling, where the general path it took before spills and answers.
+    let distinct = lanes
+        .iter()
+        .any(|lane| matches!(lane, TwoPassLane::Distinct { .. }));
+    let added = lanes.iter().any(|lane| {
+        matches!(
+            lane,
+            TwoPassLane::Present { .. } | TwoPassLane::Temporal { .. }
+        )
+    });
+    (!(distinct && added)).then_some(lanes)
 }
 
 /// One worker's scatter output for one partition: struct-of-arrays rows.
@@ -244,6 +313,12 @@ fn two_pass_key_bits(value: &Value) -> Option<(u64, bool)> {
 fn two_pass_key_value(bits: u64, null: bool, data_type: DataType) -> Value {
     if null {
         return Value::Null;
+    }
+    if matches!(data_type, DataType::Date32 | DataType::DateTime64 { .. }) {
+        // A temporal key's bits are its packed units; its value is the
+        // text they spell, as the key column itself would hand it out.
+        let units = i128::from(i64::from_ne_bytes(bits.to_ne_bytes()));
+        return temporal_unit_text(units, data_type).map_or(Value::Null, Value::Utf8);
     }
     match data_type.storage_type() {
         DataType::Int64 => Value::Int64(i64::from_ne_bytes(bits.to_ne_bytes())),
@@ -568,11 +643,369 @@ fn two_pass_relieve(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn build_streaming_two_pass_aggregate(
     input: &mut PullOperator,
     first: RecordBatch,
     keys: TwoPassKeySource,
+    lanes: &[TwoPassLane],
+    aggregates: &[CompiledAggregate],
+    memory: &MemoryTracker,
+    collation: Collation,
+) -> Result<MaterializedRows, ExecError> {
+    streaming_two_pass(
+        input,
+        first,
+        keys,
+        &[],
+        lanes,
+        aggregates,
+        memory,
+        collation,
+    )
+}
+
+/// The streaming two-pass with the GROUP BY expressions its key bits were
+/// derived from, so a batch the lanes cannot carry still finds its groups
+/// by evaluating them row by row.
+///
+/// An integer key source with one expression is keyed by that expression's
+/// packed units: a DATE or DATETIME column, or an expression whose kernel
+/// yields a column of units or integers, which each batch then carries as
+/// one more column at `keys`' index (see [`unit_key_type`]). A date-part
+/// source reads its parts off the temporal columns' units, and falls back
+/// to the expressions for a batch whose column carries none.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_unit_key_two_pass_aggregate(
+    input: &mut PullOperator,
+    first: RecordBatch,
+    keys: TwoPassKeySource,
+    key_exprs: &[CompiledExpr],
+    lanes: &[TwoPassLane],
+    aggregates: &[CompiledAggregate],
+    memory: &MemoryTracker,
+    collation: Collation,
+) -> Result<MaterializedRows, ExecError> {
+    streaming_two_pass(
+        input, first, keys, key_exprs, lanes, aggregates, memory, collation,
+    )
+}
+
+/// The type an expression key evaluates to, which its column kernels
+/// require; `None` for a node that declares none.
+fn key_declared_type(key: &CompiledExpr) -> Option<DataType> {
+    match key {
+        CompiledExpr::Unary { data_type, .. }
+        | CompiledExpr::Binary { data_type, .. }
+        | CompiledExpr::Scalar { data_type, .. } => *data_type,
+        _ => None,
+    }
+}
+
+/// The type of a computed key column whose packed form identifies each of
+/// its values: temporal units that spell their own text, or integers.
+fn unit_key_column_type(column: &crate::ColumnVector, rows: usize) -> Option<DataType> {
+    use crate::batch::TypedValues;
+    let data_type = column.data_type();
+    match (data_type, column.typed()?.0) {
+        (DataType::Date32 | DataType::DateTime64 { .. }, TypedValues::Temporal { units, text })
+            if text.derived() && units.len() >= rows =>
+        {
+            Some(data_type)
+        }
+        (_, TypedValues::Int64(values))
+            if data_type.storage_type() == DataType::Int64 && values.len() >= rows =>
+        {
+            Some(data_type)
+        }
+        (_, TypedValues::UInt64(values))
+            if data_type.storage_type() == DataType::UInt64 && values.len() >= rows =>
+        {
+            Some(data_type)
+        }
+        _ => None,
+    }
+}
+
+/// The key type of a GROUP BY the streaming two-pass can key by packed
+/// units, judged on the first batch: a DATE or DATETIME column, or an
+/// expression with a packed kernel over one. An integer column is not
+/// answered here; it has its own route.
+pub(super) fn unit_key_type(key: &CompiledExpr, first: &RecordBatch) -> Option<DataType> {
+    if key.has_variable_effects() {
+        return None;
+    }
+    if let Some(column) = key.column_index() {
+        derived_temporal_units(first, column)?;
+        first.column(column).map(crate::ColumnVector::data_type)
+    } else {
+        let column = key.evaluate_vector_column_quietly(first, key_declared_type(key))?;
+        unit_key_column_type(&column, first.row_count())
+    }
+}
+
+/// A batch as the lanes read it, with a computed key added as its last
+/// column. `Err` hands back a batch the lanes cannot carry - a key with no
+/// packed kernel answer for it (it raised a warning, or met a value with no
+/// units), or a temporal lane's column holding a zero date or text as it
+/// was written - which then folds row by row.
+fn laned_batch(
+    batch: RecordBatch,
+    keys: TwoPassKeySource,
+    key_exprs: &[CompiledExpr],
+    lanes: &[TwoPassLane],
+) -> Result<RecordBatch, RecordBatch> {
+    let carried = lanes.iter().all(|lane| match lane {
+        TwoPassLane::Temporal { column, .. } => derived_temporal_units(&batch, *column).is_some(),
+        _ => true,
+    });
+    if !carried {
+        return Err(batch);
+    }
+    if let TwoPassKeySource::DateParts { parts } = keys
+        && !key_exprs.is_empty()
+    {
+        // The parts are read off the column's units; a batch without them
+        // evaluates the expressions instead.
+        let units = parts.iter().flatten().all(|(_, column)| {
+            matches!(
+                batch.column(*column).and_then(crate::ColumnVector::typed),
+                Some((crate::batch::TypedValues::Temporal { .. }, _))
+            )
+        });
+        return if units { Ok(batch) } else { Err(batch) };
+    }
+    let (Some(key), TwoPassKeySource::Int { column, group_type }) = (key_exprs.first(), keys)
+    else {
+        return Ok(batch);
+    };
+    if key.column_index().is_some() {
+        return if derived_temporal_units(&batch, column).is_some() {
+            Ok(batch)
+        } else {
+            Err(batch)
+        };
+    }
+    if batch.columns().len() != column {
+        return Err(batch);
+    }
+    match key.evaluate_vector_column_quietly(&batch, key_declared_type(key)) {
+        Some(computed)
+            if unit_key_column_type(&computed, batch.row_count()) == Some(group_type) =>
+        {
+            batch.with_appended_column(computed)
+        }
+        _ => Err(batch),
+    }
+}
+
+/// The bits of a unit key's value, as the lanes would have read them from
+/// its column; `None` for a value with no units - a zero date, text that is
+/// not the canonical spelling - whose group is then kept by value.
+fn unit_key_bits(value: &Value, group_type: DataType) -> Option<(u64, bool)> {
+    let units = |units: i64| (u64::from_ne_bytes(units.to_ne_bytes()), false);
+    match (group_type, value) {
+        (_, Value::Null) => Some((0, true)),
+        (DataType::Date32, Value::Utf8(text)) => pintail_types::parse_date_days(text)
+            .filter(|days| pintail_types::format_date_days(*days).as_deref() == Some(text))
+            .map(units),
+        (DataType::DateTime64 { fsp }, Value::Utf8(text)) => {
+            pintail_types::parse_datetime_micros(text)
+                .filter(|micros| {
+                    pintail_types::format_datetime_micros(*micros, fsp).as_deref() == Some(text)
+                })
+                .map(units)
+        }
+        (DataType::Date32 | DataType::DateTime64 { .. }, _) => None,
+        _ => match (group_type.storage_type(), value) {
+            (DataType::Int64, Value::Int64(_))
+            | (DataType::UInt64, Value::UInt64(_))
+            | (DataType::Float64, Value::Float64(_))
+            | (DataType::Boolean, Value::Boolean(_)) => two_pass_key_bits(value),
+            _ => None,
+        },
+    }
+}
+
+/// Groups of a unit key whose value has no units, by normalized key.
+type OddGroups = HashMap<Vec<Value>, AggregateGroup>;
+
+/// Folds one batch row by row: a batch [`laned_batch`] handed back.
+///
+/// Every row finds its group the way the lanes key it - by the key's bits,
+/// in the partition maps, where a later flush, the dense slots and the
+/// range fold all merge into the same state - or, for a key value with no
+/// bits, in `odd` by its normalized value. Each lane with bits for the row
+/// applies them as pass 2 does; a temporal lane whose column carries no
+/// units here updates its state with the row's value instead, which is the
+/// general path's update, so a zero date takes its place in a MIN or MAX
+/// rather than reading as NULL.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn fold_odd_batch(
+    batch: &RecordBatch,
+    keys: TwoPassKeySource,
+    key_exprs: &[CompiledExpr],
+    lanes: &[TwoPassLane],
+    aggregates: &[CompiledAggregate],
+    maps: &mut [GroupKeyMap],
+    odd: &mut OddGroups,
+    mut intern: Option<&mut StringIntern>,
+    collation: Collation,
+    memory: &MemoryTracker,
+) -> Result<usize, ExecError> {
+    let partitions = maps.len();
+    // Bytes reserved for the groups kept by value, which no spill frees.
+    let mut odd_bytes = 0_usize;
+    let per_group_bytes = size_of::<(u64, bool)>()
+        .saturating_add(aggregates.len().saturating_mul(size_of::<AggregateState>()))
+        .saturating_add(size_of::<AggregateGroup>())
+        .saturating_add(HASH_ENTRY_OVERHEAD);
+    let by_value = lanes
+        .iter()
+        .map(|lane| match lane {
+            TwoPassLane::Temporal { column, .. }
+                if derived_temporal_units(batch, *column).is_none() =>
+            {
+                Some(*column)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let text_columns: &[usize] = match &keys {
+        TwoPassKeySource::Text { column } => std::slice::from_ref(column),
+        TwoPassKeySource::TextPair { first, second } => &[*first, *second],
+        TwoPassKeySource::Int { .. } | TwoPassKeySource::DateParts { .. } => &[],
+    };
+    let mut readers = Vec::with_capacity(text_columns.len());
+    for column in text_columns {
+        let intern = intern
+            .as_deref_mut()
+            .ok_or(ExecError::InvalidBatch("text keys carry an intern table"))?;
+        readers.push(string_key_reader(batch, *column, intern, memory)?);
+    }
+    for row in batch.selection().selected_rows() {
+        let key = match keys {
+            TwoPassKeySource::Int { column, group_type } => {
+                let computed = key_exprs.first().filter(|key| key.column_index().is_none());
+                let value = match computed {
+                    Some(key) => key.evaluate(batch, row)?,
+                    None => batch
+                        .column(column)
+                        .and_then(|values| values.value_owned(row))
+                        .ok_or(ExecError::InvalidBatch(
+                            "grouping row is outside the input batch",
+                        ))?,
+                };
+                let bits = if key_exprs.is_empty() {
+                    two_pass_key_bits(&value)
+                } else {
+                    unit_key_bits(&value, group_type)
+                };
+                bits.ok_or_else(|| vec![value])
+            }
+            TwoPassKeySource::Text { .. } | TwoPassKeySource::TextPair { .. } => {
+                let intern = intern
+                    .as_deref_mut()
+                    .ok_or(ExecError::InvalidBatch("text keys carry an intern table"))?;
+                let pair = readers.len() == 2;
+                let mut bits = 0_u64;
+                let mut null = false;
+                for (reader, validity) in &readers {
+                    let id = if validity.is_valid(row) {
+                        reader.read(row, intern, memory)? + u64::from(pair)
+                    } else {
+                        null = !pair;
+                        0
+                    };
+                    bits = if pair { (bits << 32) | id } else { id };
+                }
+                Ok((bits, null))
+            }
+            TwoPassKeySource::DateParts { parts }
+                if key_exprs.len() == parts.iter().flatten().count() =>
+            {
+                // Each part as its expression evaluates it, packed as the
+                // units reading packs it; a value the 20-bit id cannot hold
+                // keeps its group by value.
+                let values = key_exprs
+                    .iter()
+                    .map(|key| key.evaluate(batch, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut bits = Some(0_u64);
+                for value in &values {
+                    let id = match value {
+                        Value::Null => Some(0),
+                        Value::Int64(part) => u64::try_from(*part).ok().map(|part| part + 1),
+                        Value::UInt64(part) => part.checked_add(1),
+                        _ => None,
+                    }
+                    .filter(|id| *id <= 0xF_FFFF);
+                    bits = bits.zip(id).map(|(bits, id)| (bits << 20) | id);
+                }
+                bits.map(|bits| (bits, false)).ok_or(values)
+            }
+            TwoPassKeySource::DateParts { parts } => {
+                Ok((date_parts_key_bits(batch, row, parts)?, false))
+            }
+        };
+        let states = match key {
+            Ok((bits, null)) => {
+                let partition = usize::try_from(
+                    crate::batch::mix64(bits ^ u64::from(null)) % partitions as u64,
+                )
+                .expect("partition index fits usize");
+                match maps[partition].entry((bits, null)) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        memory.reserve(per_group_bytes)?;
+                        entry.insert(aggregates.iter().map(AggregateState::new).collect())
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                }
+            }
+            Err(values) => {
+                let normalized = values
+                    .iter()
+                    .cloned()
+                    .map(|value| normalized_group_hash_key(value, collation).unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                match odd.entry(normalized) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let bytes = per_group_bytes
+                            .saturating_add(estimated_row_payload_bytes(&values).saturating_mul(2));
+                        memory.reserve(bytes)?;
+                        odd_bytes = odd_bytes.saturating_add(bytes);
+                        &mut entry
+                            .insert(AggregateGroup {
+                                values,
+                                states: aggregates.iter().map(AggregateState::new).collect(),
+                            })
+                            .states
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        &mut entry.into_mut().states
+                    }
+                }
+            }
+        };
+        for (index, (lane, aggregate)) in lanes.iter().zip(aggregates).enumerate() {
+            if let Some(column) = by_value[index] {
+                match batch.column(column).and_then(|values| values.value(row)) {
+                    Some(Value::Null) | None => {}
+                    Some(value) => states[index].update(aggregate, value, memory)?,
+                }
+            } else if let Some(bits) = two_pass_lane_bits(batch, row, lane) {
+                apply_two_pass_lane(&mut states[index], lane, aggregate, bits, memory)?;
+            }
+        }
+    }
+    Ok(odd_bytes)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn streaming_two_pass(
+    input: &mut PullOperator,
+    first: RecordBatch,
+    keys: TwoPassKeySource,
+    key_exprs: &[CompiledExpr],
     lanes: &[TwoPassLane],
     aggregates: &[CompiledAggregate],
     memory: &MemoryTracker,
@@ -670,6 +1103,9 @@ pub(super) fn build_streaming_two_pass_aggregate(
         TwoPassKeySource::TextPair { first, second } => [Some(first), Some(second)],
         TwoPassKeySource::Int { .. } | TwoPassKeySource::DateParts { .. } => [None, None],
     };
+    let mut odd = OddGroups::new();
+    let mut odd_reserved = 0_usize;
+    let mut odd_batches = 0_usize;
     let mut batch = Some(first);
     loop {
         let Some(current) = batch.take() else {
@@ -704,6 +1140,56 @@ pub(super) fn build_streaming_two_pass_aggregate(
                 key_set_members[slot] = strings.declared_set_members().cloned();
             }
         }
+        let current = match laned_batch(current, keys, key_exprs, lanes) {
+            Ok(current) => current,
+            Err(current) => {
+                // No lane can carry this batch: its rows go straight to
+                // their groups. Relief first, as before any flush, so the
+                // groups it adds do not meet a full budget.
+                two_pass_relieve(
+                    &mut TwoPassState {
+                        maps: &mut maps,
+                        dense: &mut dense,
+                        range: &mut range,
+                        pool: &mut dense_pool,
+                        group_reserved: &mut group_reserved,
+                        spill_runs: &mut spill_runs,
+                    },
+                    keys,
+                    aggregates,
+                    partitions,
+                    intern.as_ref(),
+                    &key_enum_labels,
+                    &key_set_members,
+                    collation,
+                    memory,
+                )?;
+                let used_before = memory.used();
+                let kept = fold_odd_batch(
+                    &current,
+                    keys,
+                    key_exprs,
+                    lanes,
+                    aggregates,
+                    &mut maps,
+                    &mut odd,
+                    intern.as_mut(),
+                    collation,
+                    memory,
+                );
+                // Whatever was reserved is held whether or not the fold
+                // finished: the map entries and what their states grew by
+                // belong to the maps, the rest to the groups kept by value.
+                let grown = memory.used().saturating_sub(used_before);
+                let kept_bytes = *kept.as_ref().unwrap_or(&0);
+                odd_reserved = odd_reserved.saturating_add(kept_bytes);
+                group_reserved = group_reserved.saturating_add(grown.saturating_sub(kept_bytes));
+                kept?;
+                odd_batches += 1;
+                batch = input.next_batch(memory)?;
+                continue;
+            }
+        };
         // String sources prepare their (tiny, per-distinct-value) dictionary
         // translations serially, then scatter rows in parallel from the
         // read-only tables; batches whose strings decoded without codes
@@ -1096,9 +1582,16 @@ pub(super) fn build_streaming_two_pass_aggregate(
             &mut group_reserved,
         )?;
     }
+    if odd_batches > 0 {
+        // Otherwise invisible: the answer is the same, only slower.
+        super::ProfileNote::of(input).set(&format!(
+            "two-pass: {odd_batches} batches without packed units folded row by row"
+        ));
+    }
     if let IntRange::Active(active) = std::mem::replace(&mut range, IntRange::Off) {
         if let TwoPassKeySource::Int { group_type, .. } = keys
             && spill_runs.is_empty()
+            && odd.is_empty()
             && maps.iter().all(HashMap::is_empty)
         {
             // Every group is in the range fold: finish them straight from
@@ -1132,15 +1625,17 @@ pub(super) fn build_streaming_two_pass_aggregate(
     if std::env::var_os("PINTAIL_AGG_DEBUG").is_some() {
         let groups: usize = maps.iter().map(HashMap::len).sum();
         eprintln!(
-            "[agg] streaming two-pass: {groups} groups, {} flushes, {} spill runs",
+            "[agg] streaming two-pass: {groups} groups, {} flushes, {} spill runs, \
+             {odd_batches} batches row by row, {} groups kept by value",
             flushes + 1,
-            spill_runs.len()
+            spill_runs.len(),
+            odd.len()
         );
     }
     if !spill_runs.is_empty() {
         // Groups went to disk along the way: the remainder joins them and
         // the shared merge combines each group once, in run order.
-        let resident = two_pass_groups_map(
+        let mut resident = two_pass_groups_map(
             &mut maps,
             keys,
             intern.as_ref(),
@@ -1148,7 +1643,10 @@ pub(super) fn build_streaming_two_pass_aggregate(
             &key_set_members,
             collation,
         );
+        // A key kept by value has no bits, so no run holds its group.
+        resident.extend(odd);
         memory.release(group_reserved);
+        memory.release(odd_reserved);
         return merge_spilled_aggregate_groups(spill_runs, resident, memory);
     }
 
@@ -1191,10 +1689,20 @@ pub(super) fn build_streaming_two_pass_aggregate(
         })
         .collect::<Result<Vec<_>, _>>();
     memory.release(group_reserved);
+    memory.release(odd_reserved);
     let finalized = finalized?;
     let mut rows = Vec::new();
     for (partition_rows, _) in finalized {
         rows.extend(partition_rows);
+    }
+    for (_, group) in odd {
+        let mut row = group.values;
+        row.reserve(group.states.len());
+        for state in group.states {
+            row.push(state.finish(memory)?);
+        }
+        memory.reserve(estimated_row_payload_bytes(&row))?;
+        rows.push(row);
     }
     Ok(MaterializedRows {
         rows,
@@ -1227,7 +1735,8 @@ fn two_pass_scatter_batch(
         Some((crate::batch::TypedValues::UInt64(values), validity)) => {
             Some((PackedInts::Unsigned(values.as_slice()), validity))
         }
-        _ => None,
+        _ => derived_temporal_units(batch, group_column)
+            .map(|(units, validity)| (PackedInts::Signed(units), validity)),
     };
     if let Some((values, validity)) = packed_key {
         for row in morsel.selected_rows() {
@@ -1496,34 +2005,45 @@ fn two_pass_scatter_date_parts(
     let batch = morsel.batch;
     let readers = lane_readers(batch, lanes);
     for row in morsel.selected_rows() {
-        let mut key_bits = 0_u64;
-        for (part, column) in parts.iter().flatten() {
-            let id = match crate::expression::evaluate_units_date_part(batch, *column, row, *part) {
-                // Ids are 20-bit lane slots (value + 1, 0 = NULL); a value
-                // the lane cannot carry - negative, or past the mask - must
-                // refuse rather than collide with a real slot.
-                Some(Ok(Value::Int64(value))) => match u64::try_from(value) {
-                    Ok(value) if value < 0xF_FFFF => value + 1,
-                    _ => {
-                        return Err(ExecError::InvalidBatch(
-                            "date-part group key does not fit its 20-bit lane",
-                        ));
-                    }
-                },
-                Some(Ok(Value::Null)) => 0,
-                Some(Err(error)) => return Err(error),
-                _ => {
-                    return Err(ExecError::InvalidBatch(
-                        "date-part group key column lost its packed units",
-                    ));
-                }
-            };
-            debug_assert!(id < 1 << 20, "date part value fits 20 bits");
-            key_bits = (key_bits << 20) | id;
-        }
+        let key_bits = date_parts_key_bits(batch, row, parts)?;
         scatter_two_pass_row(&readers, row, key_bits, false, partitions, buckets);
     }
     Ok(())
+}
+
+/// One row's date-part key: each part's `(value + 1)` in 20 bits, 0 for a
+/// NULL part.
+fn date_parts_key_bits(
+    batch: &RecordBatch,
+    row: usize,
+    parts: [Option<(DatePart, usize)>; 2],
+) -> Result<u64, ExecError> {
+    let mut key_bits = 0_u64;
+    for (part, column) in parts.iter().flatten() {
+        let id = match crate::expression::evaluate_units_date_part(batch, *column, row, *part) {
+            // Ids are 20-bit lane slots (value + 1, 0 = NULL); a value
+            // the lane cannot carry - negative, or past the mask - must
+            // refuse rather than collide with a real slot.
+            Some(Ok(Value::Int64(value))) => match u64::try_from(value) {
+                Ok(value) if value < 0xF_FFFF => value + 1,
+                _ => {
+                    return Err(ExecError::InvalidBatch(
+                        "date-part group key does not fit its 20-bit lane",
+                    ));
+                }
+            },
+            Some(Ok(Value::Null)) => 0,
+            Some(Err(error)) => return Err(error),
+            _ => {
+                return Err(ExecError::InvalidBatch(
+                    "date-part group key column lost its packed units",
+                ));
+            }
+        };
+        debug_assert!(id < 1 << 20, "date part value fits 20 bits");
+        key_bits = (key_bits << 20) | id;
+    }
+    Ok(key_bits)
 }
 
 #[inline]
@@ -1572,6 +2092,20 @@ fn two_pass_lane_bits(batch: &RecordBatch, row: usize, lane: &TwoPassLane) -> Op
                 .and_then(|units| i64::try_from(units).ok())
                 .map(|units| u64::from_ne_bytes(units.to_ne_bytes()))
         }
+        TwoPassLane::Present { column } => {
+            let vector = batch.column(*column)?;
+            let present = match vector.typed() {
+                Some((_, validity)) => validity.is_valid(row),
+                None => !matches!(vector.value(row), Some(Value::Null) | None),
+            };
+            present.then_some(0)
+        }
+        TwoPassLane::Temporal { column, .. } => {
+            let (units, validity) = derived_temporal_units(batch, *column)?;
+            validity
+                .is_valid(row)
+                .then(|| u64::from_ne_bytes(units[row].to_ne_bytes()))
+        }
         TwoPassLane::Int { column, .. }
         | TwoPassLane::Exact { column, .. }
         | TwoPassLane::Distinct { column, .. } => {
@@ -1618,6 +2152,8 @@ pub(super) enum LaneReader<'a> {
     ),
     Int64(&'a [i64], &'a crate::array::ValidityMask),
     UInt64(&'a [u64], &'a crate::array::ValidityMask),
+    /// Whether the row holds a value, for a COUNT of a column.
+    Presence(&'a crate::array::ValidityMask),
     /// Any other representation takes the per-row reader.
     Row(&'a RecordBatch, &'a TwoPassLane),
 }
@@ -1638,6 +2174,7 @@ impl LaneReader<'_> {
                 .is_valid(row)
                 .then(|| u64::from_ne_bytes(values[row].to_ne_bytes())),
             Self::UInt64(values, validity) => validity.is_valid(row).then(|| values[row]),
+            Self::Presence(validity) => validity.is_valid(row).then_some(0),
             Self::Row(batch, lane) => two_pass_lane_bits(batch, row, lane),
         }
     }
@@ -1673,6 +2210,16 @@ fn lane_readers<'a>(batch: &'a RecordBatch, lanes: &'a [TwoPassLane]) -> Vec<Lan
                     }
                     _ => LaneReader::Row(batch, lane),
                 },
+                TwoPassLane::Present { column } => match typed(*column) {
+                    Some((_, validity)) => LaneReader::Presence(validity),
+                    None => LaneReader::Row(batch, lane),
+                },
+                TwoPassLane::Temporal { column, .. } => {
+                    match derived_temporal_units(batch, *column) {
+                        Some((units, validity)) => LaneReader::Int64(units, validity),
+                        None => LaneReader::Row(batch, lane),
+                    }
+                }
                 TwoPassLane::Float { .. } => LaneReader::Row(batch, lane),
             }
         })
@@ -1814,10 +2361,10 @@ fn drain_two_pass_window(
         )?;
     }
     if let TwoPassKeySource::Int { column, group_type } = keys
-        && matches!(
+        && (matches!(
             group_type.storage_type(),
             DataType::Int64 | DataType::UInt64
-        )
+        ) || matches!(group_type, DataType::Date32 | DataType::DateTime64 { .. }))
         && fold_int_range_window(
             window,
             column,
@@ -2013,7 +2560,10 @@ fn int_key_column(
         {
             Some((PackedInts::Unsigned(values.as_slice()), validity))
         }
-        _ => None,
+        // A DATE or DATETIME key: its units are the key, a day number or a
+        // microsecond count, and as dense as the days the rows cover.
+        _ => derived_temporal_units(batch, column)
+            .map(|(units, validity)| (PackedInts::Signed(units), validity)),
     }
 }
 
@@ -2699,21 +3249,38 @@ fn fold_int_range_window(
 #[derive(Clone, Copy)]
 pub(super) enum PackedLane {
     Count,
+    /// COUNT of a column: the slot's rows less the column's NULLs.
+    Present,
     Sum {
         scale: u8,
         float_output: bool,
     },
+    /// SUM of a signed integer column answered as a signed integer.
+    IntegerSum,
     Average {
         /// Places between the input scale and the result scale.
         digits: u8,
         result_scale: u8,
     },
     Minimum {
-        scale: u8,
+        text: UnitText,
     },
     Maximum {
+        text: UnitText,
+    },
+}
+
+/// What a packed extreme's units are, which is how the retained value is
+/// built from them once a group's extreme is known.
+#[derive(Clone, Copy)]
+pub(super) enum UnitText {
+    Decimal {
         scale: u8,
     },
+    /// A DATE's day number or a DATETIME's microseconds.
+    Temporal(DataType),
+    /// A signed integer, retained as the integer it is.
+    Integer,
 }
 
 /// Largest rescale a packed average takes: an `i64` unit times `10^19`
@@ -2741,15 +3308,57 @@ fn packed_lane(lane: &TwoPassLane, aggregate: &CompiledAggregate) -> Option<Pack
                     result_scale,
                 }),
         },
-        TwoPassLane::ExtremeDecimal { scale, .. } => match aggregate.function {
-            AggregateFunction::Minimum => Some(PackedLane::Minimum { scale }),
-            AggregateFunction::Maximum => Some(PackedLane::Maximum { scale }),
+        TwoPassLane::ExtremeDecimal { scale, .. } => {
+            packed_extreme(aggregate, UnitText::Decimal { scale })
+        }
+        TwoPassLane::Present { .. } => Some(PackedLane::Present),
+        TwoPassLane::Temporal { data_type, .. } => {
+            packed_extreme(aggregate, UnitText::Temporal(data_type))
+        }
+        // A signed integer column's SUM and AVG are exact decimal totals of
+        // its values, and its MIN and MAX compare the values themselves:
+        // all three reduce to one total per group, as a decimal column's
+        // do. The unsigned reading and the bit folds keep the per-row lane.
+        TwoPassLane::Int {
+            data_type: DataType::Int64,
+            ..
+        } if !aggregate.distinct => match (aggregate.function, aggregate.data_type) {
+            (AggregateFunction::Count, _) => Some(PackedLane::Present),
+            (AggregateFunction::Sum, Some(DataType::Decimal { scale: 0, .. })) => {
+                Some(PackedLane::Sum {
+                    scale: 0,
+                    float_output: false,
+                })
+            }
+            // A sum the plan types as an integer is refused when it leaves
+            // the type. Row by row that is wherever the running sum first
+            // leaves it, which depends on the order the rows arrive in;
+            // here it is whether the group's exact total fits.
+            (AggregateFunction::Sum, Some(DataType::Int64)) => Some(PackedLane::IntegerSum),
+            (AggregateFunction::Average, _) => decimal_average_scale(aggregate)
+                .filter(|digits| *digits <= PACKED_AVERAGE_MAX_DIGITS)
+                .map(|result_scale| PackedLane::Average {
+                    digits: result_scale,
+                    result_scale,
+                }),
             _ => None,
         },
+        TwoPassLane::Exact {
+            data_type: DataType::Int64,
+            ..
+        } => packed_extreme(aggregate, UnitText::Integer),
         TwoPassLane::Float { .. }
         | TwoPassLane::Int { .. }
         | TwoPassLane::Exact { .. }
         | TwoPassLane::Distinct { .. } => None,
+    }
+}
+
+fn packed_extreme(aggregate: &CompiledAggregate, text: UnitText) -> Option<PackedLane> {
+    match aggregate.function {
+        AggregateFunction::Minimum => Some(PackedLane::Minimum { text }),
+        AggregateFunction::Maximum => Some(PackedLane::Maximum { text }),
+        _ => None,
     }
 }
 
@@ -2767,8 +3376,8 @@ impl PackedCell {
     fn add(&mut self, lane: PackedLane, bits: u64) -> Result<(), ExecError> {
         let units = i128::from(i64::from_ne_bytes(bits.to_ne_bytes()));
         match lane {
-            PackedLane::Count => {}
-            PackedLane::Sum { .. } | PackedLane::Average { .. } => {
+            PackedLane::Count | PackedLane::Present => {}
+            PackedLane::Sum { .. } | PackedLane::IntegerSum | PackedLane::Average { .. } => {
                 self.total = self
                     .total
                     .checked_add(units)
@@ -2802,23 +3411,47 @@ impl PackedCell {
             return Ok(());
         }
         match lane {
-            PackedLane::Count => state.add_dense_count(self.rows),
+            PackedLane::Count | PackedLane::Present => state.add_dense_count(self.rows),
             PackedLane::Sum {
                 scale,
                 float_output,
             } => state.update_decimal_sum_units(self.total, scale, float_output),
+            PackedLane::IntegerSum => state.add_dense_signed(
+                i64::try_from(self.total).map_err(|_| ExecError::NumericOverflow)?,
+            ),
             PackedLane::Average {
                 digits,
                 result_scale,
             } => state.add_decimal_average_partial(self.total, digits, result_scale, self.rows),
-            PackedLane::Minimum { scale } | PackedLane::Maximum { scale } => {
+            PackedLane::Minimum { text } | PackedLane::Maximum { text } => {
                 let units = self.total;
-                state.update_extreme_units(
-                    aggregate,
-                    units,
-                    || Some(pintail_types::format_decimal_scaled(units, scale)),
-                    memory,
-                )
+                match text {
+                    UnitText::Decimal { scale } => state.update_extreme_units(
+                        aggregate,
+                        units,
+                        || Some(pintail_types::format_decimal_scaled(units, scale)),
+                        memory,
+                    ),
+                    UnitText::Temporal(data_type) => state.update_extreme_units(
+                        aggregate,
+                        units,
+                        || temporal_unit_text(units, data_type),
+                        memory,
+                    ),
+                    UnitText::Integer => {
+                        // What the per-row lane hands the state: the value
+                        // and its double as the comparison hint.
+                        let value = i64::try_from(units).map_err(|_| ExecError::NumericOverflow)?;
+                        #[allow(clippy::cast_precision_loss)]
+                        let number = value as f64;
+                        state.update_with_number(
+                            aggregate,
+                            &Value::Int64(value),
+                            Some(number),
+                            memory,
+                        )
+                    }
+                }
             }
         }
     }
@@ -2835,7 +3468,18 @@ fn apply_two_pass_lane(
     memory: &MemoryTracker,
 ) -> Result<(), ExecError> {
     match lane {
-        TwoPassLane::CountStar => state.update(aggregate, &Value::UInt64(1), memory),
+        TwoPassLane::CountStar | TwoPassLane::Present { .. } => {
+            state.update(aggregate, &Value::UInt64(1), memory)
+        }
+        TwoPassLane::Temporal { data_type, .. } => {
+            let units = i128::from(i64::from_ne_bytes(bits.to_ne_bytes()));
+            state.update_extreme_units(
+                aggregate,
+                units,
+                || temporal_unit_text(units, *data_type),
+                memory,
+            )
+        }
         TwoPassLane::DecimalUnits {
             scale,
             float_output,
@@ -3065,6 +3709,8 @@ fn poolable(lanes: &[TwoPassLane]) -> bool {
                 | TwoPassLane::ExtremeDecimal { .. }
                 | TwoPassLane::Distinct { .. }
                 | TwoPassLane::Exact { .. }
+                | TwoPassLane::Present { .. }
+                | TwoPassLane::Temporal { .. }
         )
     })
 }

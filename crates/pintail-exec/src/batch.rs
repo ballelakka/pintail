@@ -1407,6 +1407,17 @@ impl RecordBatch {
         self.columns.get(index)
     }
 
+    /// The batch with `column` added after its last column, the selection
+    /// kept; the batch comes back unchanged as the error when the column's
+    /// length is not the batch's.
+    pub(crate) fn with_appended_column(mut self, column: ColumnVector) -> Result<Self, Self> {
+        if column.len() != self.row_count {
+            return Err(self);
+        }
+        self.columns.push(column);
+        Ok(self)
+    }
+
     /// Moves selected columns, cloning only repeated references. The row
     /// selection and each column's packed representation remain intact.
     pub(crate) fn project_columns(self, positions: &[usize]) -> Option<Self> {

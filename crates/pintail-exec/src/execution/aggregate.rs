@@ -3897,10 +3897,13 @@ fn build_buffered_hash_aggregate(
         && let Some(keys) = date_part_key_source(group_by, &first_batch)
         && let Some(lanes) = two_pass_lanes(aggregates, &first_batch)
     {
-        return build_streaming_two_pass_aggregate(
+        // The expressions go along: a later batch whose column carries no
+        // units (one holding a zero date) evaluates them row by row.
+        return super::two_pass::build_unit_key_two_pass_aggregate(
             input,
             first_batch,
             keys,
+            group_by,
             &lanes,
             aggregates,
             memory,
@@ -3925,6 +3928,30 @@ fn build_buffered_hash_aggregate(
             input,
             first_batch,
             &group_by[0],
+            aggregates,
+            memory,
+            key_collations.first().copied().unwrap_or(collation),
+        );
+    }
+    // Too many groups for that fold, and a key whose packed units identify
+    // it - a DATE or DATETIME column, or an expression with a packed kernel
+    // such as `DATE(occurred_at)`: the units are the key of the streaming
+    // two-pass, a day number or a count as dense as the days the rows
+    // cover, in place of a value built, normalized and hashed per row.
+    if let [key] = group_by
+        && let Some(group_type) = super::two_pass::unit_key_type(key, &first_batch)
+        && let Some(lanes) = two_pass_lanes(aggregates, &first_batch)
+    {
+        super::ProfileNote::of(input).set("two-pass over the key's packed units");
+        let column = key
+            .column_index()
+            .unwrap_or_else(|| first_batch.columns().len());
+        return super::two_pass::build_unit_key_two_pass_aggregate(
+            input,
+            first_batch,
+            TwoPassKeySource::Int { column, group_type },
+            std::slice::from_ref(key),
+            &lanes,
             aggregates,
             memory,
             key_collations.first().copied().unwrap_or(collation),
@@ -6126,6 +6153,8 @@ fn build_direct_column_aggregate(
                         TwoPassLane::DecimalUnits { .. } => "decimal-units",
                         TwoPassLane::Distinct { .. } => "distinct",
                         TwoPassLane::ExtremeDecimal { .. } => "extreme-decimal",
+                        TwoPassLane::Present { .. } => "present",
+                        TwoPassLane::Temporal { .. } => "temporal-units",
                     })
                     .collect::<Vec<_>>()
             });
