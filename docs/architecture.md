@@ -189,7 +189,10 @@ Roles are per workspace, and anyone may create a workspace and administer
 it. Settings that apply to the whole node (the OAuth client, the wire
 certificate's hostnames) belong to node administrators: the administrators of
 the node's first workspace. Live event streams carry only the events of
-databases the caller's workspace owns.
+databases the caller's workspace owns (an API key's stream, its one
+database); events that belong to no database reach node administrators only.
+A stream re-reads its caller's standing every few seconds and ends once the
+account is disabled, the membership removed or the key revoked.
 
 Pintail does not terminate TLS and its embedded dashboard is not a
 multi-tenant security boundary. Keep listeners private or place a

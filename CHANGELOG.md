@@ -21,6 +21,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   session only the events of databases its own workspace owns. Every session
   used to receive every workspace's events: database identifiers, table names
   and replication messages.
+  An open stream now ends within seconds of its account being disabled, its
+  member being removed from the workspace, or its API key being revoked; it
+  used to run until the client hung up. Events that belong to no database
+  reach node administrators only.
 - Node-wide settings (the Google sign-in client and the wire certificate's
   hostnames) now require a node administrator: an administrator of the node's
   first workspace. Any account could create a workspace, become its

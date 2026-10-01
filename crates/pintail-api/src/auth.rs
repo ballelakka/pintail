@@ -132,6 +132,45 @@ pub(crate) fn is_node_admin(state: &ApiState, principal: &AuthPrincipal) -> Resu
     Ok(role.as_deref() == Some("admin"))
 }
 
+/// The authority a principal holds right now, or `None` when it holds none.
+///
+/// Authentication answers for the moment a request arrives. Anything that
+/// outlives the request - an event stream stays open for hours - has to ask
+/// again, or a removed member, a disabled account or a revoked key keeps
+/// what it was given. A read that fails answers `None` too: not knowing is
+/// no reason to keep serving.
+pub(crate) fn current_authority(
+    state: &ApiState,
+    principal: &AuthPrincipal,
+) -> Option<AuthPrincipal> {
+    let metadata = state.metadata().ok()?;
+    let mut current = principal.clone();
+    match (&principal.workspace_id, &principal.database_id) {
+        (Some(workspace_id), _) => {
+            let user = metadata.user_by_id(&principal.subject).ok()??;
+            if !user.enabled {
+                return None;
+            }
+            current.role = metadata
+                .workspace_member_role(workspace_id, &principal.subject)
+                .ok()??;
+        }
+        (None, Some(database_id)) => {
+            let key = metadata
+                .api_keys(database_id)
+                .ok()?
+                .into_iter()
+                .find(|key| key.id == principal.subject)?;
+            if !key.enabled || key.expires_at.as_deref().is_some_and(is_expired) {
+                return None;
+            }
+            current.scopes = serde_json::from_str(&key.scopes_json).ok()?;
+        }
+        (None, None) => return None,
+    }
+    Some(current)
+}
+
 /// Guards a setting that applies to the whole node.
 ///
 /// # Errors
@@ -387,7 +426,7 @@ fn client_ip_of(request: &Request<Body>) -> Option<String> {
         .map(|info| info.0.ip().to_string())
 }
 
-fn authenticate_jwt(state: &ApiState, token: &str) -> Result<AuthPrincipal, ApiError> {
+pub(crate) fn authenticate_jwt(state: &ApiState, token: &str) -> Result<AuthPrincipal, ApiError> {
     let mut validation = Validation::new(JwtAlgorithm::HS256);
     validation.set_issuer(&[TOKEN_ISSUER]);
     validation.set_required_spec_claims(&["exp", "iat", "iss", "sub"]);
@@ -434,7 +473,10 @@ fn authenticate_jwt(state: &ApiState, token: &str) -> Result<AuthPrincipal, ApiE
     })
 }
 
-fn authenticate_api_key(state: &ApiState, secret: &str) -> Result<AuthPrincipal, ApiError> {
+pub(crate) fn authenticate_api_key(
+    state: &ApiState,
+    secret: &str,
+) -> Result<AuthPrincipal, ApiError> {
     let started = Instant::now();
     let digest: [u8; 32] = Sha256::digest(secret.as_bytes())
         .as_slice()

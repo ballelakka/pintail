@@ -284,6 +284,20 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Enables or disables one account. A disabled account authenticates
+    /// nowhere, whatever it is still a member of.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the account cannot be updated.
+    pub fn set_user_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let changed = self
+            .connection
+            .execute("UPDATE users SET enabled = ?2 WHERE id = ?1", (id, enabled))
+            .context("failed to update user")?;
+        Ok(changed == 1)
+    }
+
     /// Returns a user by case-insensitive email.
     ///
     /// # Errors

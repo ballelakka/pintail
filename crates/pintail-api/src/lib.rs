@@ -40,6 +40,8 @@ mod snapshot;
 mod state;
 mod storage;
 mod supervisor;
+#[cfg(test)]
+mod test_support;
 mod upstream;
 mod workspaces;
 
