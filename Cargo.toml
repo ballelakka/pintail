@@ -13,6 +13,7 @@ members = [
     "crates/pintail-probe",
     "crates/pintail-protocol",
     "crates/pintail-snapshot",
+    "crates/pintail-simd",
     "crates/pintail-sql",
     "crates/pintail-store",
     "crates/pintail-telemetry",
@@ -83,9 +84,15 @@ pintail-snapshot = { path = "crates/pintail-snapshot" }
 pintail-store = { path = "crates/pintail-store" }
 pintail-write = { path = "crates/pintail-write" }
 pintail-telemetry = { path = "crates/pintail-telemetry" }
+pintail-simd = { path = "crates/pintail-simd" }
 pintail-sql = { path = "crates/pintail-sql" }
 pintail-types = { path = "crates/pintail-types" }
 pintail-wire = { path = "crates/pintail-wire" }
+# Runtime CPU dispatch for the vector kernels in pintail-simd: it owns the
+# single target-feature call those need, so Pintail's crates keep
+# unsafe_code = "forbid" and one binary serves every x86-64 CPU. The x86-v4
+# feature adds the AVX-512 copy (stable since Rust 1.89).
+pulp = { version = "0.22.3", default-features = false, features = ["std", "x86-v3", "x86-v4"] }
 rand = "0.9.1"
 rand_core06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
 rsa = "0.9.8"

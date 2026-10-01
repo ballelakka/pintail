@@ -1,0 +1,21 @@
+[package]
+name = "pintail-simd"
+description = "Safe vector kernels with runtime CPU dispatch for Pintail's executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pulp.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[lints]
+workspace = true
