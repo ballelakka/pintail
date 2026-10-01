@@ -26,8 +26,19 @@ use pintail_sql::{Binder, parse_statement};
 use pintail_store::{StoreOptions, TableStore};
 use pintail_types::{Column, DataType, KeyPart, PrimaryKey, StoredRow, TableSchema, Value};
 
-/// Seconds between consecutive events.
-const STEP_SECONDS: u64 = 2;
+/// Seconds between consecutive events: two, or `WINDOW_STEP_SECONDS`.
+/// Twenty million events two seconds apart cover 463 days; five seconds
+/// apart they cover a little over three years, which is what the
+/// whole-table cases group by day.
+fn step_seconds() -> u64 {
+    static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("WINDOW_STEP_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2)
+    })
+}
 /// 2024-01-01 00:00:00 UTC.
 const EPOCH: u64 = 1_704_067_200;
 const DAY: u64 = 86_400;
@@ -106,11 +117,11 @@ fn row(id: u64) -> StoredRow {
         PrimaryKey::new(vec![KeyPart::UInt64(id)]).expect("key"),
         vec![
             Value::UInt64(id),
-            Value::Utf8(timestamp(id * STEP_SECONDS)),
+            Value::Utf8(timestamp(id * step_seconds())),
             Value::Utf8(cents(price(id))),
             Value::Utf8(CHANNELS[channel(id)].to_owned()),
             Value::Int64(amount(id)),
-            Value::Utf8(timestamp(id * STEP_SECONDS)),
+            Value::Utf8(timestamp(id * step_seconds())),
         ],
         1,
         false,
@@ -153,8 +164,8 @@ impl Totals {
                 self.count,
                 cents(self.price),
                 self.average(),
-                timestamp(self.first * STEP_SECONDS),
-                timestamp(self.last * STEP_SECONDS)
+                timestamp(self.first * step_seconds()),
+                timestamp(self.last * step_seconds())
             ),
             Shape::Daily => format!("{}|{}", self.count, cents(self.price)),
         }
@@ -180,7 +191,7 @@ enum Grouping {
 /// The window's ids: `occurred_at` between `from` and `to` seconds, both
 /// inclusive.
 fn ids(rows: u64, from: u64, to: u64) -> std::ops::RangeInclusive<u64> {
-    from.div_ceil(STEP_SECONDS)..=(to / STEP_SECONDS).min(rows - 1)
+    from.div_ceil(step_seconds())..=(to / step_seconds()).min(rows - 1)
 }
 
 /// `from` and `to` are seconds as the session reads them, `offset` the
@@ -195,7 +206,7 @@ fn expected(
     let utc = |seconds: u64| seconds.checked_add_signed(-offset).expect("in range");
     let local = |id: u64| {
         timestamp(
-            (id * STEP_SECONDS)
+            (id * step_seconds())
                 .checked_add_signed(offset)
                 .expect("in range"),
         )
@@ -324,7 +335,7 @@ fn aggregates_over_a_recent_window() {
     ])
     .expect("catalog");
 
-    let span = (rows - 1) * STEP_SECONDS;
+    let span = (rows - 1) * step_seconds();
     let full = "COUNT(*), SUM(price), AVG(price), MIN(occurred_at), MAX(occurred_at)";
     let mut cases: Vec<(String, Grouping, Shape, String, Option<&str>)> = [
         (
@@ -419,8 +430,14 @@ fn aggregates_over_a_recent_window() {
         }
     }
     let mut mismatches = 0;
-    for (window_name, window) in [("7 days", 7 * DAY), ("30 days", 30 * DAY)] {
+    // The whole table is the third window: every day the events cover is a
+    // group, hundreds of them, or a thousand and more with the events
+    // spread over three years (`WINDOW_STEP_SECONDS=5`).
+    for (window_name, window) in [("7 days", 7 * DAY), ("30 days", 30 * DAY), ("all days", 0)] {
         for (name, grouping, shape, template, zone) in &cases {
+            if window == 0 && (!matches!(grouping, Grouping::Day) || zone.is_some()) {
+                continue;
+            }
             let column = if zone.is_some() {
                 "stamp"
             } else {
@@ -443,7 +460,15 @@ fn aggregates_over_a_recent_window() {
                 // The window ends a few hours earlier each run, so nothing
                 // remembered answers a repeat. The seven-day window is
                 // open-ended ("since"), the month is a closed BETWEEN.
-                let (from, to, predicate) = if window == 7 * DAY {
+                let (from, to, predicate) = if window == 0 {
+                    // Everything from a few hours in, a later start each run.
+                    let from = run_index * 3_600;
+                    (
+                        from,
+                        span + DAY,
+                        format!("{column} >= '{}'", timestamp(from)),
+                    )
+                } else if window == 7 * DAY {
                     let from = span - window - run_index * 3_600;
                     // Open-ended: past the last row in any session zone.
                     (
