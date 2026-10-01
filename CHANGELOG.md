@@ -46,9 +46,13 @@ that orders joins from per-column statistics instead of fixed guesses.
 
 ### Known issues
 
-- The 0.1.6 slowdown of Q8 (join users + orders) on the containerized
-  20M-row benchmark did not reproduce on native or in-process runs; it
-  will be re-measured by the next stable release's benchmark.
+- On the 20M-row benchmark with the result memo off, Q2 (filtered count)
+  and Q5 (monthly revenue) are slower than in 0.1.6: minimums 24 to 29 ms
+  and 52 to 60 ms on the same kind of host, with ClickHouse unchanged.
+  Answers are unaffected. The cause is being bisected for rc2.
+- The 0.1.6 slowdown of Q8 (join users + orders) did not reproduce on
+  native or in-process runs; on this release's containerized run Q8 is
+  within 5% of 0.1.6.
 
 ## [0.1.6] - 2026-09-30
 
