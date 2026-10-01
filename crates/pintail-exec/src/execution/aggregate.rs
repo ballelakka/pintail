@@ -646,6 +646,41 @@ fn bitmap_members(min: i128, bits: &[u64]) -> impl Iterator<Item = i128> + '_ {
     })
 }
 
+/// A COUNT(DISTINCT) state's bitmap opened for a run of unchecked inserts:
+/// a key inside the bitmap's window sets its bit with no test and no count,
+/// so consecutive keys do not wait on each other's word loads or branch on
+/// whether a key was new. The state's counts are stale until
+/// [`AggregateState::settle_distinct_bits`] recounts the bitmap, which the
+/// opener must call before anything else reads or inserts into the state.
+pub(super) struct OpenDistinctBits<'a> {
+    min: i128,
+    bits: &'a mut [u64],
+    /// Whether any key was set since the bitmap was opened.
+    pub(super) touched: bool,
+}
+
+impl OpenDistinctBits<'_> {
+    /// The bitmap's size in words: what settling it costs.
+    pub(super) fn words(&self) -> usize {
+        self.bits.len()
+    }
+
+    /// Sets `key`'s bit, or answers `false` with nothing changed for a key
+    /// outside the window, which the caller inserts through the state.
+    #[inline]
+    pub(super) fn set(&mut self, key: i128) -> bool {
+        let Ok(offset) = usize::try_from(key - self.min) else {
+            return false;
+        };
+        let Some(word) = self.bits.get_mut(offset / 64) else {
+            return false;
+        };
+        *word |= 1_u64 << (offset % 64);
+        self.touched = true;
+        true
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct AggregateState {
     value: AggregateValue,
@@ -1607,6 +1642,45 @@ impl AggregateState {
                 "decimal unit average applied to an incompatible aggregate state",
             )),
         }
+    }
+
+    /// This COUNT(DISTINCT) state's bitmap, opened for unchecked inserts
+    /// (see [`OpenDistinctBits`]), while its distinct set is a bitmap.
+    pub(super) fn open_distinct_bits(&mut self) -> Option<OpenDistinctBits<'_>> {
+        let (Some(DistinctSeen::Bitmap(bitmap)), AggregateValue::Count(_)) =
+            (&mut self.seen, &self.value)
+        else {
+            return None;
+        };
+        Some(OpenDistinctBits {
+            min: bitmap.min,
+            bits: &mut bitmap.bits,
+            touched: false,
+        })
+    }
+
+    /// Recounts a bitmap that took unchecked inserts, and adds the keys it
+    /// gained to the count: the state then stands where inserting the same
+    /// keys one at a time would have left it.
+    pub(super) fn settle_distinct_bits(&mut self) -> Result<(), ExecError> {
+        let (Some(DistinctSeen::Bitmap(bitmap)), AggregateValue::Count(count)) =
+            (&mut self.seen, &mut self.value)
+        else {
+            return Ok(());
+        };
+        let members = bitmap
+            .bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum::<usize>();
+        let added = members
+            .checked_sub(bitmap.count)
+            .expect("an unchecked insert never clears a bit");
+        bitmap.count = members;
+        *count = count
+            .checked_add(u64::try_from(added).expect("count fits u64"))
+            .ok_or(ExecError::NumericOverflow)?;
+        Ok(())
     }
 
     /// COUNT(DISTINCT) on a raw integer key: dedup in the i128 set and

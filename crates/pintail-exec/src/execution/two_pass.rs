@@ -8,8 +8,9 @@ use pintail_types::{DataType, Value};
 
 use super::aggregate::GroupKeyMap;
 use super::aggregate::{
-    AggregateGroup, AggregateState, CompiledAggregate, aggregate_uses_float, decimal_average_scale,
-    decimal_units_from_int, merge_spilled_aggregate_groups, write_aggregate_spill_run,
+    AggregateGroup, AggregateState, CompiledAggregate, OpenDistinctBits, aggregate_uses_float,
+    decimal_average_scale, decimal_units_from_int, merge_spilled_aggregate_groups,
+    write_aggregate_spill_run,
 };
 use super::join::{normalized_group_hash_key, normalized_group_text};
 use super::morsel::{Morsel, default_morsel_limit, morsel_plan};
@@ -3818,25 +3819,32 @@ fn apply_unpacked_lanes(
         }
         // The key a distinct lane dedups on, from its column's bits: the
         // conversion `apply_two_pass_lane` makes.
-        let distinct_key = |bits: u64| -> Option<i128> {
-            match lane {
-                TwoPassLane::Distinct { data_type, .. } => Some(if *data_type == DataType::Int64 {
-                    i128::from(i64::from_ne_bytes(bits.to_ne_bytes()))
-                } else {
-                    i128::from(bits)
-                }),
-                _ => None,
+        let signed = matches!(
+            lane,
+            TwoPassLane::Distinct {
+                data_type: DataType::Int64,
+                ..
             }
-        };
+        );
         macro_rules! distinct_from {
             ($values:expr, $validity:expr, $bits:expr) => {
-                for (row, slot) in rows.iter().zip(slots) {
-                    if $validity.is_valid(row) {
-                        let key = distinct_key($bits($values[row])).expect("distinct lane");
-                        acc[*slot as usize].as_mut().expect("states made above")[index]
-                            .update_distinct_count_int(key, memory)?;
-                    }
-                }
+                insert_distinct_keys(
+                    acc,
+                    index,
+                    rows,
+                    slots,
+                    $values,
+                    $validity,
+                    |value| {
+                        let bits: u64 = $bits(value);
+                        if signed {
+                            i128::from(i64::from_ne_bytes(bits.to_ne_bytes()))
+                        } else {
+                            i128::from(bits)
+                        }
+                    },
+                    memory,
+                )?
             };
         }
         match (lane, reader) {
@@ -3859,6 +3867,117 @@ fn apply_unpacked_lanes(
         }
     }
     Ok(())
+}
+
+/// Inserts one batch's keys into a COUNT(DISTINCT) lane's group states.
+///
+/// A group whose distinct set is a bitmap takes its keys as unchecked bit
+/// sets and is recounted once after the batch (see `OpenDistinctBits`): the
+/// per-key test, count and branch on whether the key was new each waited on
+/// a bitmap word that a low-cardinality key's few groups, each spanning the
+/// whole key range, keep out of the first-level cache. A recount reads the
+/// whole bitmap, so the bitmaps open only while recounting all of them costs
+/// no more than a few words per row of the batch. Every other key, and
+/// every key outside its bitmap's window, inserts one at a time after the
+/// recount; a set's members and count do not depend on the order its keys
+/// arrive in.
+#[allow(clippy::too_many_arguments)]
+fn insert_distinct_keys<T: Copy>(
+    acc: &mut DenseGroupSlots,
+    index: usize,
+    rows: &FoldRows<'_>,
+    slots: &[u32],
+    values: &[T],
+    validity: &crate::array::ValidityMask,
+    key: impl Fn(T) -> i128,
+    memory: &MemoryTracker,
+) -> Result<(), ExecError> {
+    let mut open = if acc.len() <= rows.len() {
+        acc.iter_mut()
+            .map(|entry| {
+                entry
+                    .as_mut()
+                    .and_then(|states| states[index].open_distinct_bits())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let words = open
+        .iter()
+        .flatten()
+        .fold(0_usize, |words, bits| words.saturating_add(bits.words()));
+    if words > rows.len().saturating_mul(4) || open.iter().all(Option::is_none) {
+        drop(open);
+        for (row, slot) in rows.iter().zip(slots) {
+            if validity.is_valid(row) {
+                acc[*slot as usize].as_mut().expect("states made above")[index]
+                    .update_distinct_count_int(key(values[row]), memory)?;
+            }
+        }
+        return Ok(());
+    }
+    let mut misses = Vec::new();
+    set_distinct_keys(&mut open, rows, slots, values, validity, key, &mut misses);
+    let touched = open
+        .iter()
+        .enumerate()
+        .filter(|(_, bits)| bits.as_ref().is_some_and(|bits| bits.touched))
+        .map(|(slot, _)| slot)
+        .collect::<Vec<_>>();
+    drop(open);
+    for slot in touched {
+        acc[slot].as_mut().expect("opened above")[index].settle_distinct_bits()?;
+    }
+    for (slot, key) in misses {
+        acc[slot as usize].as_mut().expect("states made above")[index]
+            .update_distinct_count_int(key, memory)?;
+    }
+    Ok(())
+}
+
+/// Sets each listed row's distinct key in its slot's opened bitmap, and
+/// lists the keys with no open bitmap or outside its window in `misses`.
+/// The loops are spelled per row shape and per validity so the body is a
+/// load, a subtraction and a bit set.
+#[inline]
+fn set_distinct_keys<T: Copy>(
+    open: &mut [Option<OpenDistinctBits<'_>>],
+    rows: &FoldRows<'_>,
+    slots: &[u32],
+    values: &[T],
+    validity: &crate::array::ValidityMask,
+    key: impl Fn(T) -> i128,
+    misses: &mut Vec<(u32, i128)>,
+) {
+    let mut set = |slot: u32, value: T| {
+        let key = key(value);
+        if !open[slot as usize]
+            .as_mut()
+            .is_some_and(|bits| bits.set(key))
+        {
+            misses.push((slot, key));
+        }
+    };
+    match (rows, validity.no_nulls()) {
+        (FoldRows::Span(span), true) => {
+            for (&slot, &value) in slots.iter().zip(&values[span.clone()]) {
+                set(slot, value);
+            }
+        }
+        (FoldRows::Picked(picked), true) => {
+            for (&slot, &row) in slots.iter().zip(*picked) {
+                set(slot, values[row as usize]);
+            }
+        }
+        _ => {
+            for (slot, row) in slots.iter().zip(rows.iter()) {
+                if validity.is_valid(row) {
+                    set(*slot, values[row]);
+                }
+            }
+        }
+    }
 }
 
 /// Dense pass over one batch for a date-part key: the same part extraction
