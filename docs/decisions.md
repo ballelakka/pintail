@@ -1827,3 +1827,110 @@ in a fixed-width suffix, with wrapping byte positions and PAD SPACE comparison.
 The key builder scans once, including inputs with repeated marks. All non-NUL
 byte pairs were checked against the oracle's weights; embedded NUL comparison
 is tested directly because the weight diagnostic truncates at NUL.
+
+## SIMD route (2026-10-01)
+
+Vector kernels live in `pintail-simd`. They are safe Rust, dispatched at
+runtime to AVX2, with hand-written AVX2 bodies only where the
+auto-vectorizer falls short. The release binary stays generic x86-64.
+This keeps the 2026-07-31 ruling (`unsafe_code = "forbid"`, safe SIMD
+crates only) and one portable binary. All numbers below come from one
+Ryzen 9 9950X box with 8 vCPU.
+
+Three safe routes were tried:
+
+- **Auto-vectorization alone.** Kernel *shape* is most of the gain. Lane
+  arrays as accumulators, `chunks_exact`, and compare results packed a
+  byte at a time beat a per-row loop by 2.5-14x, even at the SSE2
+  baseline. Building the whole crate with `-C target-cpu=x86-64-v3` adds
+  little on top. The hand-written AVX2 compare kernels still run 2.5x
+  faster than the v3-compiled portable ones (0.039 vs 0.097 ns/row in
+  cache). Some operations the baseline cannot do at all: generic x86-64
+  has no `popcnt` and no 64-bit vector compare, so a plain
+  `iter().min()` over `i64` stays scalar there (0.68 ns/row) but runs at
+  0.058 ns/row with AVX2.
+- **`std::arch` from Pintail's own crates.** Intrinsics are safe to call
+  inside a `#[target_feature]` function, but calling that function from
+  ordinary code is `unsafe` (E0133). This holds even when the whole build
+  uses `-C target-cpu=x86-64-v3`; on Rust 1.97 only the caller's own
+  attribute counts. Loads and stores take raw pointers. So every route
+  into `std::arch` needs an `unsafe` block somewhere, and Pintail's crates
+  cannot hold one.
+- **Safe wrapper crates.** `pulp` (MIT) checks the CPU at runtime and makes
+  the one `#[target_feature]` call itself. Kernels inlined into it compile
+  for AVX2 or AVX-512 inside one portable binary. It also exposes every
+  x86 intrinsic as a safe method on a token that only exists once the CPU
+  has been checked, and it moves values into and out of registers by
+  value (`pulp::cast`), never through a pointer. Its dependency tree is
+  small and permissively licensed: bytemuck, num-complex, raw-cpuid,
+  reborrow, and libm, all MIT, Apache-2.0 or Zlib. `wide` (Zlib,
+  Apache-2.0 or MIT) gives fixed-width types, but it picks its instruction
+  set at compile time with `cfg(target_feature)`. In a generic build it
+  emulates AVX2 with SSE2, and inlining it into a dispatched function does
+  not change that. `wide` 1.x also needs Rust 1.89, above the workspace's
+  1.88 minimum. `wide` only helps a `target-cpu` build, so it was not
+  adopted.
+
+Rules this sets for kernel authors:
+
+- Hand a kernel to the dispatcher as a struct whose `#[inline(always)]`
+  method calls an `#[inline(always)]` kernel directly. A closure, or a
+  function item, left an out-of-line call compiled for the baseline. The
+  dispatcher's AVX2 function was then a two-instruction jump to scalar
+  code, and only the disassembly showed it.
+- AVX-512 is opt-in (`PINTAIL_SIMD=avx512`). On this machine its
+  auto-vectorized copies streamed a 16M-row column 3-5x slower than the
+  AVX2 copies, though they matched AVX2 in cache.
+- Where the auto-vectorizer lowers a loop badly, write the AVX2 body by
+  hand:
+  - Compare-to-bitmask, range tests and flag packing use one compare plus
+    one `movemask` per 4, 8 or 32 rows. The auto-vectorizer turns
+    compare-and-pack into a chain of shifts and ORs. The hand-written form
+    is 4-5x faster in cache and 7-48x faster than a per-row loop.
+  - Mask expansion looks up each mask byte in a 256-entry table and does
+    one vector add per byte.
+  - The exact `i64` sum builds its high halves from 32-bit shifts, because
+    AVX2 has no 64-bit arithmetic shift.
+
+  Where the auto-vectorizer does well, keep the plain loop. For `i64`
+  min and max the plain fold beats the lane form under AVX2, so each
+  instruction set gets the body that wins on it.
+- Grouped updates (sum, count, min and max by a precomputed group index)
+  are scatters, and they do not vectorize. Interleaving partial tables to
+  break the store-to-load chain on repeated groups measured within noise.
+  The kernel's value is one typed pass per batch, without per-row
+  dispatch, `Option` or `Result`. A fused sum and count measured 1.4x
+  faster than the equivalent per-row loop.
+- Gather stays plain checked indexing. Clamping indices doubled its cost,
+  and hardware gathers were no faster.
+- Float sums from `sum_f64` are reassociated across eight lanes. They are
+  exact for integer-valued data. Any path that promises a summation order
+  must not use them. `sum_by_group_f64` keeps row order.
+- `PINTAIL_SIMD=off` runs the baseline copy in the same binary, for A/B
+  measurement and for ruling the dispatch out when an answer is wrong.
+  `cargo bench -p pintail-simd` reports each kernel against a per-row loop
+  and against its undispatched copy.
+
+**Build target: stay generic x86-64.** Two alternating rounds of the
+20M-row engine track compared the current engine built generic and built
+with `-C target-cpu=x86-64-v3`. The figures are the per-query minimum
+over 15 runs, in ms, for round 1 / round 2:
+
+| Query | generic | x86-64-v3 |
+|---|---|---|
+| Q2 | 27 / 26 | 23 / 24 |
+| Q3 | 55 / 54 | 59 / 56 |
+| Q4 | 84 / 82 | 80 / 86 |
+| Q5 | 52 / 51 | 45 / 50 |
+| Q6 | 151 / 147 | 162 / 163 |
+| Q7 | 108 / 110 | 105 / 111 |
+| Q8 | 168 / 165 | 162 / 171 |
+
+Q2 and Q5 gain 5-12%, Q6 loses 8-10%, and the rest is noise. The engine's
+hot loops are still per-row, and the compiler cannot vectorize them at any
+target. A v3 baseline would also stop the binary from starting on CPUs or
+VMs without AVX2, such as a hypervisor's generic CPU model. Runtime
+dispatch already gives the kernels their AVX2 copies. Re-measure once the
+batch-at-a-time scan and aggregation loops call these kernels. Moving the
+baseline to x86-64-v2, which adds `popcnt` and is near-universal, is the
+cheaper next step to measure then.
